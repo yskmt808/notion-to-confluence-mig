@@ -1,0 +1,1670 @@
+"""
+Notion のブロック・リッチテキスト・データベース情報を
+Confluence Storage Format (XHTML) に変換するモジュール。
+"""
+
+import os
+import re
+import html
+import logging
+import urllib.parse
+import datetime
+from typing import Any, Dict, List, Optional, Tuple, Union
+from src.extractor import PageNode
+
+logger = logging.getLogger(__name__)
+
+UUID_PATTERN = re.compile(r"([0-9a-fA-F]{32})")
+
+
+NOTION_TO_CONFLUENCE_COLOR_MAP = {
+    "default": "Grey",
+    "gray": "Grey",
+    "brown": "Grey",
+    "orange": "Yellow",
+    "yellow": "Yellow",
+    "green": "Green",
+    "blue": "Blue",
+    "purple": "Blue",
+    "pink": "Red",
+    "red": "Red",
+}
+
+NOTION_COLOR_TO_BADGE_STYLE = {
+    "default": "background-color: rgb(235,236,240); color: rgb(23,43,77);",
+    "gray": "background-color: rgb(235,236,240); color: rgb(23,43,77);",
+    "brown": "background-color: rgb(235,220,211); color: rgb(83,63,4);",
+    "orange": "background-color: rgb(255,227,128); color: rgb(23,43,77);",
+    "yellow": "background-color: rgb(255,240,179); color: rgb(23,43,77);",
+    "green": "background-color: rgb(227,252,239); color: rgb(0,102,68);",
+    "blue": "background-color: rgb(222,235,255); color: rgb(7,71,166);",
+    "purple": "background-color: rgb(234,230,255); color: rgb(64,50,148);",
+    "pink": "background-color: rgb(255,205,210); color: rgb(191,38,0);",
+    "red": "background-color: rgb(255,235,230); color: rgb(191,38,0);",
+}
+
+NOTION_TEXT_COLOR_MAP = {
+    "gray": "#787774",
+    "brown": "#976d57",
+    "orange": "#c25c04",
+    "yellow": "#b58700",
+    "green": "#2b8457",
+    "blue": "#1f75cb",
+    "purple": "#7647c2",
+    "pink": "#b83085",
+    "red": "#df3937",
+}
+
+NOTION_BG_COLOR_MAP = {
+    "gray_background": "#ebeced",
+    "brown_background": "#e9e5e3",
+    "orange_background": "#faece3",
+    "yellow_background": "#fbf3db",
+    "green_background": "#edf3ec",
+    "blue_background": "#e7f3f8",
+    "purple_background": "#f4f0f7",
+    "pink_background": "#fbf0f4",
+    "red_background": "#fdebec",
+}
+
+
+def _render_badge(text: str, color: str = "default") -> str:
+    style = NOTION_COLOR_TO_BADGE_STYLE.get(color, NOTION_COLOR_TO_BADGE_STYLE["default"])
+    css = f"{style} padding: 2px 8px; border-radius: 3px; font-weight: 500; font-size: 12px; display: inline-block; margin: 2px 4px 2px 0;"
+    return f'<span style="{css}">{html.escape(str(text))}</span>'
+
+
+DEFAULT_METADATA_TEMPLATE = "📄 Notion元情報 — 作成者: {author} | 🕒 作成日時: {created_time}"
+
+
+class NotionToConfluenceConverter:
+    MERMAID_KEYWORDS = (
+        "graph ", "flowchart ", "sequencediagram", "statediagram", "classdiagram",
+        "erdiagram", "gantt", "pie", "gitgraph", "journey", "mindmap", "timeline",
+        "quadrantchart", "sankey", "xychart-beta", "block-beta", "architecture-beta"
+    )
+
+    @classmethod
+    def is_mermaid_code(cls, lang: str, code_str: str) -> Tuple[bool, str]:
+        """コードブロックがMermaidダイアグラム定義であるかを判定する。"""
+        l_norm = (lang or "").lower().strip()
+        c_clean = (code_str or "").strip()
+        c_lower = c_clean.lower()
+        if l_norm == "mermaid":
+            return True, c_clean
+        if any(c_lower.startswith(kw) for kw in cls.MERMAID_KEYWORDS):
+            return True, c_clean
+        return False, c_clean
+
+    def __init__(
+        self,
+        id_to_title_map: Optional[Dict[str, str]] = None,
+        timezone: Optional[Union[str, datetime.tzinfo]] = None,
+        user_mapper: Optional[Any] = None,
+        metadata_template: Optional[str] = DEFAULT_METADATA_TEMPLATE,
+    ):
+        self.id_to_title_map = id_to_title_map or {}
+        self.migration_map: Dict[str, Dict[str, Any]] = {}
+        self.user_mapper = user_mapper
+        from src.timezone_util import resolve_timezone
+        self.timezone = resolve_timezone(timezone)
+
+        # テンプレート文字列またはファイルパスの解決 (明示的に .txt/.html/.md 等のパス指定時のみ読込)
+        if metadata_template and any(metadata_template.endswith(ext) for ext in (".txt", ".html", ".md", ".tpl")) and os.path.isfile(metadata_template):
+            try:
+                with open(metadata_template, "r", encoding="utf-8") as f:
+                    self.metadata_template = f.read().strip()
+            except Exception as e:
+                logger.warning(f"Could not read metadata template file {metadata_template}: {e}")
+                self.metadata_template = metadata_template
+        else:
+            self.metadata_template = metadata_template
+
+    def _get_attachment_filename(self, block: Dict[str, Any]) -> str:
+        """ブロック情報からConfluence用の一意で分かりやすい添付ファイル名を導出する。"""
+        if block.get("_attachment_filename"):
+            return block["_attachment_filename"]
+        b_type = block.get("type", "")
+        b_id_short = block.get("id", "").replace("-", "")[:8]
+        data = block.get(b_type, {})
+        f_obj = data.get("file") or {}
+        e_obj = data.get("external") or {}
+        url = f_obj.get("url") or e_obj.get("url") or ""
+
+        ext_map = {
+            "image": "png",
+            "pdf": "pdf",
+            "file": "bin",
+            "video": "mp4",
+            "audio": "mp3",
+        }
+        default_ext = ext_map.get(b_type, "bin")
+        if url:
+            parsed_path = urllib.parse.urlparse(url).path
+            base = os.path.basename(parsed_path)
+            if base and "." in base:
+                name, ext = os.path.splitext(urllib.parse.unquote(base))
+                clean_ext = ext.lstrip(".").lower()
+                if len(clean_ext) <= 5 and clean_ext.isalnum():
+                    clean_name = re.sub(r"[^\w\-_.]", "_", name)[:30]
+                    return f"{clean_name}_{b_id_short}.{clean_ext}"
+        return f"{b_type}_{b_id_short}.{default_ext}"
+
+    def format_property_for_confluence(self, prop: Any) -> str:
+        """Notionプロパティ辞書をConfluenceのXHTML表現にフォーマットする。"""
+        if prop is None:
+            return "-"
+        if not isinstance(prop, dict):
+            return html.escape(str(prop))
+
+        p_type = prop.get("type")
+
+        if p_type in ("select", "status"):
+            val = prop.get("value")
+            if not val:
+                return "-"
+            color = prop.get("color", "default")
+            return _render_badge(str(val), color)
+
+        elif p_type == "multi_select":
+            items = prop.get("items", [])
+            if not items:
+                return "-"
+            badges = []
+            for item in items:
+                val = item.get("value")
+                if not val:
+                    continue
+                color = item.get("color", "default")
+                badges.append(_render_badge(str(val), color))
+            return " ".join(badges) if badges else "-"
+
+        elif p_type == "date":
+            start = prop.get("start")
+            end = prop.get("end")
+            if not start:
+                return "-"
+            clean_start = str(start).split("T")[0]
+            from src.timezone_util import format_iso_datetime
+            start_time_str = f" {format_iso_datetime(start, tz=self.timezone, fmt='%H:%M %Z')}" if "T" in str(start) else ""
+            if end:
+                clean_end = str(end).split("T")[0]
+                end_time_str = f" {format_iso_datetime(end, tz=self.timezone, fmt='%H:%M %Z')}" if "T" in str(end) else ""
+                return f'<time datetime="{clean_start}" />{start_time_str} 〜 <time datetime="{clean_end}" />{end_time_str}'
+            return f'<time datetime="{clean_start}" />{start_time_str}'
+
+        elif p_type == "checkbox":
+            val = prop.get("value", False)
+            return "☑️ 完了" if val else "⬜ 未完了"
+
+        elif p_type == "url":
+            url = prop.get("value")
+            if not url:
+                return "-"
+            return f'<a href="{html.escape(url)}">{html.escape(url)}</a>'
+
+        elif p_type == "people":
+            users = prop.get("users", [])
+            if not users:
+                return "-"
+            if self.user_mapper:
+                badges = []
+                for u in users:
+                    u_id = u.get("id")
+                    u_name = u.get("name")
+                    u_email = u.get("person", {}).get("email") if isinstance(u.get("person"), dict) else None
+                    badges.append(self.user_mapper.format_mention(user_id=u_id, email=u_email, name=u_name))
+                return "👤 " + ", ".join(badges)
+            names = [u.get("name") for u in users if u.get("name")]
+            return "👤 " + ", ".join(html.escape(n) for n in names)
+
+        elif p_type == "relation":
+            relations = prop.get("relations", [])
+            if not relations:
+                return "-"
+            links = []
+            for r in relations:
+                target_id = r.get("id", "")
+                target_title = self.id_to_title_map.get(target_id)
+                if target_title:
+                    escaped_title = html.escape(target_title)
+                    links.append(
+                        f'<ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-title="{escaped_title}" />'
+                        f'<ac:link-body>{escaped_title}</ac:link-body>'
+                        f'</ac:link>'
+                    )
+                else:
+                    links.append(f'🔗 <em>{target_id[:8]}...</em>')
+            return ", ".join(links)
+
+        elif p_type == "rollup":
+            r_type = prop.get("rollup_type")
+            if r_type == "array":
+                items = prop.get("items", [])
+                if not items:
+                    return "-"
+                rendered_items = []
+                for it in items:
+                    rendered_items.append(self.format_property_for_confluence(it))
+                return " ".join(rendered_items)
+            elif r_type == "number":
+                val = prop.get("value")
+                return str(val) if val is not None else "-"
+            elif r_type == "date":
+                st = prop.get("start")
+                return f"📅 {html.escape(st)}" if st else "-"
+            else:
+                val = prop.get("value")
+                return html.escape(str(val)) if val is not None else "-"
+
+        elif p_type in ("title", "rich_text", "number", "email", "phone_number", "formula"):
+            val = prop.get("value")
+            return html.escape(str(val)) if val is not None else "-"
+
+        else:
+            val = prop.get("value")
+            return html.escape(str(val)) if val is not None else "-"
+
+    def convert_rich_text(self, rich_text_list: List[Dict[str, Any]]) -> str:
+        """Notionのrich_text配列をConfluence Storage FormatのXHTML文字列に変換する。
+        メンション（日付、ページ、データベース、ユーザー、リンクプレビュー等）や書式、カラーも完全サポート。"""
+        if not rich_text_list:
+            return ""
+
+        result = []
+        for item in rich_text_list:
+            item_type = item.get("type", "text")
+
+            # 1. メンション記法 (mention) の処理
+            if item_type == "mention":
+                mention_data = item.get("mention", {})
+                m_type = mention_data.get("type")
+
+                # 1-a. 日付メンション (<time datetime="YYYY-MM-DD" />)
+                if m_type == "date":
+                    date_info = mention_data.get("date", {})
+                    start_date = date_info.get("start", "")
+                    end_date = date_info.get("end")
+                    if start_date:
+                        date_val = str(start_date).split("T")[0]
+                        from src.timezone_util import format_iso_datetime
+                        s_time = f" {format_iso_datetime(start_date, tz=self.timezone, fmt='%H:%M %Z')}" if "T" in str(start_date) else ""
+                        if end_date:
+                            end_val = str(end_date).split("T")[0]
+                            e_time = f" {format_iso_datetime(end_date, tz=self.timezone, fmt='%H:%M %Z')}" if "T" in str(end_date) else ""
+                            time_html = f'<time datetime="{date_val}" />{s_time} → <time datetime="{end_val}" />{e_time}'
+                        else:
+                            time_html = f'<time datetime="{date_val}" />{s_time}'
+                        result.append(time_html)
+                        continue
+
+                # 1-b. ページメンション (<ac:link ac:card-appearance="inline">)
+                elif m_type == "page":
+                    target_page_id = mention_data.get("page", {}).get("id", "")
+                    norm_id = target_page_id.replace("-", "").lower()
+                    target_title = None
+                    if self.id_to_title_map:
+                        target_title = self.id_to_title_map.get(target_page_id) or self.id_to_title_map.get(norm_id)
+                    if not target_title:
+                        target_title = item.get("plain_text", "").replace("@", "").strip() or "Page"
+
+                    escaped_title = html.escape(target_title)
+                    link_html = (
+                        f'<ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-title="{escaped_title}" />'
+                        f'<ac:link-body>{escaped_title}</ac:link-body>'
+                        f'</ac:link>'
+                    )
+                    result.append(link_html)
+                    continue
+
+                # 1-c. データベースメンション (<ac:link ac:card-appearance="inline">)
+                elif m_type == "database":
+                    target_db_id = mention_data.get("database", {}).get("id", "")
+                    norm_id = target_db_id.replace("-", "").lower()
+                    target_title = None
+                    if self.id_to_title_map:
+                        target_title = self.id_to_title_map.get(target_db_id) or self.id_to_title_map.get(norm_id)
+                    if not target_title:
+                        target_title = item.get("plain_text", "").replace("@", "").strip() or "Database"
+
+                    escaped_title = html.escape(target_title)
+                    link_html = (
+                        f'<ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-title="{escaped_title}" />'
+                        f'<ac:link-body>{escaped_title}</ac:link-body>'
+                        f'</ac:link>'
+                    )
+                    result.append(link_html)
+                    continue
+
+                # 1-d. ユーザーメンション
+                elif m_type == "user":
+                    user_info = mention_data.get("user", {})
+                    user_id = user_info.get("id")
+                    user_name = user_info.get("name") or item.get("plain_text", "")
+                    user_email = user_info.get("person", {}).get("email") if isinstance(user_info.get("person"), dict) else None
+                    if user_name.startswith("@"):
+                        user_name = user_name[1:]
+                    if self.user_mapper:
+                        mention_html = self.user_mapper.format_mention(user_id=user_id, email=user_email, name=user_name)
+                        result.append(mention_html)
+                    else:
+                        escaped_name = html.escape(user_name if user_name else "ユーザー")
+                        result.append(f'<strong>@{escaped_name}</strong>')
+                    continue
+
+                # 1-e. リンクプレビューメンション
+                elif m_type == "link_preview":
+                    lp_obj = mention_data.get("link_preview") or {}
+                    url = lp_obj.get("url", "")
+                    if url:
+                        result.append(f'<a href="{html.escape(url)}" data-card-appearance="inline">{html.escape(url)}</a>')
+                        continue
+
+            # 2. インライン数式 (equation) の処理
+            elif item_type == "equation":
+                expr = item.get("equation", {}).get("expression", "") or item.get("plain_text", "")
+                result.append(f'<code>{html.escape(expr)}</code>')
+                continue
+
+            # 3. 通常テキスト (text) の処理
+            content = item.get("text", {}).get("content", "") or item.get("plain_text", "")
+            if not content:
+                continue
+
+            escaped = html.escape(content).replace("\n", "<br />")
+            annotations = item.get("annotations", {})
+
+            if annotations.get("code"):
+                escaped = f"<code>{escaped}</code>"
+            if annotations.get("bold"):
+                escaped = f"<strong>{escaped}</strong>"
+            if annotations.get("italic"):
+                escaped = f"<em>{escaped}</em>"
+            if annotations.get("underline"):
+                escaped = f"<u>{escaped}</u>"
+            if annotations.get("strikethrough"):
+                escaped = f"<s>{escaped}</s>"
+
+            # テキストカラー / 背景色
+            color = annotations.get("color", "default")
+            if color and color != "default":
+                if color in NOTION_TEXT_COLOR_MAP:
+                    escaped = f'<span style="color: {NOTION_TEXT_COLOR_MAP[color]};">{escaped}</span>'
+                elif color in NOTION_BG_COLOR_MAP:
+                    escaped = f'<span style="background-color: {NOTION_BG_COLOR_MAP[color]}; padding: 2px 4px; border-radius: 3px;">{escaped}</span>'
+
+            # リンク
+            text_obj = item.get("text") or {}
+            link_obj = text_obj.get("link") or {}
+            href = link_obj.get("url") if isinstance(link_obj, dict) else None
+            if not href and item.get("href"):
+                href = item.get("href")
+            if href:
+                # Notion内部リンク / クロスブロックリンク（UUID検出）
+                m = UUID_PATTERN.findall(href)
+                target_uuid = m[-1].lower() if m else None
+                target_title = None
+                target_info = None
+
+                if target_uuid:
+                    # ハイフン付き・なし両方に対応
+                    for key in (target_uuid, f"{target_uuid[:8]}-{target_uuid[8:12]}-{target_uuid[12:16]}-{target_uuid[16:20]}-{target_uuid[20:]}"):
+                        if self.id_to_title_map and key in self.id_to_title_map:
+                            target_title = self.id_to_title_map[key]
+                        if self.migration_map and key in self.migration_map:
+                            target_info = self.migration_map[key]
+                        if target_title or target_info:
+                            break
+
+                if target_info and target_info.get("node_type") == "database":
+                    db_url = target_info.get("web_url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
+                    escaped = f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(target_info.get("title", escaped))}</a>'
+                elif target_title:
+                    escaped_title = html.escape(target_title)
+                    escaped = (
+                        f'<ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-title="{escaped_title}" />'
+                        f'<ac:link-body>{escaped}</ac:link-body>'
+                        f'</ac:link>'
+                    )
+                else:
+                    escaped = f'<a href="{html.escape(href)}">{escaped}</a>'
+
+            result.append(escaped)
+
+        return "".join(result)
+
+    def blocks_to_storage_format(self, blocks: List[Dict[str, Any]], context_heading: str = "") -> str:
+        """NotionブロックのリストをConfluence Storage Format (XHTML) に変換する。
+        連続する箇条書き、番号付きリスト、ToDoリストを適切にタグでラップする。"""
+        output = []
+        current_list_type = None  # "bulleted", "numbered", "to_do"
+        list_buffer = []
+        current_heading = context_heading
+
+        def flush_list():
+            nonlocal current_list_type, list_buffer
+            if not current_list_type:
+                return
+            if current_list_type == "bulleted":
+                output.append("<ul>" + "".join(list_buffer) + "</ul>")
+            elif current_list_type == "numbered":
+                output.append("<ol>" + "".join(list_buffer) + "</ol>")
+            elif current_list_type == "to_do":
+                output.append(
+                    '<ac:task-list>' + "".join(list_buffer) + '</ac:task-list>'
+                )
+            current_list_type = None
+            list_buffer = []
+
+        for b in blocks:
+            b_type = b.get("type")
+
+            # リスト系の処理
+            if b_type == "bulleted_list_item":
+                if current_list_type != "bulleted":
+                    flush_list()
+                    current_list_type = "bulleted"
+                text = self.convert_rich_text(b.get("bulleted_list_item", {}).get("rich_text", []))
+                nested_html = ""
+                if b.get("children_blocks"):
+                    nested_html = self.blocks_to_storage_format(b["children_blocks"])
+                list_buffer.append(f"<li>{text}{nested_html}</li>")
+                continue
+
+            elif b_type == "numbered_list_item":
+                if current_list_type != "numbered":
+                    flush_list()
+                    current_list_type = "numbered"
+                text = self.convert_rich_text(b.get("numbered_list_item", {}).get("rich_text", []))
+                nested_html = ""
+                if b.get("children_blocks"):
+                    nested_html = self.blocks_to_storage_format(b["children_blocks"])
+                list_buffer.append(f"<li>{text}{nested_html}</li>")
+                continue
+
+            elif b_type == "to_do":
+                if current_list_type != "to_do":
+                    flush_list()
+                    current_list_type = "to_do"
+                todo_data = b.get("to_do", {})
+                is_checked = todo_data.get("checked", False)
+                status = "complete" if is_checked else "incomplete"
+                text = self.convert_rich_text(todo_data.get("rich_text", []))
+                nested_html = ""
+                if b.get("children_blocks"):
+                    nested_html = self.blocks_to_storage_format(b["children_blocks"])
+                list_buffer.append(
+                    f'<ac:task><ac:task-status>{status}</ac:task-status><ac:task-body>{text}{nested_html}</ac:task-body></ac:task>'
+                )
+                continue
+
+            # リスト以外のブロックが来たらバッファをフラッシュ
+            flush_list()
+
+            if b_type == "paragraph":
+                text = self.convert_rich_text(b.get("paragraph", {}).get("rich_text", []))
+                children_html = ""
+                if b.get("children_blocks"):
+                    children_html = self.blocks_to_storage_format(b["children_blocks"])
+                output.append(f"<p>{text if text else '<br />'}</p>{children_html}")
+
+            elif b_type == "heading_1":
+                h_data = b.get("heading_1", {})
+                text = self.convert_rich_text(h_data.get("rich_text", []))
+                current_heading = text
+                if h_data.get("is_toggleable") and b.get("children_blocks"):
+                    children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
+                    output.append(
+                        f'<ac:structured-macro ac:name="expand">'
+                        f'<ac:parameter ac:name="title">{text if text else "詳細"}</ac:parameter>'
+                        f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
+                        f'</ac:structured-macro>'
+                    )
+                else:
+                    output.append(f"<h1>{text}</h1>")
+
+            elif b_type == "heading_2":
+                h_data = b.get("heading_2", {})
+                text = self.convert_rich_text(h_data.get("rich_text", []))
+                current_heading = text
+                if h_data.get("is_toggleable") and b.get("children_blocks"):
+                    children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
+                    output.append(
+                        f'<ac:structured-macro ac:name="expand">'
+                        f'<ac:parameter ac:name="title">{text if text else "詳細"}</ac:parameter>'
+                        f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
+                        f'</ac:structured-macro>'
+                    )
+                else:
+                    output.append(f"<h2>{text}</h2>")
+
+            elif b_type == "heading_3":
+                h_data = b.get("heading_3", {})
+                text = self.convert_rich_text(h_data.get("rich_text", []))
+                current_heading = text
+                if h_data.get("is_toggleable") and b.get("children_blocks"):
+                    children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
+                    output.append(
+                        f'<ac:structured-macro ac:name="expand">'
+                        f'<ac:parameter ac:name="title">{text if text else "詳細"}</ac:parameter>'
+                        f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
+                        f'</ac:structured-macro>'
+                    )
+                else:
+                    output.append(f"<h3>{text}</h3>")
+
+            elif b_type == "table_of_contents":
+                # Confluence 目次マクロ (TOC Macro)
+                output.append(
+                    '<ac:structured-macro ac:name="toc">'
+                    '<ac:parameter ac:name="maxLevel">3</ac:parameter>'
+                    '<ac:parameter ac:name="type">list</ac:parameter>'
+                    '</ac:structured-macro>'
+                )
+
+            elif b_type == "column_list":
+                # Confluence セクションマクロ (Section / Columns)
+                columns_html = []
+                for col in b.get("children_blocks", []):
+                    col_content = self.blocks_to_storage_format(col.get("children_blocks", []))
+                    columns_html.append(
+                        f'<ac:structured-macro ac:name="column">'
+                        f'<ac:rich-text-body>{col_content if col_content else "<p></p>"}</ac:rich-text-body>'
+                        f'</ac:structured-macro>'
+                    )
+                output.append(
+                    f'<ac:structured-macro ac:name="section">'
+                    f'<ac:rich-text-body>{"".join(columns_html)}</ac:rich-text-body>'
+                    f'</ac:structured-macro>'
+                )
+
+            elif b_type == "equation":
+                # 数式ブロック: Confluence Cloud標準で100%エラーなく美しく表示するため高解像度画像として埋め込み
+                expr = b.get("equation", {}).get("expression", "")
+                block_id_short = b.get("id", "").replace("-", "")[:8]
+                filename = b.get("_attachment_filename") or f"equation_{block_id_short}.png"
+                output.append(
+                    f'<p><ac:image ac:align="center">'
+                    f'<ri:attachment ri:filename="{html.escape(filename)}" />'
+                    f'</ac:image></p>'
+                )
+
+            elif b_type == "code":
+                code_data = b.get("code", {})
+                lang = code_data.get("language", "text")
+                raw_code = "".join(t.get("plain_text", "") for t in code_data.get("rich_text", []))
+                is_mermaid, clean_mermaid = self.is_mermaid_code(lang, raw_code)
+
+                if is_mermaid:
+                    # Task B.8: 方式② Confluence codeマクロ (language: mermaid) による完全ローカル・外部API不要のネイティブ移行
+                    caption_list = code_data.get("caption", [])
+                    caption_text = "".join(t.get("plain_text", "") for t in caption_list) if caption_list else ""
+                    macro_title = caption_text or "📊 Mermaid ダイアグラム"
+                    safe_cdata = raw_code.replace("]]>", "]]]]><![CDATA[>")
+                    output.append(
+                        f'<ac:structured-macro ac:name="code">'
+                        f'<ac:parameter ac:name="language">mermaid</ac:parameter>'
+                        f'<ac:parameter ac:name="title">{html.escape(macro_title)}</ac:parameter>'
+                        f'<ac:parameter ac:name="linenumbers">true</ac:parameter>'
+                        f'<ac:plain-text-body><![CDATA[{safe_cdata}]]></ac:plain-text-body>'
+                        f'</ac:structured-macro>'
+                    )
+                else:
+                    safe_cdata = raw_code.replace("]]>", "]]]]><![CDATA[>")
+                    output.append(
+                        f'<ac:structured-macro ac:name="code">'
+                        f'<ac:parameter ac:name="language">{html.escape(lang)}</ac:parameter>'
+                        f'<ac:parameter ac:name="linenumbers">true</ac:parameter>'
+                        f'<ac:plain-text-body><![CDATA[{safe_cdata}]]></ac:plain-text-body>'
+                        f'</ac:structured-macro>'
+                    )
+
+            elif b_type == "quote":
+                text = self.convert_rich_text(b.get("quote", {}).get("rich_text", []))
+                children_html = ""
+                if b.get("children_blocks"):
+                    children_html = self.blocks_to_storage_format(b["children_blocks"])
+                output.append(f"<blockquote><p>{text}</p>{children_html}</blockquote>")
+
+            elif b_type == "callout":
+                callout_data = b.get("callout", {})
+                color = callout_data.get("color", "default").lower()
+                icon_obj = callout_data.get("icon") or {}
+                emoji = icon_obj.get("emoji") if icon_obj.get("type") == "emoji" else None
+                text = self.convert_rich_text(callout_data.get("rich_text", []))
+
+                # マクロ名と背景色・Confluence側システムアイコンの対応:
+                # - note: 黄色背景 ＋ ⚠️ アイコン
+                # - warning: 赤色背景 ＋ ❌ アイコン
+                # - tip: 緑色背景 ＋ ✔ アイコン
+                # - info: 青色背景 ＋ ⓘ アイコン
+                is_red = any(c in color for c in ("red", "pink")) or emoji in {"🚨", "🛑", "⛔", "❌", "🔥"}
+                is_yellow = any(c in color for c in ("yellow", "orange")) or emoji in {"⚠️", "❗", "❕", "⚡"}
+                is_green = "green" in color or emoji in {"💡", "✨", "⭐", "🌟", "🌱", "🔑", "✅"}
+
+                if is_red:
+                    macro_name = "warning"  # 赤背景・❌
+                elif is_yellow:
+                    macro_name = "note"     # 黄色背景・⚠️
+                elif is_green:
+                    macro_name = "tip"      # 緑色背景・✔
+                else:
+                    macro_name = "info"     # 青色背景・ⓘ
+
+                # Confluenceの各マクロは左端に固定アイコン（ⓘ, ⚠️, ✔, ❌）を自動描画するため、
+                # それらと意味が重複・競合する絵文字（ℹ️, ⚠️, 💡, 📝, etc）は本文先頭に入れず、
+                # マクロのシステムアイコンに任せることで「異なる意味のアイコンが2重に並ぶ」問題を完全に解消。
+                # ロケット（🚀）やターゲット（🎯）など、特殊なカスタムアイコンの場合のみ先頭に残す。
+                standard_callout_emojis = {
+                    "ℹ️", "⚠️", "💡", "📝", "❌", "❗", "❕", "🚨", "🛑", "⚡",
+                    "✨", "⭐", "🌟", "🌱", "🔑", "✅", "📌", "📋", "✏️", "🗒️", "📖", "🔖", "🔍", "💬", "📢"
+                }
+                if emoji and emoji not in standard_callout_emojis:
+                    text = f"{emoji} {text}" if text else emoji
+
+                children_html = ""
+                if b.get("children_blocks"):
+                    children_html = self.blocks_to_storage_format(b["children_blocks"])
+
+                output.append(
+                    f'<ac:structured-macro ac:name="{macro_name}">'
+                    f'<ac:rich-text-body><p>{text}</p>{children_html}</ac:rich-text-body>'
+                    f'</ac:structured-macro>'
+                )
+
+            elif b_type == "toggle":
+                toggle_data = b.get("toggle", {})
+                title_text = self.convert_rich_text(toggle_data.get("rich_text", [])) or "詳細"
+                children_html = ""
+                if b.get("children_blocks"):
+                    children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=title_text)
+                output.append(
+                    f'<ac:structured-macro ac:name="expand">'
+                    f'<ac:parameter ac:name="title">{title_text}</ac:parameter>'
+                    f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
+                    f'</ac:structured-macro>'
+                )
+
+            elif b_type == "divider":
+                output.append("<hr />")
+
+            elif b_type == "table":
+                output.append(self._convert_simple_table(b))
+
+            elif b_type == "child_page":
+                child_title = b.get("child_page", {}).get("title", "Untitled Page")
+                if hasattr(self, "migration_map") and self.migration_map:
+                    for m in self.migration_map.values():
+                        if m.get("node_type") == "page":
+                            m_title = m.get("title", "")
+                            if m_title == child_title or m_title.endswith(child_title):
+                                child_title = m_title
+                                break
+                escaped_title = html.escape(child_title)
+                # Confluenceのインラインスマートリンクオブジェクト（ページアイコン自動表示・プレビュー対応）
+                output.append(
+                    f'<p><ac:link ac:card-appearance="inline">'
+                    f'<ri:page ri:content-title="{escaped_title}" />'
+                    f'<ac:link-body>{escaped_title}</ac:link-body>'
+                    f'</ac:link></p>'
+                )
+
+            elif b_type == "child_database":
+                if b.get("is_linked_database"):
+                    # Notionのリンクされたデータベースビュー（Linked Database View）
+                    data_sources = b.get("data_sources", [])
+                    views_info = b.get("views", [])
+                    source_name = data_sources[0].get("name", "") if data_sources else ""
+
+                    db_info = None
+                    if hasattr(self, "migration_map") and self.migration_map:
+                        for mid, minfo in self.migration_map.items():
+                            if minfo.get("node_type") == "database":
+                                m_title = minfo.get("title", "")
+                                if m_title == source_name or m_title.endswith(source_name):
+                                    db_info = minfo
+                                    break
+
+                    if db_info:
+                        db_url = db_info.get("url")
+                        conf_views = db_info.get("views", {})
+
+                        primary_view = views_info[0] if views_info else {}
+                        v_name = primary_view.get("name", "")
+                        v_type = primary_view.get("type", "")
+                        v_config = primary_view.get("configuration", {}) or {}
+                        group_by = v_config.get("group_by")
+
+                        # Notionで Group by（グループ化）が設定されたビューの場合：
+                        # Confluence Databasesには単一ビュー内でのGroup by機能がないため、
+                        # ハイブリッド方式（未完了グループ: 未着手・進行中等は常時展開の見出し＋完了グループ: 完了等はExpandマクロ折りたたみ）として自動近似移植する
+                        if group_by and group_by.get("property_name"):
+                            prop_name = group_by.get("property_name")
+                            open_groups = []
+                            collapsed_groups = []
+                            for cv_name, cv_id in conf_views.items():
+                                if cv_name.startswith(f"{prop_name}: "):
+                                    gval = cv_name[len(f"{prop_name}: "):]
+                                    if any(done_word in gval for done_word in ("完了", "Done", "Closed", "アーカイブ")):
+                                        collapsed_groups.append((gval, cv_id))
+                                    else:
+                                        open_groups.append((gval, cv_id))
+
+                            if open_groups or collapsed_groups:
+                                hybrid_parts = []
+                                for gval, vid in open_groups:
+                                    card = self.generate_database_view_embed(db_url, vid)
+                                    hybrid_parts.append(f"<h3>📌 {html.escape(prop_name)}: {html.escape(gval)} (常時展開)</h3>\n{card}")
+                                for gval, vid in collapsed_groups:
+                                    card = self.generate_database_view_embed(db_url, vid)
+                                    title_text = html.escape(f"📂 {prop_name}: {gval} (折りたたみ保管)")
+                                    hybrid_parts.append(
+                                        f'<ac:structured-macro ac:name="expand">'
+                                        f'<ac:parameter ac:name="title">{title_text}</ac:parameter>'
+                                        f'<ac:rich-text-body>{card}</ac:rich-text-body>'
+                                        f'</ac:structured-macro>'
+                                    )
+                                output.append("\n".join(hybrid_parts))
+                                continue
+
+                        target_view_id = None
+                        views_list = db_info.get("views_info", [])
+
+                        if v_type == "board" or "ボード" in v_name:
+                            board_group_field = group_by.get("property_name") if group_by else None
+                            # 1. views_info から type == 'board' を最優先で検索
+                            if views_list:
+                                if board_group_field:
+                                    target_view_id = next((v["id"] for v in views_list if v.get("type") == "board" and board_group_field in v.get("name", "")), None)
+                                if not target_view_id:
+                                    target_view_id = next((v["id"] for v in views_list if v.get("type") == "board"), None)
+
+                            # 2. conf_views からフォールバック
+                            if not target_view_id:
+                                if board_group_field:
+                                    target_view_id = next((vid for name, vid in conf_views.items() if board_group_field in name and ("ボード" in name or "board" in name.lower())), None)
+                                if not target_view_id:
+                                    target_view_id = next((vid for name, vid in conf_views.items() if "ボード" in name or "board" in name.lower()), None)
+
+                        elif v_type == "gallery" or "ギャラリー" in v_name:
+                            # 1. views_info から type == 'gallery' を最優先で検索
+                            if views_list:
+                                target_view_id = next((v["id"] for v in views_list if v.get("type") == "gallery"), None)
+                            # 2. conf_views からフォールバック
+                            if not target_view_id:
+                                target_view_id = next((vid for name, vid in conf_views.items() if "ギャラリー" in name or "gallery" in name.lower()), None)
+
+                        elif "未着手" in v_name:
+                            target_view_id = next((vid for name, vid in conf_views.items() if "未着手" in name), None)
+                        elif "進行中" in v_name:
+                            target_view_id = next((vid for name, vid in conf_views.items() if "進行中" in name), None)
+                        elif "完了" in v_name:
+                            target_view_id = next((vid for name, vid in conf_views.items() if "完了" in name), None)
+                        else:
+                            target_view_id = next((vid for name, vid in conf_views.items() if "すべてのデータ" in name or "default" in name.lower()), None)
+
+                        embed_html = self.generate_database_view_embed(db_url, target_view_id)
+
+                        # 完了グループは方式A（Expandマクロ折りたたみ）でラップ（全体ビューであるboard/galleryは除外）
+                        is_completed_group = (v_type not in ("board", "gallery")) and (
+                            v_name == "完了" or "ステータス: 完了" in v_name or (": 完了" in v_name)
+                        )
+                        if is_completed_group:
+                            output.append(
+                                f'<ac:structured-macro ac:name="expand">'
+                                f'<ac:parameter ac:name="title">📂 ステータス: 完了 (折りたたみ保管)</ac:parameter>'
+                                f'<ac:rich-text-body>{embed_html}</ac:rich-text-body>'
+                                f'</ac:structured-macro>'
+                            )
+                        else:
+                            output.append(embed_html)
+                    else:
+                        output.append(f'<p>📊 <em>データベースビュー: {html.escape(source_name)}</em></p>')
+
+                else:
+                    db_title = b.get("database_title") or b.get("child_database", {}).get("title", "Untitled Database")
+                    escaped_title = html.escape(db_title)
+                    db_url = None
+                    if hasattr(self, "migration_map") and self.migration_map:
+                        # Notion ID またはタイトル一致でマッピングされた Confluence Database の URL を検索
+                        m_entry = self.migration_map.get(b.get("id"))
+                        if m_entry and m_entry.get("node_type") == "database":
+                            db_url = m_entry.get("url")
+                        if not db_url:
+                            for m in self.migration_map.values():
+                                if m.get("node_type") == "database":
+                                    m_title = m.get("title", "")
+                                    if m_title == db_title or m_title.endswith(db_title):
+                                        db_url = m.get("url")
+                                        break
+
+                    if db_url:
+                        # Confluence Databases は page ではなく database オブジェクトのため、スマートリンク（URL）として出力
+                        escaped_db_url = html.escape(db_url)
+                        output.append(
+                            f'<p><a href="{escaped_db_url}" data-card-appearance="inline">{escaped_title}</a></p>'
+                        )
+                    else:
+                        output.append(
+                            f'<p><ac:link ac:card-appearance="inline">'
+                            f'<ri:page ri:content-title="{escaped_title}" />'
+                            f'<ac:link-body>{escaped_title}</ac:link-body>'
+                            f'</ac:link></p>'
+                        )
+
+            elif b_type == "link_to_page":
+                link_data = b.get("link_to_page", {})
+                target_page_id = link_data.get("page_id") or link_data.get("database_id")
+                saved_view_id = link_data.get("saved_view_id")
+                db_url = link_data.get("db_url")
+
+                # migration_map からデータベース/ページ情報を逆引き
+                db_info = None
+                if target_page_id and hasattr(self, "migration_map") and self.migration_map:
+                    norm_id = target_page_id.replace("-", "").lower()
+                    db_info = self.migration_map.get(target_page_id) or self.migration_map.get(norm_id)
+                    if not db_info:
+                        for mid, minfo in self.migration_map.items():
+                            if mid.replace("-", "").lower() == norm_id:
+                                db_info = minfo
+                                break
+
+                if db_info and db_info.get("node_type") == "database":
+                    db_url = db_info.get("url")
+                    views = db_info.get("views", {})
+                    active_context = (context_heading or current_heading).strip()
+
+                    # 見出し・トグルの文脈に応じた最適なConfluence DatabasesビューIDの自動選択
+                    if not saved_view_id and views:
+                        act_lower = active_context.lower()
+                        if any(kw in act_lower for kw in ("ボード", "カンバン", "board")):
+                            saved_view_id = next((vid for name, vid in views.items() if "ボード" in name or "board" in name.lower()), None)
+                        elif any(kw in act_lower for kw in ("ギャラリー", "カード", "gallery")):
+                            saved_view_id = next((vid for name, vid in views.items() if "ギャラリー" in name or "gallery" in name.lower()), None)
+                        elif any(kw in act_lower for kw in ("リスト", "list", "テーブル", "table")):
+                            saved_view_id = next((vid for name, vid in views.items() if "すべてのデータ" in name or "default" in name.lower()), None)
+                        else:
+                            # Group by フィルタービューの自動マッピング (未着手, 進行中, 完了 etc.)
+                            for vname, vid in views.items():
+                                clean_vname = vname.split(": ")[-1] if ": " in vname else vname
+                                if clean_vname in active_context:
+                                    saved_view_id = vid
+                                    break
+
+                    output.append(self.generate_database_view_embed(db_url, saved_view_id))
+
+                elif db_url:
+                    output.append(self.generate_database_view_embed(db_url, saved_view_id))
+                else:
+                    target_title = None
+                    if target_page_id and self.id_to_title_map:
+                        norm_id = target_page_id.replace("-", "").lower()
+                        target_title = self.id_to_title_map.get(target_page_id) or self.id_to_title_map.get(norm_id)
+                    if target_title:
+                        escaped_title = html.escape(target_title)
+                        output.append(
+                            f'<p><ac:link ac:card-appearance="inline">'
+                            f'<ri:page ri:content-title="{escaped_title}" />'
+                            f'<ac:link-body>{escaped_title}</ac:link-body>'
+                            f'</ac:link></p>'
+                        )
+                    else:
+                        output.append(
+                            f'<p>🔗 <em>Notionリンク: {target_page_id}</em></p>'
+                        )
+
+            elif b_type == "synced_block":
+                synced_data = b.get("synced_block", {})
+                synced_from = synced_data.get("synced_from")
+                children_blocks = b.get("children_blocks", [])
+                if children_blocks:
+                    children_html = self.blocks_to_storage_format(children_blocks)
+                    # Notionの同期ブロック風に、左端に薄紫のバーを配したコンテナとして描画
+                    output.append(
+                        f'<div style="border-left: 3px solid #8777D9; padding-left: 14px; margin: 12px 0;">'
+                        f'{children_html}'
+                        f'</div>'
+                    )
+                elif synced_from:
+                    sync_orig_id = synced_from.get("block_id", "")
+                    output.append(
+                        f'<p>🔄 <em>同期ブロック（同期元: {html.escape(sync_orig_id)}）</em></p>'
+                    )
+
+            elif b_type in ("embed", "figma", "miro", "trello", "maps", "google_drive", "twitter", "gist", "codepen"):
+                embed_data = b.get(b_type, {})
+                url = embed_data.get("url", "")
+                caption = self.convert_rich_text(embed_data.get("caption", []))
+                caption_html = f"<p><em>{caption}</em></p>" if caption else ""
+                if url:
+                    # Confluenceのスマートリンク Embed カード + 直リンク
+                    output.append(
+                        f'<p><a href="{html.escape(url)}" data-card-appearance="embed">{html.escape(url)}</a></p>'
+                        f'<p>🔗 <a href="{html.escape(url)}">{html.escape(url)}</a></p>'
+                        f'{caption_html}'
+                    )
+
+            elif b_type == "link_preview":
+                lp_data = b.get("link_preview", {})
+                url = lp_data.get("url", "")
+                if url:
+                    output.append(
+                        f'<p><a href="{html.escape(url)}" data-card-appearance="block">{html.escape(url)}</a></p>'
+                    )
+
+            elif b_type in ("breadcrumb", "unsupported", "button", "template"):
+                # Notion固有・Confluence非対応ブロックのフォールバック表示
+                b_name_map = {
+                    "breadcrumb": "ページ内パンくず (Breadcrumb)",
+                    "button": "アクションボタン (Button)",
+                    "template": "テンプレートボタン (Template)",
+                    "unsupported": "未対応独自機能 (Unsupported)",
+                }
+                disp_name = b_name_map.get(b_type, f"Notionブロック ({b_type})")
+                children_html = ""
+                if b.get("children_blocks"):
+                    children_html = self.blocks_to_storage_format(b["children_blocks"])
+                output.append(
+                    f'<ac:structured-macro ac:name="note">'
+                    f'<ac:parameter ac:name="title">⚠️ Notion固有機能: {html.escape(disp_name)}</ac:parameter>'
+                    f'<ac:rich-text-body><p>この要素（種別: <code>{html.escape(b_type)}</code>）はConfluence側に同等の機能が存在しないため、フォールバック注記として保持されています。</p>{children_html}</ac:rich-text-body>'
+                    f'</ac:structured-macro>'
+                )
+
+            elif b_type == "bookmark":
+                bm_data = b.get("bookmark", {})
+                url = bm_data.get("url", "")
+                caption = self.convert_rich_text(bm_data.get("caption", []))
+                caption_html = f"<p><em>{caption}</em></p>" if caption else ""
+                if url:
+                    output.append(
+                        f'<p><a href="{html.escape(url)}" data-card-appearance="block">{html.escape(url)}</a></p>{caption_html}'
+                    )
+
+            elif b_type == "image":
+                img_data = b.get("image", {})
+                img_file = img_data.get("file") or {}
+                img_ext = img_data.get("external") or {}
+                img_url = img_file.get("url") or img_ext.get("url", "")
+                filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
+                caption = self.convert_rich_text(img_data.get("caption", []))
+                caption_html = f"<p><em>{caption}</em></p>" if caption else ""
+                if img_url or filename:
+                    output.append(
+                        f'<p><ac:image>'
+                        f'<ri:attachment ri:filename="{html.escape(filename)}" />'
+                        f'</ac:image></p>{caption_html}'
+                    )
+
+            elif b_type == "pdf":
+                pdf_data = b.get("pdf", {})
+                pdf_file = pdf_data.get("file") or {}
+                pdf_ext = pdf_data.get("external") or {}
+                pdf_url = pdf_file.get("url") or pdf_ext.get("url", "")
+                filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
+                caption = self.convert_rich_text(pdf_data.get("caption", []))
+                caption_html = f"<p><em>{caption}</em></p>" if caption else ""
+                if b.get("_attachment_uploaded", True):
+                    safe_fn_cdata = filename.replace("]]>", "]]]]><![CDATA[>")
+                    output.append(
+                        f'<p><ac:structured-macro ac:name="view-file">'
+                        f'<ac:parameter ac:name="name"><ri:attachment ri:filename="{html.escape(filename)}" /></ac:parameter>'
+                        f'</ac:structured-macro></p>'
+                        f'<p><ac:link>'
+                        f'<ri:attachment ri:filename="{html.escape(filename)}" />'
+                        f'<ac:plain-text-link-body><![CDATA[📄 {safe_fn_cdata} (クリックしてプレビュー・ダウンロード)]]></ac:plain-text-link-body>'
+                        f'</ac:link></p>{caption_html}'
+                    )
+                elif pdf_url:
+                    output.append(
+                        f'<p>📄 <a href="{html.escape(pdf_url)}">PDF文書を開く: {html.escape(filename)}</a></p>{caption_html}'
+                    )
+
+            elif b_type == "file":
+                file_data = b.get("file", {})
+                file_file = file_data.get("file") or {}
+                file_ext = file_data.get("external") or {}
+                file_url = file_file.get("url") or file_ext.get("url", "")
+                filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
+                caption = self.convert_rich_text(file_data.get("caption", []))
+                caption_html = f"<p><em>{caption}</em></p>" if caption else ""
+                if b.get("_attachment_uploaded", True):
+                    safe_fn_cdata = filename.replace("]]>", "]]]]><![CDATA[>")
+                    output.append(
+                        f'<p><ac:link>'
+                        f'<ri:attachment ri:filename="{html.escape(filename)}" />'
+                        f'<ac:plain-text-link-body><![CDATA[📎 {safe_fn_cdata} (添付ファイルをダウンロード)]]></ac:plain-text-link-body>'
+                        f'</ac:link></p>{caption_html}'
+                    )
+                elif file_url:
+                    output.append(
+                        f'<p>📎 <a href="{html.escape(file_url)}">添付ファイルを開く: {html.escape(filename)}</a></p>{caption_html}'
+                    )
+
+            elif b_type == "video":
+                video_data = b.get("video", {})
+                video_file = video_data.get("file") or {}
+                video_ext = video_data.get("external") or {}
+                video_url = video_file.get("url") or video_ext.get("url", "")
+                caption = self.convert_rich_text(video_data.get("caption", []))
+                caption_html = f"<p><em>{caption}</em></p>" if caption else ""
+
+                is_embed_service = any(h in video_url.lower() for h in ("youtube.com", "youtu.be", "vimeo.com", "loom.com", "twitch.tv", "wistia.com"))
+                if is_embed_service:
+                    output.append(
+                        f'<ac:structured-macro ac:name="info">'
+                        f'<ac:parameter ac:name="title">🎥 動画コンテンツ</ac:parameter>'
+                        f'<ac:rich-text-body>'
+                        f'<p><a href="{html.escape(video_url)}" data-card-appearance="embed">{html.escape(video_url)}</a></p>'
+                        f'<p>🔗 <a href="{html.escape(video_url)}">動画を別ウィンドウで開いて視聴する ({html.escape(video_url)})</a></p>'
+                        f'{caption_html}'
+                        f'</ac:rich-text-body>'
+                        f'</ac:structured-macro>'
+                    )
+                else:
+                    filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
+                    if b.get("_attachment_uploaded", True):
+                        safe_fn_cdata = filename.replace("]]>", "]]]]><![CDATA[>")
+                        output.append(
+                            f'<p><ac:structured-macro ac:name="multimedia">'
+                            f'<ac:parameter ac:name="name"><ri:attachment ri:filename="{html.escape(filename)}" /></ac:parameter>'
+                            f'</ac:structured-macro></p>'
+                            f'<p><ac:link>'
+                            f'<ri:attachment ri:filename="{html.escape(filename)}" />'
+                            f'<ac:plain-text-link-body><![CDATA[🎬 {safe_fn_cdata} (動画再生・ダウンロード)]]></ac:plain-text-link-body>'
+                            f'</ac:link></p>{caption_html}'
+                        )
+                    else:
+                        output.append(
+                            f'<p>🎬 <a href="{html.escape(video_url)}">動画を再生・ダウンロード: {html.escape(filename)}</a></p>{caption_html}'
+                        )
+
+            elif b_type == "audio":
+                audio_data = b.get("audio", {})
+                audio_file = audio_data.get("file") or {}
+                audio_ext = audio_data.get("external") or {}
+                audio_url = audio_file.get("url") or audio_ext.get("url", "")
+                caption = self.convert_rich_text(audio_data.get("caption", []))
+                caption_html = f"<p><em>{caption}</em></p>" if caption else ""
+
+                is_embed_service = any(h in audio_url.lower() for h in ("spotify.com", "soundcloud.com", "apple.com"))
+                if is_embed_service:
+                    output.append(
+                        f'<ac:structured-macro ac:name="info">'
+                        f'<ac:parameter ac:name="title">🎵 音声コンテンツ</ac:parameter>'
+                        f'<ac:rich-text-body>'
+                        f'<p><a href="{html.escape(audio_url)}" data-card-appearance="embed">{html.escape(audio_url)}</a></p>'
+                        f'<p>🔗 <a href="{html.escape(audio_url)}">音声を別ウィンドウで再生する</a></p>'
+                        f'{caption_html}'
+                        f'</ac:rich-text-body>'
+                        f'</ac:structured-macro>'
+                    )
+                else:
+                    filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
+                    if b.get("_attachment_uploaded", True):
+                        safe_fn_cdata = filename.replace("]]>", "]]]]><![CDATA[>")
+                        output.append(
+                            f'<p><ac:structured-macro ac:name="multimedia">'
+                            f'<ac:parameter ac:name="name"><ri:attachment ri:filename="{html.escape(filename)}" /></ac:parameter>'
+                            f'</ac:structured-macro></p>'
+                            f'<p><ac:link>'
+                            f'<ri:attachment ri:filename="{html.escape(filename)}" />'
+                            f'<ac:plain-text-link-body><![CDATA[🎵 {safe_fn_cdata} (音声ダウンロード)]]></ac:plain-text-link-body>'
+                            f'</ac:link></p>{caption_html}'
+                        )
+                    else:
+                        output.append(
+                            f'<p>🎵 <a href="{html.escape(audio_url)}">音声ファイルを再生・ダウンロード: {html.escape(filename)}</a></p>{caption_html}'
+                        )
+
+            else:
+                # 未知・未対応のNotionブロック型
+                logger.warning(f"Unknown or unsupported Notion block type: {b_type}")
+                children_html = ""
+                if b.get("children_blocks"):
+                    children_html = self.blocks_to_storage_format(b["children_blocks"])
+                output.append(
+                    f'<ac:structured-macro ac:name="note">'
+                    f'<ac:parameter ac:name="title">⚠️ 未対応ブロック: {html.escape(str(b_type))}</ac:parameter>'
+                    f'<ac:rich-text-body><p>種別 <code>{html.escape(str(b_type))}</code> のNotionブロックが検出されました。</p>{children_html}</ac:rich-text-body>'
+                    f'</ac:structured-macro>'
+                )
+
+        flush_list()
+        return "\n".join(output)
+
+    def _convert_simple_table(self, table_block: Dict[str, Any]) -> str:
+        """シンプルテーブルのブロックをConfluenceのtableタグに変換する。"""
+        rows = table_block.get("children_blocks", [])
+        has_header = table_block.get("table", {}).get("has_column_header", False)
+
+        html_rows = []
+        for idx, row in enumerate(rows):
+            cells = row.get("table_row", {}).get("cells", [])
+            tag = "th" if (idx == 0 and has_header) else "td"
+            cell_strs = []
+            for cell in cells:
+                cell_content = self.convert_rich_text(cell)
+                cell_strs.append(f"<{tag}>{cell_content}</{tag}>")
+            html_rows.append(f"<tr>{''.join(cell_strs)}</tr>")
+
+        return f'<table class="wrapped"><tbody>{"".join(html_rows)}</tbody></table>'
+
+    def _escape_csv_cell(self, val: Any) -> str:
+        """Confluence Database CSV用の安全なセルエスケープ。"""
+        if val is None:
+            return '""'
+        s = str(val).strip()
+        if not s or s == "-":
+            return '""'
+        if any(c in s for c in (',', '"', '\n', '\r')):
+            escaped = s.replace('"', '""')
+            return f'"{escaped}"'
+        return s
+
+    def _format_prop_for_csv(self, prop: Any, prop_name: str, fallback_title: str) -> str:
+        """NotionプロパティをConfluence Database CSV用のセル値に変換する。"""
+        if prop is None:
+            return ""
+        if not isinstance(prop, dict):
+            return str(prop)
+
+        p_type = prop.get("type")
+        if p_type == "title":
+            val = prop.get("value") or fallback_title
+            return str(val) if val else ""
+        elif p_type in ("select", "status"):
+            val = prop.get("value")
+            return str(val) if val else ""
+        elif p_type == "multi_select":
+            items = prop.get("items", [])
+            vals = [it.get("value") for it in items if it.get("value")]
+            return "|".join(vals) if vals else ""
+        elif p_type == "date":
+            start = prop.get("start")
+            if not start:
+                return ""
+            return start.split("T")[0]
+        elif p_type == "checkbox":
+            return "完了" if prop.get("value") else "未完了"
+        elif p_type == "url":
+            val = prop.get("value")
+            return str(val) if val else ""
+        elif p_type == "number":
+            val = prop.get("value")
+            return str(val) if val is not None else ""
+        elif p_type == "people":
+            users = prop.get("users", [])
+            if self.user_mapper and self.user_mapper.mappings:
+                acc_ids = []
+                for u in users:
+                    u_id = u.get("id")
+                    u_name = u.get("name")
+                    u_email = u.get("person", {}).get("email") if isinstance(u.get("person"), dict) else None
+                    m = self.user_mapper.resolve_user(user_id=u_id, email=u_email, name=u_name)
+                    if m and m.is_resolved():
+                        acc_ids.append(m.confluence_account_id)
+                if acc_ids:
+                    return "|".join(acc_ids)
+            names = [u.get("name") for u in users if u.get("name")]
+            return ", ".join(names) if names else ""
+        elif p_type == "relation":
+            relations = prop.get("relations", [])
+            titles = []
+            for r in relations:
+                t_id = r.get("id")
+                t_title = self.id_to_title_map.get(t_id)
+                titles.append(t_title if t_title else t_id[:8])
+            return ", ".join(titles) if titles else ""
+        elif p_type == "rollup":
+            r_type = prop.get("rollup_type")
+            if r_type == "array":
+                items = prop.get("items", [])
+                vals = [str(it.get("value") or "") for it in items if it.get("value")]
+                return ", ".join(vals) if vals else ""
+            val = prop.get("value")
+            return str(val) if val is not None else ""
+        else:
+            val = prop.get("value")
+            return str(val) if val is not None else ""
+
+    def get_select_field_configurations(self, db_node: PageNode) -> Tuple[List[str], List[str]]:
+        """
+        データベースノードから、単一選択 (single-select) と複数選択 (multi-select) のフィールド名を分類して返す。
+        - single_select: select, status, checkbox
+        - multi_select: multi_select
+        """
+        single_select = []
+        multi_select = []
+        schema = db_node.properties.get("schema", {})
+        if schema:
+            for p_name, p_info in schema.items():
+                p_type = p_info.get("type", "")
+                if p_type in ("status", "select", "checkbox"):
+                    single_select.append(p_name)
+                elif p_type == "multi_select":
+                    multi_select.append(p_name)
+        elif db_node.children:
+            sample_props = db_node.children[0].properties
+            for p_name, p_val in sample_props.items():
+                p_type = p_val.get("type", "") if isinstance(p_val, dict) else ""
+                if p_type in ("status", "select", "checkbox"):
+                    single_select.append(p_name)
+                elif p_type == "multi_select":
+                    multi_select.append(p_name)
+        return single_select, multi_select
+
+    def generate_database_csv(self, db_node: PageNode, page_link_map: Dict[str, str]) -> str:
+        """Confluence Databases (type: database) 用の構造化CSV (<fields>, <views>, <data>) を生成する。"""
+        fields: List[Tuple[str, str, str]] = [("リンク", "confluence-page-link", "")]
+
+        schema = db_node.properties.get("schema", {})
+        prop_names = []
+        if schema:
+            for p_name, p_info in schema.items():
+                p_type = p_info.get("type", "rich_text")
+                if p_type in ("select", "status", "multi_select", "checkbox"):
+                    conf_type = "tag"
+                elif p_type == "date":
+                    conf_type = "date"
+                elif p_type == "number":
+                    conf_type = "number"
+                elif p_type == "url":
+                    conf_type = "hyperlink"
+                elif p_type == "people" and self.user_mapper and self.user_mapper.mappings:
+                    conf_type = "user"
+                else:
+                    conf_type = "text"
+
+                cfg = 'number_format:number' if conf_type == "number" else ''
+                fields.append((p_name, conf_type, cfg))
+                prop_names.append(p_name)
+        elif db_node.children:
+            sample_props = db_node.children[0].properties
+            for p_name, p_val in sample_props.items():
+                p_type = p_val.get("type", "text") if isinstance(p_val, dict) else "text"
+                if p_type in ("select", "status", "multi_select", "checkbox"):
+                    conf_type = "tag"
+                elif p_type == "date":
+                    conf_type = "date"
+                elif p_type == "number":
+                    conf_type = "number"
+                elif p_type == "url":
+                    conf_type = "hyperlink"
+                elif p_type == "people" and self.user_mapper and self.user_mapper.mappings:
+                    conf_type = "user"
+                else:
+                    conf_type = "text"
+                cfg = 'number_format:number' if conf_type == "number" else ''
+                fields.append((p_name, conf_type, cfg))
+                prop_names.append(p_name)
+
+        field_lines = ["<fields>", "field_name,type,configuration"]
+        for f_name, f_type, f_cfg in fields:
+            field_lines.append(f"{self._escape_csv_cell(f_name)},{f_type},{f_cfg}")
+        field_lines.append("</fields>")
+
+        view_lines = [
+            "<views>",
+            "view_name,layout,filters,sorts,hidden_fields",
+            'すべてのデータ,table,"","",""',
+            "</views>",
+        ]
+
+        header_cols = [f[0] for f in fields]
+        data_lines = [
+            "<data>",
+            ",".join(self._escape_csv_cell(c) for c in header_cols),
+        ]
+
+        for child in db_node.children:
+            row_cells = []
+            child_link = page_link_map.get(child.id, "")
+            row_cells.append(self._escape_csv_cell(child_link if child_link else child.title))
+
+            for p_name in prop_names:
+                prop = child.properties.get(p_name)
+                val_str = self._format_prop_for_csv(prop, p_name, child.title)
+                row_cells.append(self._escape_csv_cell(val_str))
+
+            data_lines.append(",".join(row_cells))
+
+        data_lines.append("</data>")
+
+        return "\n".join(field_lines + view_lines + data_lines)
+
+    @staticmethod
+    def generate_database_view_embed(db_web_url: str, saved_view_id: Optional[str] = None) -> str:
+        """Confluence Databases のビューを埋め込むためのスマートカードHTMLを生成する。"""
+        url = f"{db_web_url}?savedViewId={saved_view_id}" if saved_view_id else db_web_url
+        escaped_url = html.escape(url)
+        return f'<p><a href="{escaped_url}" data-layout="center" data-width="100.00" data-card-appearance="embed">{escaped_url}</a></p>'
+
+    @classmethod
+    def generate_grouped_database_views_html(
+        cls,
+        db_web_url: str,
+        group_field: str,
+        group_views: List[Dict[str, str]],
+        style: str = "expand",
+    ) -> str:
+        """
+        NotionのGroup by（グループ化）を再現するため、複数のフィルタービューを配置したHTMLを生成する。
+        - group_views: [{"label": "未着手", "saved_view_id": "...", "count": 2}, ...]
+        - style: "expand" (折りたたみトグル) または "heading" (見出し区切り)
+        """
+        parts = []
+        for g in group_views:
+            label = g.get("label", "その他")
+            view_id = g.get("saved_view_id")
+            count = g.get("count")
+            count_str = f" ({count}件)" if count is not None else ""
+            embed_card = cls.generate_database_view_embed(db_web_url, view_id)
+
+            if style == "expand":
+                title_text = html.escape(f"📂 {group_field}: {label}{count_str}")
+                parts.append(
+                    f'<ac:structured-macro ac:name="expand">'
+                    f'<ac:parameter ac:name="title">{title_text}</ac:parameter>'
+                    f'<ac:rich-text-body>{embed_card}</ac:rich-text-body>'
+                    f'</ac:structured-macro>'
+                )
+            else:
+                title_text = html.escape(f"📌 {group_field}: {label}{count_str}")
+                parts.append(f"<h4>{title_text}</h4>\n{embed_card}")
+
+        return "\n".join(parts)
+
+    def generate_page_content(
+        self,
+        node: PageNode,
+        db_url: Optional[str] = None,
+        entry_id: Optional[str] = None,
+        incoming_links: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """PageNodeのデータからConfluenceページ用の本文 (Storage Format) を生成する。"""
+        cover_html = ""
+        cover_file = getattr(node, "_cover_filename", None) or (
+            f"cover_{node.id.replace('-', '')[:8]}.jpg" if getattr(node, "cover", None) else None
+        )
+        if cover_file:
+            # Notionのカバー画像のようにページの最上部に横幅いっぱいの美しいバナーとして表示
+            cover_html = (
+                f'<div style="width: 100%; max-height: 250px; overflow: hidden; margin-bottom: 24px; border-radius: 8px;">'
+                f'<p style="text-align: center; margin: 0;">'
+                f'<ac:image ac:align="center" ac:layout="full-width" ac:width="1200">'
+                f'<ri:attachment ri:filename="{html.escape(cover_file)}" />'
+                f'</ac:image>'
+                f'</p>'
+                f'</div>\n'
+            )
+
+        metadata_header = self._render_metadata_header(node)
+
+        if node.node_type == "database":
+            main_body = cover_html + metadata_header + self._generate_database_overview_content(node)
+        elif node.node_type == "database_row":
+            main_body = cover_html + metadata_header + self._generate_database_row_content(node, db_url=db_url, entry_id=entry_id)
+        else:
+            main_body = cover_html + metadata_header + self.blocks_to_storage_format(node.blocks)
+
+        # Task B.9: Confluence受信リンクマクロ・バックリンク一覧の自動配置
+        backlinks_html = ""
+        if incoming_links:
+            items_html = []
+            for lk in incoming_links:
+                t = lk.get("title", "Untitled Page")
+                u = lk.get("url")
+                if u:
+                    items_html.append(f'<li><a href="{html.escape(u)}">{html.escape(t)}</a></li>')
+                else:
+                    items_html.append(
+                        f'<li><ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-title="{html.escape(t)}" />'
+                        f'</ac:link></li>'
+                    )
+            backlinks_html = (
+                f'\n<hr />\n'
+                f'<ac:structured-macro ac:name="expand">'
+                f'<ac:parameter ac:name="title">🔗 このページへのリンク元 (受信リンク: {len(incoming_links)}件)</ac:parameter>'
+                f'<ac:rich-text-body>'
+                f'<p>このページは以下のページから参照されています:</p>'
+                f'<ul>{"".join(items_html)}</ul>'
+                f'</ac:rich-text-body>'
+                f'</ac:structured-macro>'
+            )
+
+        return main_body + backlinks_html
+
+    def _generate_database_overview_content(self, db_node: PageNode) -> str:
+        """データベースをConfluenceページとして表現する際の概要テーブルを生成する。"""
+        content_parts = [
+            '<ac:structured-macro ac:name="info">'
+            '<ac:rich-text-body>'
+            f'<p>Notionデータベース <strong>{html.escape(db_node.title)}</strong> から移行されたデータ一覧です。'
+            '各行の詳細は配下の子ページとして格納されています。</p>'
+            '</ac:rich-text-body>'
+            '</ac:structured-macro>'
+        ]
+
+        if not db_node.children:
+            content_parts.append("<p>レコードが存在しません。</p>")
+            return "\n".join(content_parts)
+
+        # 全レコードのプロパティキーを収集
+        first_row_props = db_node.children[0].properties
+        keys = ["タスク名"] if "タスク名" in first_row_props else []
+        for k in first_row_props.keys():
+            if k not in keys:
+                keys.append(k)
+
+        # 1. Confluence 動的連動マクロ: Page Properties Report (detailssummary)
+        # 子ページ（database_row）の details マクロと自動リアルタイム同期・連動
+        headings_csv = ",".join(keys)
+        report_macro = (
+            '<h2>📊 動的連動テーブル (Page Properties Report)</h2>'
+            '<p><em>💡 各行（子ページ）のプロパティを編集すると、この親テーブルも自動でリアルタイム連動・更新されます。</em></p>'
+            '<ac:structured-macro ac:name="detailssummary">'
+            '<ac:parameter ac:name="cql">parent = currentContent()</ac:parameter>'
+            f'<ac:parameter ac:name="headings">{html.escape(headings_csv)}</ac:parameter>'
+            '</ac:structured-macro>'
+        )
+        content_parts.append(report_macro)
+
+        # 2. 静的スナップショットテーブル（エクスポートや即時読み込み用のバックアップ）
+        table_html = [
+            '<h2>📋 静的スナップショットテーブル</h2>',
+            '<table class="wrapped"><thead><tr>'
+        ]
+        for k in keys:
+            table_html.append(f'<th>{html.escape(k)}</th>')
+        table_html.append('</tr></thead><tbody>')
+
+        for row in db_node.children:
+            table_html.append('<tr>')
+            for k in keys:
+                prop = row.properties.get(k)
+                if k == "タスク名" or (k == keys[0]):
+                    # Confluenceネイティブ子ページリンクオブジェクト（スマートリンク・プレビュー対応）
+                    record_title = row.title or (prop.get("value") if isinstance(prop, dict) else str(prop or ""))
+                    escaped_title = html.escape(record_title)
+                    table_html.append(
+                        f'<td><ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-title="{escaped_title}" />'
+                        f'<ac:link-body>{escaped_title}</ac:link-body>'
+                        f'</ac:link></td>'
+                    )
+                else:
+                    formatted_val = self.format_property_for_confluence(prop)
+                    table_html.append(f'<td>{formatted_val}</td>')
+            table_html.append('</tr>')
+
+        table_html.append('</tbody></table>')
+        content_parts.append("".join(table_html))
+        return "\n".join(content_parts)
+
+    def _render_metadata_header(self, node: PageNode) -> str:
+        """Notionの作成者・作成日時・最終更新日時を記録したヘッダHTMLを生成する。
+        self.metadata_template が空または "none" の場合は空文字列を返す。
+        """
+        if not self.metadata_template or self.metadata_template.strip() == "" or self.metadata_template.strip().lower() == "none":
+            return ""
+
+        # 各種メタデータ変数の解決
+        author_mention = ""
+        author_name = ""
+        if getattr(node, "created_by", None):
+            cb = node.created_by
+            u_id = cb.get("id") if isinstance(cb, dict) else None
+            u_name = cb.get("name") if isinstance(cb, dict) else ""
+            u_email = cb.get("person", {}).get("email") if isinstance(cb, dict) and isinstance(cb.get("person"), dict) else None
+            author_name = u_name or ""
+            if self.user_mapper:
+                author_mention = self.user_mapper.format_mention(user_id=u_id, email=u_email, name=u_name)
+            else:
+                author_mention = f"@{html.escape(u_name or 'ユーザー')}"
+
+        last_editor_mention = ""
+        last_editor_name = ""
+        if getattr(node, "last_edited_by", None):
+            leb = node.last_edited_by
+            le_id = leb.get("id") if isinstance(leb, dict) else None
+            le_name = leb.get("name") if isinstance(leb, dict) else ""
+            le_email = leb.get("person", {}).get("email") if isinstance(leb, dict) and isinstance(leb.get("person"), dict) else None
+            last_editor_name = le_name or ""
+            if self.user_mapper:
+                last_editor_mention = self.user_mapper.format_mention(user_id=le_id, email=le_email, name=le_name)
+            else:
+                last_editor_mention = f"@{html.escape(le_name or 'ユーザー')}"
+
+        from src.timezone_util import format_iso_datetime
+        created_time_str = ""
+        created_date_str = ""
+        if getattr(node, "created_time", None):
+            created_time_str = format_iso_datetime(node.created_time, tz=self.timezone, fmt="%Y-%m-%d %H:%M")
+            created_date_str = format_iso_datetime(node.created_time, tz=self.timezone, fmt="%Y-%m-%d")
+
+        last_edited_time_str = ""
+        last_edited_date_str = ""
+        if getattr(node, "last_edited_time", None):
+            last_edited_time_str = format_iso_datetime(node.last_edited_time, tz=self.timezone, fmt="%Y-%m-%d %H:%M")
+            last_edited_date_str = format_iso_datetime(node.last_edited_time, tz=self.timezone, fmt="%Y-%m-%d")
+
+        # もし作成者も作成日時も存在しないノードの場合はヘッダ不要
+        if not getattr(node, "created_by", None) and not getattr(node, "created_time", None):
+            return ""
+
+        context = {
+            "author": author_mention or "-",
+            "created_by": author_mention or "-",
+            "author_name": html.escape(author_name) if author_name else "-",
+            "created_time": created_time_str or "-",
+            "created_date": created_date_str or "-",
+            "last_edited_by": last_editor_mention or "-",
+            "last_edited_name": html.escape(last_editor_name) if last_editor_name else "-",
+            "last_edited_time": last_edited_time_str or "-",
+            "last_edited_date": last_edited_date_str or "-",
+            "title": html.escape(node.title or ""),
+            "url": html.escape(node.url or ""),
+            "notion_url": html.escape(node.url or ""),
+        }
+
+        try:
+            rendered = self.metadata_template.format(**context)
+        except Exception as e:
+            logger.warning(f"Failed to render metadata template ({self.metadata_template}): {e}")
+            rendered = f"📄 Notion元情報 — 作成者: {context['author']} | 🕒 作成日時: {context['created_time']}"
+
+        rendered = rendered.strip()
+        if not rendered:
+            return ""
+
+        if not (rendered.startswith("<p") or rendered.startswith("<div")):
+            return (
+                f'<p style="color: #6B778C; font-size: 12px; margin-bottom: 16px; padding: 4px 8px; '
+                f'background-color: #F4F5F7; border-radius: 4px; display: inline-block;">'
+                f'{rendered}'
+                f'</p>\n'
+            )
+        return f"{rendered}\n"
+
+    def _generate_database_row_content(
+        self,
+        row_node: PageNode,
+        db_url: Optional[str] = None,
+        entry_id: Optional[str] = None,
+    ) -> str:
+        """データベース行の詳細ページ用コンテンツ（折りたたみ行ビュー・プロパティ＋本文）を生成する。"""
+        parts = []
+
+        entry_embed_url = getattr(row_node, "_entry_embed_url", None)
+        if not entry_embed_url and db_url and entry_id:
+            entry_embed_url = f"{db_url}?entryId={entry_id}"
+
+        # 1. 親データベースへのナビゲーションリンク
+        parent_db_title = getattr(row_node, "parent_db_title", None)
+        parent_db_url = getattr(row_node, "parent_db_url", None) or db_url
+        if parent_db_title:
+            escaped_db_title = html.escape(parent_db_title)
+            if parent_db_url:
+                db_link_html = f'<a href="{html.escape(parent_db_url)}">{escaped_db_title}</a>'
+            else:
+                db_link_html = (
+                    f'<ac:link ac:card-appearance="inline">'
+                    f'<ri:page ri:content-title="{escaped_db_title}" />'
+                    f'<ac:link-body>{escaped_db_title}</ac:link-body>'
+                    f'</ac:link>'
+                )
+            nav_panel = (
+                f'<p style="color: #42526E; font-size: 13px; margin-bottom: 12px;">'
+                f'📁 <strong>所属データベース</strong>: {db_link_html}'
+                f'</p>'
+            )
+            parts.append(nav_panel)
+
+        # 2. プロパティ一覧テーブルのHTML生成
+        prop_rows = []
+        for k, prop in row_node.properties.items():
+            formatted_val = self.format_property_for_confluence(prop)
+            prop_rows.append(
+                f'<tr><th style="width: 150px; background-color: #f4f5f7;">{html.escape(k)}</th><td>{formatted_val}</td></tr>'
+            )
+        details_table = ""
+        if prop_rows:
+            details_table = (
+                f'<table class="wrapped"><tbody>{"".join(prop_rows)}</tbody></table>'
+            )
+
+        # 3. 折りたたみマクロ（Expand）内にネイティブ行ビューまたはフォールバックプロパティテーブルを格納
+        #    （右側プレビュー領域での展開崩れを防止し、単独閲覧時にクリックして編集・確認可能にする）
+        expand_body_parts = []
+        if entry_embed_url:
+            escaped_embed_url = html.escape(entry_embed_url)
+            expand_body_parts.append(
+                f'<p><a href="{escaped_embed_url}" data-layout="center" data-width="100.00" data-card-appearance="embed">{escaped_embed_url}</a></p>'
+            )
+        elif details_table:
+            expand_body_parts.append(details_table)
+
+        if expand_body_parts:
+            expand_macro = (
+                f'<ac:structured-macro ac:name="expand">'
+                f'<ac:parameter ac:name="title">📋 レコードプロパティ・行編集 (クリックして展開)</ac:parameter>'
+                f'<ac:rich-text-body>'
+                f'{"".join(expand_body_parts)}'
+                f'</ac:rich-text-body>'
+                f'</ac:structured-macro>'
+            )
+            parts.append(expand_macro)
+
+        # 4. 本文ブロック（ブロックが存在する場合のみ区切り線と本文を配置）
+        if row_node.blocks:
+            parts.append('<hr />')
+            parts.append('<h2>📄 レコード詳細本文</h2>')
+            parts.append(self.blocks_to_storage_format(row_node.blocks))
+
+        return "\n".join(parts)

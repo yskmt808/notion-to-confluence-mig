@@ -1,0 +1,42 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Environment credentials
+.env
+.env.local
+
+# Operating System
+.DS_Store
+Thumbs.db
+
+# Execution outputs & screenshots
+screenshots/
+migration_result.json
+migration_checkpoint.json
+debug_report.json
+debug_report.md
+*worksheet*.csv
+*worksheet*.json
+*.log
+*.tmp
+*.zip
+100pages/
+
+# User mappings (avoid committing personal emails/account IDs)
+user_mapping.csv
+user_mapping.json
+*user_mapping*.csv
+*user_mapping*.json
+!user_mapping.example.csv
+!user_mapping.example.json
+
+

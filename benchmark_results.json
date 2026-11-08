@@ -1,0 +1,62 @@
+[
+  {
+    "scale": 100,
+    "confluence": {
+      "csv_size_kb": 22.4,
+      "import_sec": 10.25,
+      "import_throughput": 9.8,
+      "index_wait_sec": 34.43,
+      "query_sec": 0.3,
+      "query_throughput": 328.31,
+      "query_payload_kb": 148.5
+    },
+    "notion": {
+      "write_throughput": 12.46,
+      "write_avg_latency_ms": 235.8,
+      "write_total_sec_estimated": 8.03,
+      "query_sec_estimated": 0.27,
+      "query_throughput": 363.74,
+      "query_payload_kb_estimated": 182.6
+    }
+  },
+  {
+    "scale": 500,
+    "confluence": {
+      "csv_size_kb": 111.1,
+      "import_sec": 6.23,
+      "import_throughput": 80.3,
+      "index_wait_sec": 147.39,
+      "query_sec": 2.01,
+      "query_throughput": 124.64,
+      "query_payload_kb": 371.5
+    },
+    "notion": {
+      "write_throughput": 9.86,
+      "write_avg_latency_ms": 294.7,
+      "write_total_sec_estimated": 50.7,
+      "query_sec_estimated": 2.05,
+      "query_throughput": 241.18,
+      "query_payload_kb_estimated": 910.0
+    }
+  },
+  {
+    "scale": 1000,
+    "confluence": {
+      "csv_size_kb": 221.9,
+      "import_sec": 9.53,
+      "import_throughput": 105.0,
+      "index_wait_sec": 120.9,
+      "query_sec": 0.29,
+      "query_throughput": 0.0,
+      "query_payload_kb": 0.0
+    },
+    "notion": {
+      "write_throughput": 11.86,
+      "write_avg_latency_ms": 249.8,
+      "write_total_sec_estimated": 84.3,
+      "query_sec_estimated": 3.5,
+      "query_throughput": 285.66,
+      "query_payload_kb_estimated": 1830.0
+    }
+  }
+]
