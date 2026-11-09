@@ -1334,7 +1334,12 @@ class NotionToConfluenceConverter:
         for child in db_node.children:
             row_cells = []
             child_link = page_link_map.get(child.id, "")
-            row_cells.append(self._escape_csv_cell(child_link if child_link else child.title))
+            # confluence-page-link は有効なURLまたは数値Content IDのみ許容される。
+            # ページ未作成時などに文字列タイトルを入れるとConfluenceがContent ID解決に失敗し
+            # 「Could not create database entity in Handling Service: CANVAS / Content ID not found for page link value」
+            # で500/400エラーとなるため、有効なURLまたは数値ID以外は必ず空文字とする。
+            safe_link_val = child_link if (child_link and (child_link.startswith("http://") or child_link.startswith("https://") or child_link.isdigit())) else ""
+            row_cells.append(self._escape_csv_cell(safe_link_val))
 
             for p_name in prop_names:
                 prop = child.properties.get(p_name)

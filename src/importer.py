@@ -80,6 +80,8 @@ class ConfluenceClient:
         self.headers = {"Content-Type": "application/json"}
 
     def get_page_by_title(self, space_key: str, title: str) -> Optional[Dict[str, Any]]:
+        if title and len(title) > 255:
+            title = title[:252] + "..."
         url = f"{self.base_url}/rest/api/content"
         params = {
             "spaceKey": space_key,
@@ -118,6 +120,8 @@ class ConfluenceClient:
         body: str,
         parent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if title and len(title) > 255:
+            title = title[:252] + "..."
         url = f"{self.base_url}/rest/api/content"
         payload = {
             "type": "page",
@@ -166,6 +170,8 @@ class ConfluenceClient:
         current_version: int,
         parent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if title and len(title) > 255:
+            title = title[:252] + "..."
         url = f"{self.base_url}/rest/api/content/{page_id}"
         payload = {
             "id": page_id,
@@ -260,6 +266,8 @@ class ConfluenceClient:
 
     def get_database_by_title(self, space_key: str, title: str) -> Optional[Dict[str, Any]]:
         """Confluence Databases (type: database) をタイトルとスペースから検索する。"""
+        if title and len(title) > 255:
+            title = title[:252] + "..."
         url = f"{self.base_url}/rest/api/content/search"
         safe_title = title.replace('\\', '\\\\').replace('"', '\\"')
         safe_space = space_key.replace('\\', '\\\\').replace('"', '\\"')
@@ -291,6 +299,8 @@ class ConfluenceClient:
         csv_body: str,
     ) -> Dict[str, Any]:
         """Confluence Databases (type: database) を構造化CSVから新規作成する。"""
+        if title and len(title) > 255:
+            title = title[:252] + "..."
         url = f"{self.base_url}/api/v2/databases"
         payload = {
             "spaceId": str(space_id),
@@ -1150,7 +1160,12 @@ class ConfluenceImporter:
                 existing = self.client.get_page_by_title(space_key=self.space_key, title=assigned)
                 return assigned, existing
 
-            target_title = base_title
+            # Confluenceのページタイトル最大文字数は255文字。サフィックス付与（例: " (2)"）を考慮し240文字に安全に切り詰め
+            cleaned_title = (base_title or "Untitled").strip().replace("\n", " ").replace("\r", "")
+            if len(cleaned_title) > 240:
+                cleaned_title = cleaned_title[:237] + "..."
+
+            target_title = cleaned_title
             existing_page = self.client.get_page_by_title(space_key=self.space_key, title=target_title)
 
             # 既存ページが存在し、かつ同一実行内でまだどのノードにも予約されていない場合に限り上書きを許可
@@ -1164,7 +1179,9 @@ class ConfluenceImporter:
                 # 同一スペース内または同一ツリー内でのタイトル重複！サフィックスを付与してユニーク化
                 suffix = 2
                 while True:
-                    candidate = f"{base_title} ({suffix})"
+                    candidate = f"{cleaned_title} ({suffix})"
+                    if len(candidate) > 255:
+                        candidate = candidate[:255]
                     if (
                         candidate not in self._reserved_titles
                         and not self.client.get_page_by_title(space_key=self.space_key, title=candidate)
@@ -1290,14 +1307,18 @@ class ConfluenceImporter:
                                 chid, cid = future.result()
                                 child_link_map[chid] = f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"
                             except Exception as e:
-                                logger.error(f"Failed to create child page [{c.title}] in worker: {e}")
+                                logger.warning(f"Failed to create child page [{c.title}] in worker (skipping link in DB): {e}")
                                 if self.telemetry:
                                     self.telemetry.record_warning(f"Worker failure creating page [{c.title}]: {e}")
-                                raise
                 else:
                     for c in unmigrated_children:
-                        chid, cid = _migrate_child_task(c)
-                        child_link_map[chid] = f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"
+                        try:
+                            chid, cid = _migrate_child_task(c)
+                            child_link_map[chid] = f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"
+                        except Exception as e:
+                            logger.warning(f"Failed to create child page [{c.title}] (skipping link in DB): {e}")
+                            if self.telemetry:
+                                self.telemetry.record_warning(f"Failure creating child page [{c.title}]: {e}")
 
             if existing_db:
                 logger.info(f"Reusing existing Confluence Database: [{node.title}] (ID: {existing_db['id']})")
