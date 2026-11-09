@@ -88,21 +88,27 @@ class HtmlZipExtractor:
         uid_matches = UUID_PATTERN.findall(html_file)
         node_id = normalize_id(uid_matches[-1]) if uid_matches else "root"
 
+        from src.icon_mapper import resolve_notion_icon_to_emoji
+
         # ページタイトル
         title = "Untitled Page"
         title_el = soup.find("title") or soup.find(class_="page-title")
         if title_el:
             title = title_el.text.strip()
 
-        # アイコン
+        # アイコン (絵文字またはNotion標準SVGアイコンを解決)
         icon = None
         icon_meta = soup.find("meta", attrs={"name": "data-notion-page-icon"})
         if icon_meta and icon_meta.get("content"):
-            icon = icon_meta["content"]
+            icon = resolve_notion_icon_to_emoji(icon_meta["content"])
         if not icon:
             icon_span = soup.find("span", class_="icon")
             if icon_span and icon_span.get("data-emoji"):
-                icon = icon_span["data-emoji"]
+                icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
+        if not icon:
+            header_icon_div = soup.find("div", class_=lambda c: c and "page-header-icon" in c)
+            if header_icon_div and header_icon_div.find("img"):
+                icon = resolve_notion_icon_to_emoji(header_icon_div.find("img").get("src"))
 
         # カバー画像
         cover = None
@@ -462,6 +468,7 @@ class HtmlZipExtractor:
 
             # 8. コールアウト
             elif tag == "aside" or "callout" in classes:
+                from src.icon_mapper import resolve_notion_icon_to_emoji
                 bg_color = el.get("data-notion-callout-background") or "default"
                 if "block-color-" in str(classes):
                     for c in classes:
@@ -475,14 +482,18 @@ class HtmlZipExtractor:
                     if icon_el and icon_el.get("data-emoji"):
                         icon_val = icon_el["data-emoji"]
                 if not icon_val:
-                    icon_val = "💡"
+                    icon_img = el.find("img", class_="icon")
+                    if icon_img and icon_img.get("src"):
+                        icon_val = icon_img["src"]
+
+                resolved_emoji = resolve_notion_icon_to_emoji(icon_val) if icon_val else None
 
                 blocks.append({
                     "id": el_id,
                     "type": "callout",
                     "callout": {
                         "rich_text": self._parse_inline_rich_text(el, skip_classes=["icon"]),
-                        "icon": {"type": "emoji", "emoji": icon_val},
+                        "icon": {"type": "emoji", "emoji": resolved_emoji} if resolved_emoji else None,
                         "color": bg_color,
                     },
                 })
@@ -630,34 +641,14 @@ class HtmlZipExtractor:
                 caption_text = figcaption.text.strip() if figcaption else ""
                 caption_rich = [{"type": "text", "text": {"content": caption_text}}] if caption_text else []
 
-                # 画像ブロック (figure.image または内部にimgタグを含む場合)
-                if "image" in classes or img_tag:
-                    src = img_tag.get("src") if img_tag else href
-                    if src:
-                        is_external = src.startswith(("http://", "https://"))
-                        img_filename = os.path.basename(urllib.parse.unquote(src))
-                        block_obj = {
-                            "id": el_id,
-                            "type": "image",
-                            "image": {
-                                "type": "external" if is_external else "file",
-                                "caption": caption_rich,
-                                "external": {"url": src} if is_external else None,
-                                "file": {"url": src} if not is_external else None,
-                            },
-                            "_attachment_filename": img_filename,
-                        }
-                        if not is_external:
-                            # ZIP内相対パスから画像実体バイナリを取得
-                            clean_src = urllib.parse.unquote(src)
-                            target_path = os.path.normpath(os.path.join(current_dir, clean_src))
-                            if target_path in zf.namelist():
-                                block_obj["_attachment_bytes"] = zf.read(target_path)
-                                logger.info(f"Loaded inline image attachment from ZIP: {target_path} ({len(block_obj['_attachment_bytes'])} bytes)")
-                        blocks.append(block_obj)
+                # 子ページリンク判定
+                # 注: 子ページアイコンとして <img> (例: airplane_purple.svg) が内包されるため、画像ブロック判定より優先して評価する
+                is_subpage_link = "link-to-page" in classes or (
+                    a_tag and (a_tag.get("data-notion-page-id") or (href.endswith(".html") and "image" not in classes))
+                )
 
-                elif "link-to-page" in classes or (a_tag and href.endswith(".html")):
-                    p_title = a_tag.text.strip() if a_tag else "Subpage"
+                if is_subpage_link:
+                    p_title = a_tag.get_text().strip() if a_tag else "Subpage"
                     target_id = None
                     if a_tag:
                         page_id_attr = a_tag.get("data-notion-page-id")
@@ -683,6 +674,32 @@ class HtmlZipExtractor:
                             "type": "child_page",
                             "child_page": {"title": p_title},
                         })
+
+                # 画像ブロック (figure.image または内部にimgタグを含む場合)
+                elif "image" in classes or img_tag:
+                    src = img_tag.get("src") if img_tag else href
+                    if src:
+                        is_external = src.startswith(("http://", "https://"))
+                        img_filename = os.path.basename(urllib.parse.unquote(src))
+                        block_obj = {
+                            "id": el_id,
+                            "type": "image",
+                            "image": {
+                                "type": "external" if is_external else "file",
+                                "caption": caption_rich,
+                                "external": {"url": src} if is_external else None,
+                                "file": {"url": src} if not is_external else None,
+                            },
+                            "_attachment_filename": img_filename,
+                        }
+                        if not is_external:
+                            # ZIP内相対パスから画像実体バイナリを取得
+                            clean_src = urllib.parse.unquote(src)
+                            target_path = os.path.normpath(os.path.join(current_dir, clean_src))
+                            if target_path in zf.namelist():
+                                block_obj["_attachment_bytes"] = zf.read(target_path)
+                                logger.info(f"Loaded inline image attachment from ZIP: {target_path} ({len(block_obj['_attachment_bytes'])} bytes)")
+                        blocks.append(block_obj)
                 elif href:
                     lower_href = href.lower()
                     if lower_href.endswith(".pdf"):

@@ -59,8 +59,10 @@ class NotionExtractor:
         title = self._get_page_title(page_info)
         url = page_info.get("url")
 
+        from src.icon_mapper import resolve_notion_icon_to_emoji
+
         icon_obj = page_info.get("icon") or {}
-        icon_emoji = icon_obj.get("emoji") if icon_obj.get("type") == "emoji" else None
+        icon_emoji = resolve_notion_icon_to_emoji(icon_obj)
         cover_obj = page_info.get("cover")
 
         root_node = PageNode(
@@ -200,8 +202,10 @@ class NotionExtractor:
         title = self._get_db_title(db_info)
         schema = db_info.get("properties", {})
 
+        from src.icon_mapper import resolve_notion_icon_to_emoji
+
         db_icon_obj = db_info.get("icon") or {}
-        db_icon = db_icon_obj.get("emoji") if db_icon_obj.get("type") == "emoji" else None
+        db_icon = resolve_notion_icon_to_emoji(db_icon_obj)
 
         db_node = PageNode(
             id=db_id,
@@ -234,7 +238,7 @@ class NotionExtractor:
                 row_blocks, row_children = self._extract_blocks_and_children(row_id)
 
                 row_icon_obj = row.get("icon") or {}
-                row_icon = row_icon_obj.get("emoji") if row_icon_obj.get("type") == "emoji" else None
+                row_icon = resolve_notion_icon_to_emoji(row_icon_obj)
 
                 row_node = PageNode(
                     id=row_id,

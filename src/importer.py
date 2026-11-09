@@ -218,7 +218,11 @@ class ConfluenceClient:
         """Notionの絵文字をConfluenceのページタイトル絵文字プロパティに設定する。"""
         if not emoji_char:
             return
-        cps = [f"{ord(c):x}" for c in emoji_char if ord(c) != 0xfe0f]
+        from src.icon_mapper import resolve_notion_icon_to_emoji, is_unicode_emoji
+        resolved = resolve_notion_icon_to_emoji(emoji_char)
+        if not resolved or not is_unicode_emoji(resolved):
+            return
+        cps = [f"{ord(c):x}" for c in resolved if ord(c) != 0xfe0f]
         if not cps:
             return
         emoji_hex = "-".join(cps)

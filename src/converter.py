@@ -631,10 +631,11 @@ class NotionToConfluenceConverter:
                 output.append(f"<blockquote><p>{text}</p>{children_html}</blockquote>")
 
             elif b_type == "callout":
+                from src.icon_mapper import resolve_notion_icon_to_emoji
                 callout_data = b.get("callout", {})
                 color = callout_data.get("color", "default").lower()
                 icon_obj = callout_data.get("icon") or {}
-                emoji = icon_obj.get("emoji") if icon_obj.get("type") == "emoji" else None
+                emoji = resolve_notion_icon_to_emoji(icon_obj)
                 text = self.convert_rich_text(callout_data.get("rich_text", []))
 
                 # マクロ名と背景色・Confluence側システムアイコンの対応:
