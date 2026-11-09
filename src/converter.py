@@ -451,6 +451,16 @@ class NotionToConfluenceConverter:
                 if target_info and target_info.get("node_type") == "database":
                     db_url = target_info.get("web_url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
                     escaped = f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(target_info.get("title", escaped))}</a>'
+                elif target_info and target_info.get("confluence_id"):
+                    cid = target_info["confluence_id"]
+                    disp_title = target_info.get("title") or target_title or escaped
+                    escaped_title = html.escape(disp_title)
+                    escaped = (
+                        f'<ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-id="{cid}" />'
+                        f'<ac:link-body>{escaped_title}</ac:link-body>'
+                        f'</ac:link>'
+                    )
                 elif target_title:
                     escaped_title = html.escape(target_title)
                     escaped = (
@@ -712,21 +722,51 @@ class NotionToConfluenceConverter:
 
             elif b_type == "child_page":
                 child_title = b.get("child_page", {}).get("title", "Untitled Page")
+                target_id = b.get("id")
+                target_info = None
+
                 if hasattr(self, "migration_map") and self.migration_map:
-                    for m in self.migration_map.values():
-                        if m.get("node_type") == "page":
-                            m_title = m.get("title", "")
-                            if m_title == child_title or m_title.endswith(child_title):
-                                child_title = m_title
+                    # 1. target_id (Notion UUID) による完全一致探索
+                    if target_id:
+                        norm_target = target_id.replace("-", "").lower()
+                        for mid, minfo in self.migration_map.items():
+                            if mid.replace("-", "").lower() == norm_target:
+                                target_info = minfo
                                 break
-                escaped_title = html.escape(child_title)
-                # Confluenceのインラインスマートリンクオブジェクト（ページアイコン自動表示・プレビュー対応）
-                output.append(
-                    f'<p><ac:link ac:card-appearance="inline">'
-                    f'<ri:page ri:content-title="{escaped_title}" />'
-                    f'<ac:link-body>{escaped_title}</ac:link-body>'
-                    f'</ac:link></p>'
-                )
+
+                    # 2. タイトルによる探索（完全一致・前方一致・後方一致・部分一致）
+                    if not target_info:
+                        for m in self.migration_map.values():
+                            if m.get("node_type") == "page":
+                                m_title = m.get("title", "")
+                                if (
+                                    m_title == child_title
+                                    or m_title.startswith(child_title)
+                                    or m_title.endswith(child_title)
+                                    or child_title in m_title
+                                ):
+                                    target_info = m
+                                    break
+
+                if target_info and target_info.get("confluence_id"):
+                    cid = target_info["confluence_id"]
+                    disp_title = target_info.get("title") or child_title
+                    escaped_title = html.escape(disp_title)
+                    # Confluenceのインラインスマートリンクオブジェクト（ri:content-idによる完全解決）
+                    output.append(
+                        f'<p><ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-id="{cid}" />'
+                        f'<ac:link-body>{escaped_title}</ac:link-body>'
+                        f'</ac:link></p>'
+                    )
+                else:
+                    escaped_title = html.escape(child_title)
+                    output.append(
+                        f'<p><ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-title="{escaped_title}" />'
+                        f'<ac:link-body>{escaped_title}</ac:link-body>'
+                        f'</ac:link></p>'
+                    )
 
             elif b_type == "child_database":
                 if b.get("is_linked_database"):

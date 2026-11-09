@@ -61,6 +61,7 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "earth": "🌍",
     "globe": "🌐",
     "star": "⭐",
+    "sparkle": "✨",
     "sparkles": "✨",
     # キャラクター・動物 (Animals & Fantasy)
     "alien-pixel": "👾",
@@ -82,16 +83,22 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "stopwatch": "⏱️",
     "hourglass": "⌛",
     "alarm": "⏰",
+    "watch": "⌚",
     "bell": "🔔",
     "mail": "✉️",
     "email": "✉️",
     "envelope": "✉️",
     "inbox": "📥",
     "folder": "📁",
+    "folders": "📁",
     "file": "📄",
+    "files": "📄",
     "document": "📄",
     "page": "📄",
     "note": "📝",
+    "notebook": "📓",
+    "notepad": "🗒️",
+    "article": "📰",
     "clipboard": "📋",
     "pin": "📌",
     "pushpin": "📌",
@@ -106,16 +113,20 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "tools": "🛠️",
     "wrench": "🔧",
     "hammer": "🔨",
+    "screwdriver": "🪛",
     "settings": "⚙️",
     "cog": "⚙️",
     "gear": "⚙️",
+    "gears": "⚙️",
     "trash": "🗑️",
     "tag": "🏷️",
     "tags": "🏷️",
     "flag": "🚩",
     "check": "✅",
+    "checks": "✅",
     "checkmark": "✅",
     "cross": "❌",
+    "close": "❌",
     "ban": "🚫",
     "warning": "⚠️",
     "alert": "⚠️",
@@ -127,27 +138,38 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "pencil": "✏️",
     "pen": "🖊️",
     "paintbrush": "🖌️",
+    "archive": "📦",
+    "stack": "📚",
+    "layers": "📑",
+    "layout": "📐",
     # 人・コミュニケーション (People & Communication)
     "user": "👤",
     "users": "👥",
     "person": "👤",
     "people": "👥",
     "smile": "😊",
+    "smiley": "😊",
     "heart": "❤️",
     "thumbsup": "👍",
     "thumbsdown": "👎",
     "chat": "💬",
+    "chats": "💬",
     "comment": "💬",
+    "comments": "💬",
     "message": "💬",
     "megaphone": "📢",
     "speaker": "🔊",
     "sound": "🔊",
+    "eye": "👁️",
+    "hand": "✋",
     # デバイス・IT (Devices & Tech)
     "computer": "💻",
     "laptop": "💻",
     "desktop": "🖥️",
     "mobile": "📱",
     "phone": "📱",
+    "smartphone": "📱",
+    "device": "📱",
     "tablet": "📱",
     "camera": "📷",
     "video": "📹",
@@ -159,6 +181,7 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "code": "💻",
     "database": "🗄️",
     "server": "🖥️",
+    "wifi": "📶",
     # ビジネス・建物 (Business, Finance & Places)
     "chart": "📊",
     "graph": "📈",
@@ -173,13 +196,17 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "money": "💰",
     "dollar": "💵",
     "credit-card": "💳",
+    "wallet": "👛",
+    "receipt": "🧾",
     "building": "🏢",
+    "buildings": "🏢",
     "home": "🏠",
     "house": "🏠",
     "store": "🏬",
     "bank": "🏦",
     "hospital": "🏥",
     "school": "🏫",
+    "factory": "🏭",
     "map": "🗺️",
     "compass": "🧭",
     # 飲食・ライフスタイル (Food & Lifestyle)
@@ -192,6 +219,10 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "pizza": "🍕",
     "apple": "🍎",
     "cake": "🎂",
+    # 矢印 (Arrows)
+    "arrow": "➡️",
+    "arrows": "🔄",
+    "caret": "🔻",
     # 記号・シェイプ
     "circle": "⚪",
     "square": "⬛",
@@ -199,6 +230,8 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "diamond": "🔷",
     "cube": "🧊",
     "box": "📦",
+    "dot": "•",
+    "dots": "⋯",
 }
 
 # Notion標準アイコンのカラーサフィックス除去正規表現
@@ -286,13 +319,21 @@ def resolve_notion_icon_to_emoji(icon_val: Any) -> Optional[str]:
             name = extract_icon_name_from_path(icon_str)
             if name in NOTION_ICON_TO_EMOJI:
                 return NOTION_ICON_TO_EMOJI[name]
-            # 未定義のNotionアイコンの場合は汎用アイコン
-            return "📄"
+            prefix = name.split("-")[0]
+            if prefix in NOTION_ICON_TO_EMOJI:
+                return NOTION_ICON_TO_EMOJI[prefix]
+            # 未定義のNotion公式SVGアイコンの場合は汎用アイコン
+            if "/icons/" in icon_str:
+                return "📄"
+            return None
 
         # 直接アイコン名が渡された場合
         name = _COLOR_SUFFIX_RE.sub("", icon_str).lower().strip()
         if name in NOTION_ICON_TO_EMOJI:
             return NOTION_ICON_TO_EMOJI[name]
+        prefix = name.split("-")[0]
+        if prefix in NOTION_ICON_TO_EMOJI:
+            return NOTION_ICON_TO_EMOJI[prefix]
 
     return None
 

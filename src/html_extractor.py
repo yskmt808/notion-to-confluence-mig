@@ -103,7 +103,7 @@ class HtmlZipExtractor:
         uid_matches = UUID_PATTERN.findall(html_file)
         node_id = normalize_id(uid_matches[-1]) if uid_matches else "root"
 
-        from src.icon_mapper import resolve_notion_icon_to_emoji
+        from src.icon_mapper import resolve_notion_icon_to_emoji, is_unicode_emoji
 
         # ページタイトル
         title = "Untitled Page"
@@ -116,14 +116,52 @@ class HtmlZipExtractor:
         icon_meta = soup.find("meta", attrs={"name": "data-notion-page-icon"})
         if icon_meta and icon_meta.get("content"):
             icon = resolve_notion_icon_to_emoji(icon_meta["content"])
+
+        if not icon:
+            page_art = soup.find("article", class_=lambda c: c and "page" in c) or soup.find("article") or soup.find(class_="page")
+            if page_art and page_art.get("data-notion-page-icon"):
+                icon = resolve_notion_icon_to_emoji(page_art["data-notion-page-icon"])
+
+        if not icon:
+            header_icon_div = soup.find(class_=lambda c: c and "page-header-icon" in c)
+            if header_icon_div:
+                img = header_icon_div.find("img")
+                if img and img.get("src"):
+                    icon = resolve_notion_icon_to_emoji(img["src"])
+                if not icon:
+                    icon_span = header_icon_div.find("span", class_="icon")
+                    if icon_span and icon_span.get("data-emoji"):
+                        icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
+                    if not icon and icon_span:
+                        txt = icon_span.get_text(strip=True)
+                        if is_unicode_emoji(txt):
+                            icon = resolve_notion_icon_to_emoji(txt)
+                if not icon:
+                    txt = header_icon_div.get_text(strip=True)
+                    if is_unicode_emoji(txt):
+                        icon = resolve_notion_icon_to_emoji(txt)
+
+        if not icon:
+            header = soup.find("header")
+            if header:
+                icon_span = header.find("span", class_="icon")
+                if icon_span:
+                    if icon_span.get("data-emoji"):
+                        icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
+                    if not icon:
+                        txt = icon_span.get_text(strip=True)
+                        if is_unicode_emoji(txt):
+                            icon = resolve_notion_icon_to_emoji(txt)
+
         if not icon:
             icon_span = soup.find("span", class_="icon")
-            if icon_span and icon_span.get("data-emoji"):
-                icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
-        if not icon:
-            header_icon_div = soup.find("div", class_=lambda c: c and "page-header-icon" in c)
-            if header_icon_div and header_icon_div.find("img"):
-                icon = resolve_notion_icon_to_emoji(header_icon_div.find("img").get("src"))
+            if icon_span:
+                if icon_span.get("data-emoji"):
+                    icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
+                if not icon:
+                    txt = icon_span.get_text(strip=True)
+                    if is_unicode_emoji(txt):
+                        icon = resolve_notion_icon_to_emoji(txt)
 
         # カバー画像
         cover = None
@@ -613,7 +651,7 @@ class HtmlZipExtractor:
 
             # 8. コールアウト
             elif tag == "aside" or "callout" in classes:
-                from src.icon_mapper import resolve_notion_icon_to_emoji
+                from src.icon_mapper import resolve_notion_icon_to_emoji, is_unicode_emoji
                 bg_color = el.get("data-notion-callout-background") or "default"
                 if "block-color-" in str(classes):
                     for c in classes:
@@ -624,8 +662,11 @@ class HtmlZipExtractor:
                 icon_val = el.get("data-notion-callout-icon")
                 if not icon_val:
                     icon_el = el.find("span", class_="icon")
-                    if icon_el and icon_el.get("data-emoji"):
-                        icon_val = icon_el["data-emoji"]
+                    if icon_el:
+                        if icon_el.get("data-emoji"):
+                            icon_val = icon_el["data-emoji"]
+                        elif is_unicode_emoji(icon_el.get_text(strip=True)):
+                            icon_val = icon_el.get_text(strip=True)
                 if not icon_val:
                     icon_img = el.find("img", class_="icon")
                     if icon_img and icon_img.get("src"):
@@ -778,7 +819,7 @@ class HtmlZipExtractor:
                 })
 
             # 14. 画像 / 子ページリンク / 外部ファイル・動画・音声・埋め込み
-            elif tag == "figure":
+            elif tag == "figure" or "link-to-page" in classes:
                 a_tag = el.find("a")
                 href = a_tag.get("href") if a_tag else ""
                 img_tag = el.find("img")
