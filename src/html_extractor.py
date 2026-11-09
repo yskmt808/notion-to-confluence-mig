@@ -88,6 +88,83 @@ class HtmlZipExtractor:
             root_node = self._build_page_node(zf, root_file, db_csv_map)
             return root_node
 
+    def _extract_icon_from_soup(self, soup: BeautifulSoup) -> Optional[str]:
+        """BeautifulSoupオブジェクトからNotionのページアイコン（絵文字またはNotion標準SVG）を抽出する。"""
+        from src.icon_mapper import resolve_notion_icon_to_emoji, is_unicode_emoji
+
+        # 1. meta[name=data-notion-page-icon]
+        icon_meta = soup.find("meta", attrs={"name": "data-notion-page-icon"})
+        if icon_meta and icon_meta.get("content"):
+            icon = resolve_notion_icon_to_emoji(icon_meta["content"])
+            if icon:
+                return icon
+
+        # 2. article または div.page の data-notion-page-icon 属性
+        page_art = (
+            soup.find("article", class_=lambda c: c and "page" in c)
+            or soup.find("article")
+            or soup.find(class_="page")
+        )
+        if page_art and page_art.get("data-notion-page-icon"):
+            icon = resolve_notion_icon_to_emoji(page_art["data-notion-page-icon"])
+            if icon:
+                return icon
+
+        # 3. page-header-icon コンテナ内の探索
+        header_icon_div = soup.find(class_=lambda c: c and "page-header-icon" in c)
+        if header_icon_div:
+            img = header_icon_div.find("img")
+            if img and img.get("src"):
+                icon = resolve_notion_icon_to_emoji(img["src"])
+                if icon:
+                    return icon
+            icon_span = header_icon_div.find("span", class_="icon")
+            if icon_span and icon_span.get("data-emoji"):
+                icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
+                if icon:
+                    return icon
+            if icon_span:
+                txt = icon_span.get_text(strip=True)
+                if is_unicode_emoji(txt):
+                    icon = resolve_notion_icon_to_emoji(txt)
+                    if icon:
+                        return icon
+            txt = header_icon_div.get_text(strip=True)
+            if is_unicode_emoji(txt):
+                icon = resolve_notion_icon_to_emoji(txt)
+                if icon:
+                    return icon
+
+        # 4. header コンテナ内の探索
+        header = soup.find("header")
+        if header:
+            icon_span = header.find("span", class_="icon")
+            if icon_span:
+                if icon_span.get("data-emoji"):
+                    icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
+                    if icon:
+                        return icon
+                txt = icon_span.get_text(strip=True)
+                if is_unicode_emoji(txt):
+                    icon = resolve_notion_icon_to_emoji(txt)
+                    if icon:
+                        return icon
+
+        # 5. 全体からのフォールバック探索
+        icon_span = soup.find("span", class_="icon")
+        if icon_span:
+            if icon_span.get("data-emoji"):
+                icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
+                if icon:
+                    return icon
+            txt = icon_span.get_text(strip=True)
+            if is_unicode_emoji(txt):
+                icon = resolve_notion_icon_to_emoji(txt)
+                if icon:
+                    return icon
+
+        return None
+
     def _build_page_node(
         self,
         zf: zipfile.ZipFile,
@@ -103,65 +180,17 @@ class HtmlZipExtractor:
         uid_matches = UUID_PATTERN.findall(html_file)
         node_id = normalize_id(uid_matches[-1]) if uid_matches else "root"
 
-        from src.icon_mapper import resolve_notion_icon_to_emoji, is_unicode_emoji
-
         # ページタイトル
         title = "Untitled Page"
         title_el = soup.find("title") or soup.find(class_="page-title")
         if title_el:
             title = title_el.text.strip()
+        # タイトル末尾に Notion のリンクアーティファクト " (パス/ファイル名.html)" が混入している場合は除去
+        title = re.sub(r"\s*\([^)]*\.html\)$", "", title).strip()
+        title = urllib.parse.unquote(title)
 
         # アイコン (絵文字またはNotion標準SVGアイコンを解決)
-        icon = None
-        icon_meta = soup.find("meta", attrs={"name": "data-notion-page-icon"})
-        if icon_meta and icon_meta.get("content"):
-            icon = resolve_notion_icon_to_emoji(icon_meta["content"])
-
-        if not icon:
-            page_art = soup.find("article", class_=lambda c: c and "page" in c) or soup.find("article") or soup.find(class_="page")
-            if page_art and page_art.get("data-notion-page-icon"):
-                icon = resolve_notion_icon_to_emoji(page_art["data-notion-page-icon"])
-
-        if not icon:
-            header_icon_div = soup.find(class_=lambda c: c and "page-header-icon" in c)
-            if header_icon_div:
-                img = header_icon_div.find("img")
-                if img and img.get("src"):
-                    icon = resolve_notion_icon_to_emoji(img["src"])
-                if not icon:
-                    icon_span = header_icon_div.find("span", class_="icon")
-                    if icon_span and icon_span.get("data-emoji"):
-                        icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
-                    if not icon and icon_span:
-                        txt = icon_span.get_text(strip=True)
-                        if is_unicode_emoji(txt):
-                            icon = resolve_notion_icon_to_emoji(txt)
-                if not icon:
-                    txt = header_icon_div.get_text(strip=True)
-                    if is_unicode_emoji(txt):
-                        icon = resolve_notion_icon_to_emoji(txt)
-
-        if not icon:
-            header = soup.find("header")
-            if header:
-                icon_span = header.find("span", class_="icon")
-                if icon_span:
-                    if icon_span.get("data-emoji"):
-                        icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
-                    if not icon:
-                        txt = icon_span.get_text(strip=True)
-                        if is_unicode_emoji(txt):
-                            icon = resolve_notion_icon_to_emoji(txt)
-
-        if not icon:
-            icon_span = soup.find("span", class_="icon")
-            if icon_span:
-                if icon_span.get("data-emoji"):
-                    icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
-                if not icon:
-                    txt = icon_span.get_text(strip=True)
-                    if is_unicode_emoji(txt):
-                        icon = resolve_notion_icon_to_emoji(txt)
+        icon = self._extract_icon_from_soup(soup)
 
         # カバー画像
         cover = None
@@ -173,6 +202,8 @@ class HtmlZipExtractor:
         # ノードタイプの判定（データベースか通常ページか）
         is_database = node_id in db_csv_map
         node_type = "database" if is_database else "page"
+        if is_database and not icon:
+            icon = "🗄️"
 
         # 本文ブロックのパース
         blocks = []
@@ -254,11 +285,14 @@ class HtmlZipExtractor:
             db_id = str(uuid.uuid5(uuid.NAMESPACE_URL, csv_file))
             title = base_name.strip()
 
+        title = re.sub(r"\s*\([^)]*\.html\)$", "", title).strip()
+        title = urllib.parse.unquote(title)
+
         db_node = PageNode(
             id=db_id,
             title=title or "Untitled Database",
             node_type="database",
-            icon="📊",
+            icon="🗄️",
             properties={"schema": {}},
             blocks=[],
             children=[],
@@ -295,19 +329,30 @@ class HtmlZipExtractor:
         logger.info(f"Extracting {len(rows)} records from database CSV: [{db_node.title}]")
 
         for row in rows:
+            clean_row = {k.lstrip("\ufeff"): v for k, v in row.items()}
             # タスク名またはタイトル列
-            raw_title = row.get("タスク名") or row.get("名前") or row.get("Title") or row.get("Name")
+            raw_title = (
+                clean_row.get("タスク名")
+                or clean_row.get("名前")
+                or clean_row.get("Title")
+                or clean_row.get("Name")
+                or clean_row.get("タイトル")
+            )
             if not raw_title:
                 # 最初の列をタイトルとする
-                raw_title = next(iter(row.values()), "Untitled Record")
+                raw_title = next(iter(clean_row.values()), "Untitled Record")
+            # NotionのCSVエクスポートにおけるリンクアーティファクト " (パス/ファイル名.html)" を除去
+            raw_title = re.sub(r"\s*\([^)]*\.html\)$", "", raw_title).strip()
             # タイトル内の改行文字をスペースに正規化（ファイル名やConfluenceタイトルとの不整合を防止）
             row_title = re.sub(r"[\r\n]+", " ", raw_title).strip() if raw_title else "Untitled Record"
+            row_title = urllib.parse.unquote(row_title)
 
             # 行IDの特定（CSV値内のHTMLリンク、またはタイトル名マッチング）
             row_id = None
             row_html_file = None
-            for col_val in row.values():
-                m = UUID_PATTERN.findall(col_val)
+            for col_val in clean_row.values():
+                unquoted_col_val = urllib.parse.unquote(col_val)
+                m = UUID_PATTERN.findall(unquoted_col_val) or UUID_PATTERN.findall(col_val)
                 if m:
                     cand_id = normalize_id(m[-1])
                     if cand_id in row_html_map:
@@ -327,25 +372,35 @@ class HtmlZipExtractor:
             if not row_id:
                 row_id = f"{db_node.id}_row_{len(db_node.children)}"
 
-            # レコード本文ブロックおよびコメントの抽出
+            # レコード本文ブロック、アイコン、カバーおよびコメントの抽出
             row_blocks = []
             row_comments = []
+            row_icon = None
+            row_cover = None
             if row_html_file and row_html_file in zf.namelist():
                 row_soup = BeautifulSoup(zf.read(row_html_file).decode("utf-8"), "html.parser")
+                row_icon = self._extract_icon_from_soup(row_soup)
+                cover_img = row_soup.find("img", class_="page-cover-image")
+                if cover_img and cover_img.get("src"):
+                    row_cover = {"type": "external", "external": {"url": cover_img["src"]}}
                 row_body = row_soup.find(class_="page-body")
                 if row_body:
                     row_blocks = self._parse_elements_to_blocks(row_body, zf, os.path.dirname(row_html_file))
                 row_comments = self._extract_page_comments(row_soup)
 
+            if not row_icon:
+                row_icon = "📄"
+
             # プロパティ辞書の整形
             row_properties = {}
-            for col_name, val in row.items():
+            for col_name, val in clean_row.items():
                 if not val:
                     continue
                 clean_col = col_name.strip()
                 clean_val = val.strip()
                 # リレーションのパース（例: "タイトル (フォルダ/ファイル名 00000000...html)"）
-                rel_match = UUID_PATTERN.findall(clean_val)
+                unquoted_clean_val = urllib.parse.unquote(clean_val)
+                rel_match = UUID_PATTERN.findall(unquoted_clean_val) or UUID_PATTERN.findall(clean_val)
                 if rel_match and ".html" in clean_val:
                     target_id = normalize_id(rel_match[-1])
                     row_properties[clean_col] = {
@@ -387,6 +442,8 @@ class HtmlZipExtractor:
                 id=row_id,
                 title=row_title,
                 node_type="database_row",
+                icon=row_icon,
+                cover=row_cover,
                 properties=row_properties,
                 blocks=row_blocks,
                 children=[],
@@ -1140,7 +1197,7 @@ class MultiZipExtractor:
 
         for bn in block_nodes:
             summary_blocks.append({
-                "id": f"link_{bn.id}",
+                "id": bn.id,
                 "type": "child_page",
                 "child_page": {"title": bn.title},
             })
@@ -1149,6 +1206,7 @@ class MultiZipExtractor:
             id="multi_block_root_page",
             title=self.root_title,
             node_type="page",
+            icon="🌐",
             properties={},
             blocks=summary_blocks,
             children=block_nodes,

@@ -129,6 +129,8 @@ class NotionToConfluenceConverter:
     ):
         self.id_to_title_map = id_to_title_map or {}
         self.migration_map: Dict[str, Dict[str, Any]] = {}
+        self.confluence_base_url: str = ""
+        self.space_key: str = ""
         self.user_mapper = user_mapper
         from src.timezone_util import resolve_timezone
         self.timezone = resolve_timezone(timezone)
@@ -449,18 +451,14 @@ class NotionToConfluenceConverter:
                             break
 
                 if target_info and target_info.get("node_type") == "database":
-                    db_url = target_info.get("web_url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
+                    db_url = target_info.get("web_url") or target_info.get("url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
                     escaped = f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(target_info.get("title", escaped))}</a>'
                 elif target_info and target_info.get("confluence_id"):
                     cid = target_info["confluence_id"]
                     disp_title = target_info.get("title") or target_title or escaped
                     escaped_title = html.escape(disp_title)
-                    escaped = (
-                        f'<ac:link ac:card-appearance="inline">'
-                        f'<ri:page ri:content-id="{cid}" />'
-                        f'<ac:link-body>{escaped_title}</ac:link-body>'
-                        f'</ac:link>'
-                    )
+                    target_url = target_info.get("url") or f"{self.confluence_base_url}/spaces/{self.space_key}/pages/{cid}"
+                    escaped = f'<a href="{html.escape(target_url)}" data-card-appearance="inline">{escaped_title}</a>'
                 elif target_title:
                     escaped_title = html.escape(target_title)
                     escaped = (
@@ -752,12 +750,10 @@ class NotionToConfluenceConverter:
                     cid = target_info["confluence_id"]
                     disp_title = target_info.get("title") or child_title
                     escaped_title = html.escape(disp_title)
-                    # Confluenceのインラインスマートリンクオブジェクト（ri:content-idによる完全解決）
+                    target_url = target_info.get("url") or f"{self.confluence_base_url}/spaces/{self.space_key}/pages/{cid}"
+                    # Confluenceネイティブのインラインスマートリンクオブジェクト（URL + data-card-appearance="inline"）
                     output.append(
-                        f'<p><ac:link ac:card-appearance="inline">'
-                        f'<ri:page ri:content-id="{cid}" />'
-                        f'<ac:link-body>{escaped_title}</ac:link-body>'
-                        f'</ac:link></p>'
+                        f'<p><a href="{html.escape(target_url)}" data-card-appearance="inline">{escaped_title}</a></p>'
                     )
                 else:
                     escaped_title = html.escape(child_title)
@@ -1384,7 +1380,7 @@ class NotionToConfluenceConverter:
 
         for child in db_node.children:
             row_cells = []
-            child_link = page_link_map.get(child.id, "")
+            child_link = str(page_link_map.get(child.id, "")).strip()
             # confluence-page-link は有効なURLまたは数値Content IDのみ許容される。
             # ページ未作成時などに文字列タイトルを入れるとConfluenceがContent ID解決に失敗し
             # 「Could not create database entity in Handling Service: CANVAS / Content ID not found for page link value」
@@ -1715,6 +1711,8 @@ class NotionToConfluenceConverter:
             )
         elif details_table:
             expand_body_parts.append(details_table)
+        else:
+            expand_body_parts.append("<p>レコードプロパティはありません。</p>")
 
         if expand_body_parts:
             expand_macro = (

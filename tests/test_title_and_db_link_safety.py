@@ -1,4 +1,7 @@
+import os
+import tempfile
 import unittest
+import zipfile
 from unittest.mock import MagicMock, patch
 
 from src.extractor import PageNode
@@ -183,6 +186,98 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
         finally:
             if os.path.exists(tf_path):
                 os.remove(tf_path)
+
+    def test_verifier_accepts_truncated_titles(self):
+        """240文字を超えてConfluence側で切り詰められたタイトルが検証でFAILにならずPASSすることの検証"""
+        from src.verifier import MigrationVerifier
+        from src.extractor import PageNode
+
+        mock_client = MagicMock()
+        # 250文字の長いタイトル
+        long_title = "長いタイトル" * 40
+        truncated_title = long_title[:237] + "..."
+        mock_client.get_page_by_id.return_value = {
+            "id": "12345",
+            "title": truncated_title,
+            "body": {"storage": {"value": "<p>Content</p>"}, "view": {"value": "<p>Content</p>"}},
+            "ancestors": [],
+        }
+
+        verifier = MigrationVerifier(mock_client)
+        node = PageNode(id="node-long", title=long_title, node_type="page", blocks=[])
+        res = verifier.verify_page_node(node, confluence_page_id="12345")
+        self.assertEqual(res["status"], "PASS")
+        self.assertNotIn("Title mismatch", str(res["issues"]))
+
+    def test_html_extractor_cleans_link_suffix_and_bom_from_csv_titles(self):
+        """Notion CSVのBOMやリレーション・ファイルリンク接尾辞 ' (フォルダ/名前.html)' がタイトルから安全に除去されることの検証"""
+        from src.html_extractor import HtmlZipExtractor
+
+        # リレーション列やBOMが付いたタイトル列
+        csv_content = """\ufeff名前,ステータス
+"E2E品質保証・自動テスト基盤 (05%20DB/E2E%204117be77284d812d91f0ff0be61a3c94.html)",Done
+"""
+        child_html = """<html><head><title>E2E品質保証・自動テスト基盤</title><meta name="data-notion-page-icon" content="🚀"/></head><body><div class='page-body'><p>Test</p></div></body></html>"""
+
+        tf = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        tf_path = tf.name
+        tf.close()
+
+        import os
+        try:
+            with zipfile.ZipFile(tf_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("プロジェクトDB 00000000000000000000000000000001.csv", csv_content.encode("utf-8"))
+                zf.writestr("プロジェクトDB 00000000000000000000000000000001.html", "<html><head><title>DB</title></head></html>".encode("utf-8"))
+                zf.writestr("プロジェクトDB/E2E 4117be77284d812d91f0ff0be61a3c94.html", child_html.encode("utf-8"))
+
+            extractor = HtmlZipExtractor(tf_path)
+            root = extractor.extract_tree()
+            self.assertEqual(len(root.children), 1)
+            row = root.children[0]
+            # .html リンク接尾辞が除去され、きれいなタイトルになっていること
+            self.assertEqual(row.title, "E2E品質保証・自動テスト基盤")
+            # 行アイコン（🚀）がHTMLから正しく抽出されていること
+            self.assertEqual(row.icon, "🚀")
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
+    def test_converter_inline_smart_link_rendering(self):
+        """migration_mapに存在するページへの内部リンクがConfluenceスマートリンクオブジェクト形式でレンダリングされること"""
+        conv = NotionToConfluenceConverter()
+        conv.confluence_base_url = "https://example.atlassian.net/wiki"
+        conv.space_key = "TEST"
+        conv.migration_map = {
+            "4117be77-284d-8159-abc8-fa6cce1ccf00": {
+                "confluence_id": "88888",
+                "title": "Block A: プロジェクト管理・基盤",
+                "url": "https://example.atlassian.net/wiki/spaces/TEST/pages/88888",
+                "node_type": "page",
+            }
+        }
+
+        # 1. rich_text 内の内部リンク
+        rich_text = [{
+            "type": "text",
+            "text": {
+                "content": "Block A へのリンク",
+                "link": {"url": "https://app.notion.com/p/Block-A-4117be77284d8159abc8fa6cce1ccf00?pvs=21"}
+            },
+            "plain_text": "Block A へのリンク",
+        }]
+        html_out = conv.convert_rich_text(rich_text)
+        self.assertIn('data-card-appearance="inline"', html_out)
+        self.assertIn("https://example.atlassian.net/wiki/spaces/TEST/pages/88888", html_out)
+
+        # 2. child_page ブロックのスマートリンク
+        blocks = [{
+            "id": "4117be77-284d-8159-abc8-fa6cce1ccf00",
+            "type": "child_page",
+            "child_page": {"title": "Block A: プロジェクト管理・基盤"},
+        }]
+        storage_out = conv.blocks_to_storage_format(blocks)
+        self.assertIn('data-card-appearance="inline"', storage_out)
+        self.assertIn("https://example.atlassian.net/wiki/spaces/TEST/pages/88888", storage_out)
 
 
 if __name__ == "__main__":

@@ -234,29 +234,42 @@ class ConfluenceClient:
         emoji_hex = "-".join(cps)
 
         for prop_key in ("emoji-title-published", "emoji-title-draft"):
-            url = f"{self.base_url}/rest/api/content/{page_id}/property"
-            try:
-                get_res = requests.get(f"{url}/{prop_key}", auth=self.auth, timeout=15)
-                if get_res.status_code == 200:
-                    prop_data = get_res.json()
-                    version = prop_data.get("version", {}).get("number", 1) + 1
-                    requests.put(
-                        f"{url}/{prop_key}",
-                        json={"key": prop_key, "value": emoji_hex, "version": {"number": version}},
-                        auth=self.auth,
-                        headers=self.headers,
-                        timeout=15,
-                    )
-                else:
-                    requests.post(
-                        url,
-                        json={"key": prop_key, "value": emoji_hex},
-                        auth=self.auth,
-                        headers=self.headers,
-                        timeout=15,
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to set page emoji property for {page_id}: {e}")
+            url = f"{self.base_url}/rest/api/content/{page_id}/property/{prop_key}"
+            for attempt in range(3):
+                try:
+                    get_res = requests.get(url, auth=self.auth, timeout=15)
+                    if get_res.status_code == 200:
+                        prop_data = get_res.json()
+                        version = prop_data.get("version", {}).get("number", 1) + 1
+                        res = requests.put(
+                            url,
+                            json={"key": prop_key, "value": emoji_hex, "version": {"number": version}},
+                            auth=self.auth,
+                            headers=self.headers,
+                            timeout=15,
+                        )
+                    else:
+                        post_url = f"{self.base_url}/rest/api/content/{page_id}/property"
+                        res = requests.post(
+                            post_url,
+                            json={"key": prop_key, "value": emoji_hex},
+                            auth=self.auth,
+                            headers=self.headers,
+                            timeout=15,
+                        )
+                    if res.status_code == 429:
+                        time.sleep(1.0 * (attempt + 1))
+                        continue
+                    if res.status_code in (200, 201):
+                        break
+                    else:
+                        logger.warning(f"Failed setting {prop_key} on page {page_id}: HTTP {res.status_code}")
+                        break
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(1.0)
+                    else:
+                        logger.warning(f"Exception setting page emoji property for {page_id}: {e}")
 
     def delete_page(self, page_id: str) -> bool:
         """Confluenceページを削除する。"""
@@ -593,6 +606,8 @@ class ConfluenceImporter:
         if self.metadata_template is not None:
             conv_kwargs["metadata_template"] = self.metadata_template
         self.converter = NotionToConfluenceConverter(**conv_kwargs)
+        self.converter.confluence_base_url = self.client.base_url
+        self.converter.space_key = self.space_key
         self.migration_map: Dict[str, Dict[str, Any]] = {}
 
         if self.checkpoint:
@@ -775,13 +790,17 @@ class ConfluenceImporter:
                     latest = self.client.get_page_by_id(conf_id, expand="version")
                     if latest:
                         current_ver = latest.get("version", {}).get("number", 1)
+                        title_to_update = page_info.get("title") or node.title
                         self.client.update_page(
                             page_id=conf_id,
                             space_key=self.space_key,
-                            title=node.title,
+                            title=title_to_update,
                             body=new_body,
                             current_version=current_ver,
                         )
+                        # アイコンが未設定またはPass 1で失敗していた場合の確実な再設定
+                        if node.icon:
+                            self.client.set_page_emoji(conf_id, node.icon)
                         logger.info(f"Pass 2 updated page [{node.title}] (ID: {conf_id}, v{current_ver + 1}) with resolved views & links")
                         if self.checkpoint:
                             self.checkpoint.record_pass2(node.id)
@@ -1334,15 +1353,28 @@ class ConfluenceImporter:
                 if not space_id:
                     raise RuntimeError(f"Could not resolve Confluence Space ID for space key '{self.space_key}'.")
                 logger.info(f"Creating native Confluence Database: [{node.title}] under parent {parent_id}")
-                db_res = self.client.create_database(
-                    space_id=space_id,
-                    title=node.title,
-                    parent_id=parent_id,
-                    csv_body=csv_body,
-                )
-                confluence_page_id = db_res["id"]
-                webui = db_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/database/{confluence_page_id}")
-                confluence_url = f"{self.client.base_url}{webui}"
+                try:
+                    db_res = self.client.create_database(
+                        space_id=space_id,
+                        title=node.title,
+                        parent_id=parent_id,
+                        csv_body=csv_body,
+                    )
+                    confluence_page_id = db_res["id"]
+                    webui = db_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/database/{confluence_page_id}")
+                    confluence_url = f"{self.client.base_url}{webui}"
+                except Exception as e:
+                    logger.warning(f"Failed to create native Confluence Database for [{node.title}] ({e}). Falling back to standard Confluence page with overview table.")
+                    fallback_body = self.converter.generate_page_content(node)
+                    res = self.client.create_page(
+                        space_key=self.space_key,
+                        title=node.title,
+                        body=fallback_body,
+                        parent_id=parent_id,
+                    )
+                    confluence_page_id = res["id"]
+                    webui = res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{confluence_page_id}")
+                    confluence_url = f"{self.client.base_url}{webui}"
 
             # 3.5. 単一選択・複数選択プロパティの設定を反映（ステータス等はsingle-select、カテゴリ等はmulti-select）
             single_props, multi_props = self.converter.get_select_field_configurations(node)

@@ -47,9 +47,15 @@ class MigrationVerifier:
         view_body = conf_page.get("body", {}).get("view", {}).get("value", "")
         ancestors = conf_page.get("ancestors", [])
 
-        # 2. タイトル検証
-        if conf_title == node.title:
-            checks_passed.append(f"Title exact match: '{conf_title}'")
+        # 2. タイトル検証 (240文字制限による切り詰めやサフィックスを考慮)
+        expected_title = node.title
+        expected_truncated = expected_title[:237] + "..." if len(expected_title) > 240 else expected_title
+        if (
+            conf_title == expected_title
+            or conf_title == expected_truncated
+            or (len(conf_title) >= 237 and expected_title.startswith(conf_title.rstrip(".")))
+        ):
+            checks_passed.append(f"Title match: '{conf_title}'")
         else:
             issues.append(f"Title mismatch: Expected '{node.title}', got '{conf_title}'")
 
@@ -259,9 +265,15 @@ class MigrationVerifier:
             }
 
         conf_title = db_data.get("title", "")
-        # 1-a. タイトル検証
-        if conf_title == node.title:
-            checks_passed.append(f"Database title exact match: '{conf_title}'")
+        # 1-a. タイトル検証 (240文字制限による切り詰めを考慮)
+        expected_title = node.title
+        expected_truncated = expected_title[:237] + "..." if len(expected_title) > 240 else expected_title
+        if (
+            conf_title == expected_title
+            or conf_title == expected_truncated
+            or (len(conf_title) >= 237 and expected_title.startswith(conf_title.rstrip(".")))
+        ):
+            checks_passed.append(f"Database title match: '{conf_title}'")
         else:
             issues.append(f"Database title mismatch: Expected '{node.title}', got '{conf_title}'")
 
