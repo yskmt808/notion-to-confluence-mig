@@ -9,6 +9,8 @@ import re
 import csv
 import io
 import uuid
+import base64
+import hashlib
 import zipfile
 import logging
 import urllib.parse
@@ -341,6 +343,45 @@ class HtmlZipExtractor:
                 comments=row_comments,
             )
             db_node.children.append(row_node)
+
+    @staticmethod
+    def _parse_data_uri(src: str) -> Optional[Tuple[bytes, str, str]]:
+        """Data URI (data:image/...;base64,... または URLエンコード形式) を解析し、
+        バイナリデータ、一意なファイル名、MIMEタイプを返す。
+        """
+        if not src or not src.startswith("data:image/"):
+            return None
+        header, sep, raw_data = src.partition(",")
+        if not sep:
+            return None
+
+        parts = header[5:].split(";")
+        mime_type = parts[0].strip().lower()
+        is_base64 = any(p.strip().lower() == "base64" for p in parts[1:])
+
+        try:
+            if is_base64:
+                clean_b64 = re.sub(r"\s+", "", raw_data)
+                data_bytes = base64.b64decode(clean_b64)
+            else:
+                data_bytes = urllib.parse.unquote_to_bytes(raw_data)
+        except Exception as e:
+            logger.warning(f"Failed to decode data URI image: {e}")
+            return None
+
+        ext_map = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/svg+xml": ".svg",
+            "image/bmp": ".bmp",
+        }
+        ext = ext_map.get(mime_type.lower(), ".png")
+        content_hash = hashlib.md5(data_bytes).hexdigest()[:10]
+        filename = f"embedded_image_{content_hash}{ext}"
+        return data_bytes, filename, mime_type
 
     def _read_zip_attachment_bytes(
         self, zf: zipfile.ZipFile, current_dir: str, src: str
@@ -771,28 +812,46 @@ class HtmlZipExtractor:
                 elif "image" in classes or img_tag:
                     src = img_tag.get("src") if img_tag else href
                     if src:
-                        is_external = src.startswith(("http://", "https://"))
-                        img_filename = os.path.basename(urllib.parse.unquote(src))
-                        block_obj = {
-                            "id": el_id,
-                            "type": "image",
-                            "image": {
-                                "type": "external" if is_external else "file",
-                                "caption": caption_rich,
-                                "external": {"url": src} if is_external else None,
-                                "file": {"url": src} if not is_external else None,
-                            },
-                            "_attachment_filename": img_filename,
-                        }
-                        if not is_external:
-                            # ZIP内相対パスから画像実体バイナリを取得
-                            data, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, src)
-                            if data:
-                                block_obj["_attachment_bytes"] = data
-                                logger.info(f"Loaded inline image attachment from ZIP: {resolved_path} ({len(data)} bytes)")
-                            else:
-                                logger.warning(f"Image attachment not found in ZIP: src='{src}', resolved='{resolved_path}'")
-                        blocks.append(block_obj)
+                        data_uri_info = self._parse_data_uri(src)
+                        if data_uri_info:
+                            data_bytes, filename, mime = data_uri_info
+                            block_obj = {
+                                "id": el_id,
+                                "type": "image",
+                                "image": {
+                                    "type": "file",
+                                    "caption": caption_rich,
+                                    "external": None,
+                                    "file": {"url": filename},
+                                },
+                                "_attachment_filename": filename,
+                                "_attachment_bytes": data_bytes,
+                            }
+                            logger.info(f"Loaded inline base64/data URI image: {filename} ({len(data_bytes)} bytes)")
+                            blocks.append(block_obj)
+                        else:
+                            is_external = src.startswith(("http://", "https://"))
+                            img_filename = os.path.basename(urllib.parse.unquote(src))
+                            block_obj = {
+                                "id": el_id,
+                                "type": "image",
+                                "image": {
+                                    "type": "external" if is_external else "file",
+                                    "caption": caption_rich,
+                                    "external": {"url": src} if is_external else None,
+                                    "file": {"url": src} if not is_external else None,
+                                },
+                                "_attachment_filename": img_filename,
+                            }
+                            if not is_external:
+                                # ZIP内相対パスから画像実体バイナリを取得
+                                data, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, src)
+                                if data:
+                                    block_obj["_attachment_bytes"] = data
+                                    logger.info(f"Loaded inline image attachment from ZIP: {resolved_path} ({len(data)} bytes)")
+                                else:
+                                    logger.warning(f"Image attachment not found in ZIP: src='{src}', resolved='{resolved_path}'")
+                            blocks.append(block_obj)
                 elif href:
                     lower_href = href.lower()
                     if lower_href.endswith(".pdf"):
@@ -836,27 +895,45 @@ class HtmlZipExtractor:
             elif tag == "img":
                 src = el.get("src")
                 if src:
-                    is_external = src.startswith(("http://", "https://"))
-                    img_filename = os.path.basename(urllib.parse.unquote(src))
-                    block_obj = {
-                        "id": el_id,
-                        "type": "image",
-                        "image": {
-                            "type": "external" if is_external else "file",
-                            "caption": [],
-                            "external": {"url": src} if is_external else None,
-                            "file": {"url": src} if not is_external else None,
-                        },
-                        "_attachment_filename": img_filename,
-                    }
-                    if not is_external:
-                        data, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, src)
-                        if data:
-                            block_obj["_attachment_bytes"] = data
-                            logger.info(f"Loaded inline image attachment from ZIP: {resolved_path} ({len(data)} bytes)")
-                        else:
-                            logger.warning(f"Image attachment not found in ZIP: src='{src}', resolved='{resolved_path}'")
-                    blocks.append(block_obj)
+                    data_uri_info = self._parse_data_uri(src)
+                    if data_uri_info:
+                        data_bytes, filename, mime = data_uri_info
+                        block_obj = {
+                            "id": el_id,
+                            "type": "image",
+                            "image": {
+                                "type": "file",
+                                "caption": [],
+                                "external": None,
+                                "file": {"url": filename},
+                            },
+                            "_attachment_filename": filename,
+                            "_attachment_bytes": data_bytes,
+                        }
+                        logger.info(f"Loaded inline base64/data URI image: {filename} ({len(data_bytes)} bytes)")
+                        blocks.append(block_obj)
+                    else:
+                        is_external = src.startswith(("http://", "https://"))
+                        img_filename = os.path.basename(urllib.parse.unquote(src))
+                        block_obj = {
+                            "id": el_id,
+                            "type": "image",
+                            "image": {
+                                "type": "external" if is_external else "file",
+                                "caption": [],
+                                "external": {"url": src} if is_external else None,
+                                "file": {"url": src} if not is_external else None,
+                            },
+                            "_attachment_filename": img_filename,
+                        }
+                        if not is_external:
+                            data, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, src)
+                            if data:
+                                block_obj["_attachment_bytes"] = data
+                                logger.info(f"Loaded inline image attachment from ZIP: {resolved_path} ({len(data)} bytes)")
+                            else:
+                                logger.warning(f"Image attachment not found in ZIP: src='{src}', resolved='{resolved_path}'")
+                        blocks.append(block_obj)
 
             # 16. その他・未知のNotion固有要素 (例: breadcrumb 等)
             else:

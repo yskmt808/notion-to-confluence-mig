@@ -149,6 +149,56 @@ class TestHtmlExtractorMetadataAndOrdering(unittest.TestCase):
         # 2回目: C を B の後に移動
         self.assertEqual(calls[1][0], (importer.migration_map["c"]["confluence_id"], "after", importer.migration_map["b"]["confluence_id"]))
 
+    def test_base64_embedded_image_extraction(self):
+        """HTML内のBase64データURI形式の画像がデコードされ添付バイナリとして抽出されることを検証"""
+        import base64
+        sample_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRtest_data"
+        b64_str = base64.b64encode(sample_bytes).decode("ascii")
+        data_uri = f"data:image/png;base64,{b64_str}"
+
+        html_content = f"""
+        <html>
+        <head><title>Base64 Image Page</title></head>
+        <body>
+          <h1 class="page-title">Base64 Image Page</h1>
+          <div class="page-body">
+            <figure class="image">
+              <img src="{data_uri}" />
+              <figcaption>Base64キャプション</figcaption>
+            </figure>
+            <p>本文テキスト</p>
+            <img src="{data_uri}" />
+          </div>
+        </body>
+        </html>
+        """
+
+        tf = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        tf_path = tf.name
+        tf.close()
+
+        try:
+            with zipfile.ZipFile(tf_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("Base64 Page 00000000000000000000000000000099.html", html_content.encode("utf-8"))
+
+            extractor = HtmlZipExtractor(tf_path)
+            root = extractor.extract_tree()
+            self.assertEqual(len(root.blocks), 3)
+
+            img_block1 = root.blocks[0]
+            self.assertEqual(img_block1["type"], "image")
+            self.assertEqual(img_block1["_attachment_bytes"], sample_bytes)
+            self.assertTrue(img_block1["_attachment_filename"].startswith("embedded_image_"))
+            self.assertTrue(img_block1["_attachment_filename"].endswith(".png"))
+
+            img_block2 = root.blocks[2]
+            self.assertEqual(img_block2["type"], "image")
+            self.assertEqual(img_block2["_attachment_bytes"], sample_bytes)
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
+
 
 if __name__ == "__main__":
     unittest.main()
