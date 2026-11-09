@@ -100,6 +100,34 @@ class TestIconMapperAndSubpageLink(unittest.TestCase):
             self.assertEqual(link_block["type"], "child_page")
             self.assertEqual(link_block["child_page"]["title"], "子ページタイトル")
 
+    def test_standalone_csv_recognized_as_database_node(self):
+        """HTMLファイルが存在せず単独で配置されたCSVファイルがデータベースとして認識されること"""
+        import tempfile
+        csv_content = "名前,ステータス,優先度\nタスクA,進行中,高\nタスクB,完了,中\n"
+        parent_html = """
+        <html><body><article id="p-id"><div class="page-body"></div></article></body></html>
+        """
+        with tempfile.NamedTemporaryFile(suffix=".zip") as tf:
+            with zipfile.ZipFile(tf.name, "w") as zf:
+                zf.writestr("プロジェクト 12345678123456781234567812345678.html", parent_html)
+                zf.writestr("プロジェクト/タスク管理.csv", csv_content.encode("utf-8-sig"))
+
+            extractor = HtmlZipExtractor(tf.name)
+            tree = extractor.extract_tree()
+            self.assertEqual(len(tree.children), 1)
+            child_db = tree.children[0]
+            self.assertEqual(child_db.node_type, "database")
+            self.assertEqual(child_db.title, "タスク管理")
+            self.assertEqual(len(child_db.children), 2)
+            self.assertEqual(child_db.children[0].title, "タスクA")
+
+    def test_clean_parameter_text_strips_html_tags(self):
+        """<ac:parameter>用のテキストからHTMLタグが安全に除去され、エスケープされること"""
+        from src.converter import clean_parameter_text
+        self.assertEqual(clean_parameter_text("<p><strong>太字タイトル</strong></p>"), "太字タイトル")
+        self.assertEqual(clean_parameter_text("詳細 <span style='color:red'>&amp; 注意</span>"), "詳細 &amp;amp; 注意")
+        self.assertEqual(clean_parameter_text(""), "")
+
 
 if __name__ == "__main__":
     unittest.main()

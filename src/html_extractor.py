@@ -8,6 +8,7 @@ import os
 import re
 import csv
 import io
+import uuid
 import zipfile
 import logging
 import urllib.parse
@@ -60,14 +61,26 @@ class HtmlZipExtractor:
             root_file = root_candidates[0]
             logger.info(f"Identified root HTML file: {root_file}")
 
-            # 3. データベースの特定: CSVファイルと同名(拡張子違い)のHTMLはデータベースと判定
+            # 3. データベースの特定: CSVファイルと同名(拡張子違い)のHTML、またはUUID一致するCSVをデータベースと判定
             db_csv_map = dict(self.global_db_csv_map)  # グローバルDBマップを引き継ぐ
             for c in csv_files:
-                base_name = c[:-4]
+                base_c = os.path.splitext(c)[0]
                 db_id_match = UUID_PATTERN.findall(c)
                 if db_id_match:
                     db_id = normalize_id(db_id_match[-1])
                     db_csv_map[db_id] = c
+                # UUIDがない場合でも、拡張子を除いたファイルパスでマッピング
+                db_csv_map[base_c] = c
+
+            # 同名HTMLが存在する場合のマッピング補完
+            for h in html_files:
+                base_h = os.path.splitext(h)[0]
+                if base_h in db_csv_map:
+                    h_uid = UUID_PATTERN.findall(h)
+                    if h_uid:
+                        db_csv_map[normalize_id(h_uid[-1])] = db_csv_map[base_h]
+
+            logger.info(f"Detected {len(db_csv_map)} database CSV mappings in ZIP.")
 
             # 4. 全ファイルからPageNodeを再帰的に構築
             root_node = self._build_page_node(zf, root_file, db_csv_map)
@@ -161,18 +174,61 @@ class HtmlZipExtractor:
 
         # 通常ページの場合、同名フォルダ内の子ページ/子データベースを走査
         # Notionエクスポートでは `{タイトル} {ID}.html` に対して `{タイトル}/` というフォルダ内に配下の子ファイルが格納される
-        sub_dir = re.sub(r"\s+[0-9a-fA-F]{32}\.html$", "", html_file) + "/"
+        sub_dir = re.sub(r"\s+[0-9a-fA-F]{32}\.html$", "", html_file)
+        if sub_dir == html_file:
+            sub_dir = os.path.splitext(html_file)[0]
+        sub_dir = sub_dir + "/"
 
+        processed_bases = set()
         for f in zf.namelist():
             if f.startswith(sub_dir) and f != html_file:
                 # 直下の子ファイルのみ（さらに深い孫フォルダのファイルは除外）
                 relative = f[len(sub_dir) :]
                 parts = relative.split("/")
-                if len(parts) == 1 and f.endswith(".html"):
-                    child_node = self._build_page_node(zf, f, db_csv_map, parent_dir=sub_dir)
-                    node.children.append(child_node)
+                if len(parts) == 1:
+                    base_f = os.path.splitext(f)[0]
+                    if f.endswith(".html"):
+                        child_node = self._build_page_node(zf, f, db_csv_map, parent_dir=sub_dir)
+                        node.children.append(child_node)
+                        processed_bases.add(base_f)
+                    elif f.endswith(".csv"):
+                        # 対応するHTMLが存在しない単独CSVデータベースの場合
+                        if base_f not in processed_bases:
+                            child_db_node = self._build_database_node_from_csv(zf, f)
+                            node.children.append(child_db_node)
+                            processed_bases.add(base_f)
 
         return node
+
+    def _build_database_node_from_csv(self, zf: zipfile.ZipFile, csv_file: str) -> PageNode:
+        """HTMLファイルが存在しない単独のCSVファイルから直接データベースPageNodeを構築する。"""
+        filename = os.path.basename(csv_file)
+        base_name = os.path.splitext(filename)[0]
+
+        # タイトルとIDの抽出
+        uid_matches = UUID_PATTERN.findall(filename)
+        if uid_matches:
+            db_id = normalize_id(uid_matches[-1])
+            title = re.sub(r"\s+[0-9a-fA-F]{32}$", "", base_name).strip()
+        else:
+            db_id = str(uuid.uuid5(uuid.NAMESPACE_URL, csv_file))
+            title = base_name.strip()
+
+        db_node = PageNode(
+            id=db_id,
+            title=title or "Untitled Database",
+            node_type="database",
+            icon="📊",
+            properties={"schema": {}},
+            blocks=[],
+            children=[],
+        )
+
+        # レコードの読み込み（仮想的なHTMLパスを渡して同名フォルダ内の行HTMLも探す）
+        fake_html_path = os.path.splitext(csv_file)[0] + ".html"
+        self._attach_database_rows(zf, db_node, csv_file, fake_html_path)
+        logger.info(f"Built database PageNode from standalone CSV: [{db_node.title}] (ID: {db_id}, {len(db_node.children)} rows)")
+        return db_node
 
     def _attach_database_rows(
         self,
@@ -285,6 +341,42 @@ class HtmlZipExtractor:
                 comments=row_comments,
             )
             db_node.children.append(row_node)
+
+    def _read_zip_attachment_bytes(
+        self, zf: zipfile.ZipFile, current_dir: str, src: str
+    ) -> Tuple[Optional[bytes], Optional[str]]:
+        """ZIP内から相対パス指定されたファイルの実体バイナリを安全に探索・取得する。"""
+        if not src or src.startswith(("http://", "https://", "data:")):
+            return None, None
+
+        clean_src = urllib.parse.unquote(src).replace("\\", "/").lstrip("/")
+        cand1 = os.path.normpath(os.path.join(current_dir, clean_src)).replace("\\", "/")
+        cand2 = clean_src
+        basename = os.path.basename(clean_src)
+
+        name_map = {f.replace("\\", "/"): f for f in zf.namelist()}
+
+        target = None
+        if cand1 in name_map:
+            target = name_map[cand1]
+        elif cand2 in name_map:
+            target = name_map[cand2]
+        else:
+            # 末尾一致のフォールバック探索
+            for norm_f, orig_f in name_map.items():
+                if norm_f.endswith("/" + basename) or norm_f == basename:
+                    target = orig_f
+                    break
+
+        if target:
+            try:
+                data = zf.read(target)
+                return data, target
+            except Exception as e:
+                logger.warning(f"Error reading attachment from ZIP ({target}): {e}")
+                return None, target
+
+        return None, cand1
 
     def _extract_page_comments(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
         """Notion HTMLエクスポートから最上位ページコメントを抽出する。"""
@@ -694,11 +786,12 @@ class HtmlZipExtractor:
                         }
                         if not is_external:
                             # ZIP内相対パスから画像実体バイナリを取得
-                            clean_src = urllib.parse.unquote(src)
-                            target_path = os.path.normpath(os.path.join(current_dir, clean_src))
-                            if target_path in zf.namelist():
-                                block_obj["_attachment_bytes"] = zf.read(target_path)
-                                logger.info(f"Loaded inline image attachment from ZIP: {target_path} ({len(block_obj['_attachment_bytes'])} bytes)")
+                            data, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, src)
+                            if data:
+                                block_obj["_attachment_bytes"] = data
+                                logger.info(f"Loaded inline image attachment from ZIP: {resolved_path} ({len(data)} bytes)")
+                            else:
+                                logger.warning(f"Image attachment not found in ZIP: src='{src}', resolved='{resolved_path}'")
                         blocks.append(block_obj)
                 elif href:
                     lower_href = href.lower()
@@ -757,10 +850,12 @@ class HtmlZipExtractor:
                         "_attachment_filename": img_filename,
                     }
                     if not is_external:
-                        clean_src = urllib.parse.unquote(src)
-                        target_path = os.path.normpath(os.path.join(current_dir, clean_src))
-                        if target_path in zf.namelist():
-                            block_obj["_attachment_bytes"] = zf.read(target_path)
+                        data, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, src)
+                        if data:
+                            block_obj["_attachment_bytes"] = data
+                            logger.info(f"Loaded inline image attachment from ZIP: {resolved_path} ({len(data)} bytes)")
+                        else:
+                            logger.warning(f"Image attachment not found in ZIP: src='{src}', resolved='{resolved_path}'")
                     blocks.append(block_obj)
 
             # 16. その他・未知のNotion固有要素 (例: breadcrumb 等)
@@ -861,6 +956,7 @@ class MultiZipExtractor:
                             if db_id_match:
                                 db_id = normalize_id(db_id_match[-1])
                                 global_db_csv_map[db_id] = f
+                            global_db_csv_map[os.path.splitext(f)[0]] = f
             except Exception as e:
                 logger.warning(f"ZIP事前スキャン警告 ({z_path}): {e}")
 

@@ -131,11 +131,11 @@ class MigrationVerifier:
                 else:
                     expected_macros = ["info", "note"]
 
-                matched = any(f'<ac:structured-macro ac:name="{m}"' in storage_body for m in expected_macros)
+                matched = any(f'<ac:structured-macro ac:name="{m}"' in storage_body for m in expected_macros) or '<ac:structured-macro ac:name="panel"' in storage_body
                 if matched:
-                    found_callouts.extend(expected_macros)
+                    found_callouts.extend(expected_macros + (["panel"] if '<ac:structured-macro ac:name="panel"' in storage_body else []))
                 else:
-                    issues.append(f"Callout block (color: {color}, icon: {emoji}) expected one of {expected_macros}, but not found in Confluence.")
+                    issues.append(f"Callout block (color: {color}, icon: {emoji}) expected one of {expected_macros} or 'panel', but not found in Confluence.")
             if found_callouts:
                 checks_passed.append(f"Callout macros verified: {', '.join(sorted(set(found_callouts)))}")
 

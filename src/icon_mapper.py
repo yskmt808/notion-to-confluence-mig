@@ -295,3 +295,4 @@ def resolve_notion_icon_to_emoji(icon_val: Any) -> Optional[str]:
             return NOTION_ICON_TO_EMOJI[name]
 
     return None
+

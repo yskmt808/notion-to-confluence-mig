@@ -577,6 +577,7 @@ class ConfluenceImporter:
         self.timezone = resolve_timezone(timezone)
         self._lock = threading.RLock()
         self._reserved_titles: Set[str] = set()
+        self._node_to_title: Dict[str, str] = {}
         self.client = ConfluenceClient(url, username, token)
         conv_kwargs = {"timezone": self.timezone, "user_mapper": self.user_mapper}
         if self.metadata_template is not None:
@@ -1020,8 +1021,11 @@ class ConfluenceImporter:
             node._cover_uploaded = False
             logger.warning(f"Failed to download/upload cover image {filename}: {e}")
 
-    def _process_attachments(self, blocks: List[Dict[str, Any]], page_id: str):
+    def _process_attachments(self, blocks: List[Dict[str, Any]], page_id: str, uploaded_filenames: Optional[Set[str]] = None):
         """ブロックツリー内の画像・添付ファイル・メディアをダウンロードし、Confluenceにアップロードする。"""
+        if uploaded_filenames is None:
+            uploaded_filenames = set()
+
         for b in blocks:
             b_type = b.get("type")
             file_url = None
@@ -1058,39 +1062,47 @@ class ConfluenceImporter:
                     block_id_short = b.get("id", "").replace("-", "")[:8]
                     filename = f"equation_{block_id_short}.png"
                     b["_attachment_filename"] = filename
-                    logger.info(f"Locally rendering LaTeX equation for page {page_id}: {filename}")
-                    try:
-                        png_bytes = render_latex_to_png(expr)
-                        self.client.upload_attachment(
-                            page_id=page_id,
-                            filename=filename,
-                            file_bytes=png_bytes,
-                            mime_type="image/png",
-                        )
+                    if filename in uploaded_filenames:
                         b["_attachment_uploaded"] = True
-                        logger.info(f"Successfully uploaded locally-rendered equation image: {filename}")
-                    except Exception as e:
-                        b["_attachment_uploaded"] = False
-                        logger.warning(f"Failed to locally render/upload equation {filename}: {e}")
+                    else:
+                        logger.info(f"Locally rendering LaTeX equation for page {page_id}: {filename}")
+                        try:
+                            png_bytes = render_latex_to_png(expr)
+                            self.client.upload_attachment(
+                                page_id=page_id,
+                                filename=filename,
+                                file_bytes=png_bytes,
+                                mime_type="image/png",
+                            )
+                            uploaded_filenames.add(filename)
+                            b["_attachment_uploaded"] = True
+                            logger.info(f"Successfully uploaded locally-rendered equation image: {filename}")
+                        except Exception as e:
+                            b["_attachment_uploaded"] = False
+                            logger.warning(f"Failed to locally render/upload equation {filename}: {e}")
 
             if b.get("_attachment_bytes"):
                 filename = b.get("_attachment_filename") or self.converter._get_attachment_filename(b)
                 b["_attachment_filename"] = filename
-                logger.info(f"Uploading pre-loaded attachment bytes for page {page_id}: {filename}")
-                try:
-                    ext = os.path.splitext(filename)[1].lower()
-                    mime_type = "image/png" if ext == ".png" else "image/jpeg" if ext in (".jpg", ".jpeg") else "application/octet-stream"
-                    self.client.upload_attachment(
-                        page_id=page_id,
-                        filename=filename,
-                        file_bytes=b["_attachment_bytes"],
-                        mime_type=mime_type,
-                    )
+                if filename in uploaded_filenames:
                     b["_attachment_uploaded"] = True
-                    logger.info(f"Successfully uploaded pre-loaded attachment: {filename}")
-                except Exception as e:
-                    b["_attachment_uploaded"] = False
-                    logger.warning(f"Failed to upload pre-loaded attachment {filename}: {e}")
+                else:
+                    logger.info(f"Uploading pre-loaded attachment bytes for page {page_id}: {filename}")
+                    try:
+                        ext = os.path.splitext(filename)[1].lower()
+                        mime_type = "image/png" if ext == ".png" else "image/jpeg" if ext in (".jpg", ".jpeg") else "application/octet-stream"
+                        self.client.upload_attachment(
+                            page_id=page_id,
+                            filename=filename,
+                            file_bytes=b["_attachment_bytes"],
+                            mime_type=mime_type,
+                        )
+                        uploaded_filenames.add(filename)
+                        b["_attachment_uploaded"] = True
+                        logger.info(f"Successfully uploaded pre-loaded attachment: {filename}")
+                    except Exception as e:
+                        b["_attachment_uploaded"] = False
+                        logger.warning(f"Failed to upload pre-loaded attachment {filename}: {e}")
             elif file_url and not is_embed:
                 filename = b.get("_attachment_filename") or self.converter._get_attachment_filename(b)
                 b["_attachment_filename"] = filename
@@ -1100,29 +1112,72 @@ class ConfluenceImporter:
                     b["_attachment_uploaded"] = False
                     continue
 
-                logger.info(f"Downloading attachment for page {page_id}: {filename}")
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-                try:
-                    resp = requests.get(file_url, headers=headers, timeout=30)
-                    if resp.status_code == 200:
-                        content_type = resp.headers.get("Content-Type", "application/octet-stream")
-                        self.client.upload_attachment(
-                            page_id=page_id,
-                            filename=filename,
-                            file_bytes=resp.content,
-                            mime_type=content_type,
-                        )
-                        b["_attachment_uploaded"] = True
-                        logger.info(f"Successfully uploaded attachment: {filename} ({len(resp.content)} bytes)")
-                    else:
+                if filename in uploaded_filenames:
+                    b["_attachment_uploaded"] = True
+                else:
+                    logger.info(f"Downloading attachment for page {page_id}: {filename}")
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                    try:
+                        resp = requests.get(file_url, headers=headers, timeout=30)
+                        if resp.status_code == 200:
+                            content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                            self.client.upload_attachment(
+                                page_id=page_id,
+                                filename=filename,
+                                file_bytes=resp.content,
+                                mime_type=content_type,
+                            )
+                            uploaded_filenames.add(filename)
+                            b["_attachment_uploaded"] = True
+                            logger.info(f"Successfully uploaded attachment: {filename} ({len(resp.content)} bytes)")
+                        else:
+                            b["_attachment_uploaded"] = False
+                            logger.warning(f"Download failed for {filename}: HTTP {resp.status_code}")
+                    except Exception as e:
                         b["_attachment_uploaded"] = False
-                        logger.warning(f"Download failed for {filename}: HTTP {resp.status_code}")
-                except Exception as e:
-                    b["_attachment_uploaded"] = False
-                    logger.warning(f"Failed to download/upload attachment {filename}: {e}")
+                        logger.warning(f"Failed to download/upload attachment {filename}: {e}")
 
             if b.get("children_blocks"):
-                self._process_attachments(b["children_blocks"], page_id)
+                self._process_attachments(b["children_blocks"], page_id, uploaded_filenames=uploaded_filenames)
+
+    def _resolve_unique_page_title(
+        self, base_title: str, notion_node_id: str, allow_existing_overwrite: bool = True
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """NotionノードのタイトルがConfluenceスペース内で重複している場合、安全にユニークなタイトルを採番する。"""
+        with self._lock:
+            if notion_node_id in self._node_to_title:
+                assigned = self._node_to_title[notion_node_id]
+                existing = self.client.get_page_by_title(space_key=self.space_key, title=assigned)
+                return assigned, existing
+
+            target_title = base_title
+            existing_page = self.client.get_page_by_title(space_key=self.space_key, title=target_title)
+
+            # 既存ページが存在し、かつ同一実行内でまだどのノードにも予約されていない場合に限り上書きを許可
+            can_overwrite = (
+                existing_page is not None
+                and allow_existing_overwrite
+                and target_title not in self._reserved_titles
+            )
+
+            if not can_overwrite and (existing_page is not None or target_title in self._reserved_titles):
+                # 同一スペース内または同一ツリー内でのタイトル重複！サフィックスを付与してユニーク化
+                suffix = 2
+                while True:
+                    candidate = f"{base_title} ({suffix})"
+                    if (
+                        candidate not in self._reserved_titles
+                        and not self.client.get_page_by_title(space_key=self.space_key, title=candidate)
+                    ):
+                        target_title = candidate
+                        break
+                    suffix += 1
+                logger.info(f"Resolved duplicate page title conflict in Confluence: [{base_title}] -> [{target_title}] (Node ID: {notion_node_id})")
+                existing_page = None  # 新規作成扱い
+
+            self._reserved_titles.add(target_title)
+            self._node_to_title[notion_node_id] = target_title
+            return target_title, existing_page
 
     def _import_node_recursive(
         self,
@@ -1448,10 +1503,12 @@ class ConfluenceImporter:
                 self.dashboard.record_pass1_done(node.title, node_type="database")
             return confluence_page_id
 
-        existing_page = self.client.get_page_by_title(
-            space_key=self.space_key,
-            title=node.title,
+        target_title, existing_page = self._resolve_unique_page_title(
+            base_title=node.title,
+            notion_node_id=node.id,
+            allow_existing_overwrite=overwrite,
         )
+        node.title = target_title
 
         if existing_page and overwrite:
             confluence_page_id = existing_page["id"]
@@ -1467,19 +1524,16 @@ class ConfluenceImporter:
             if self.telemetry:
                 for m in re.findall(r'<ac:structured-macro ac:name="([^"]+)"', body_xhtml):
                     self.telemetry.record_macro(m)
-            if self.telemetry:
-                for m in re.findall(r'<ac:structured-macro ac:name="([^"]+)"', body_xhtml):
-                    self.telemetry.record_macro(m)
 
             # 最新バージョンを再取得して確実に更新
             latest = self.client.get_page_by_id(confluence_page_id, expand="version")
             current_version = latest.get("version", {}).get("number", 1) if latest else 1
 
-            logger.info(f"Updating existing Confluence page: [{node.title}] (ID: {confluence_page_id}, v{current_version + 1})")
+            logger.info(f"Updating existing Confluence page: [{target_title}] (ID: {confluence_page_id}, v{current_version + 1})")
             res = self.client.update_page(
                 page_id=confluence_page_id,
                 space_key=self.space_key,
-                title=node.title,
+                title=target_title,
                 body=body_xhtml,
                 current_version=current_version,
                 parent_id=parent_id,
@@ -1491,7 +1545,7 @@ class ConfluenceImporter:
             # 新規作成フロー
             dummy_body = "<p>読み込み中...</p>"
             confluence_page_id, confluence_url = self._create_or_update_page(
-                title=node.title,
+                title=target_title,
                 body=dummy_body,
                 parent_id=parent_id,
                 overwrite=False,
@@ -1513,7 +1567,7 @@ class ConfluenceImporter:
             res = self.client.update_page(
                 page_id=confluence_page_id,
                 space_key=self.space_key,
-                title=node.title,
+                title=target_title,
                 body=body_xhtml,
                 current_version=current_version,
                 parent_id=parent_id,
@@ -1678,56 +1732,14 @@ class ConfluenceImporter:
         parent_id: Optional[str],
         overwrite: bool,
     ) -> Tuple[str, str]:
-        """Confluence上にページを作成、既存の場合は更新またはタイトル調整を行う。"""
-        # 1. 既存ページ判定とタイトル予約（短時間のロックで競合回避）
-        with self._lock:
-            existing_page = self.client.get_page_by_title(
-                space_key=self.space_key,
-                title=title,
-            )
-
-            if existing_page and overwrite:
-                page_id = existing_page["id"]
-                current_version = existing_page.get("version", {}).get("number", 1)
-                target_title = title
-            else:
-                target_title = title
-                if (existing_page or target_title in self._reserved_titles) and not overwrite:
-                    suffix = 2
-                    while True:
-                        candidate = f"{title} ({suffix})"
-                        if (
-                            candidate not in self._reserved_titles
-                            and not self.client.get_page_by_title(space_key=self.space_key, title=candidate)
-                        ):
-                            target_title = candidate
-                            break
-                        suffix += 1
-                self._reserved_titles.add(target_title)
-
-        # 2. 実際のHTTP通信（作成または更新）はロック外で完全並行実行
-        if existing_page and overwrite:
-            logger.info(f"Updating existing Confluence page: [{target_title}] (ID: {page_id}, v{current_version + 1})")
-            res = self.client.update_page(
-                page_id=page_id,
-                space_key=self.space_key,
-                title=target_title,
-                body=body,
-                current_version=current_version,
-                parent_id=parent_id,
-            )
-            webui = res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{page_id}")
-            page_url = f"{self.client.base_url}{webui}"
-            return page_id, page_url
-
-        logger.info(f"Creating new Confluence page: [{target_title}] (Parent: {parent_id})")
+        """Confluence上にページを作成する。タイトルはすでに _resolve_unique_page_title で予約・一元化されている。"""
+        logger.info(f"Creating new Confluence page: [{title}] (Parent: {parent_id})")
         res = self.client.create_page(
             space_key=self.space_key,
-            title=target_title,
+            title=title,
             body=body,
             parent_id=parent_id,
         )
-
         page_id = res["id"]
         webui = res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{page_id}")
         page_url = f"{self.client.base_url}{webui}"

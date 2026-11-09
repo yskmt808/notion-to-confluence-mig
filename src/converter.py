@@ -77,6 +77,30 @@ def _render_badge(text: str, color: str = "default") -> str:
 DEFAULT_METADATA_TEMPLATE = "📄 Notion元情報 — 作成者: {author} | 🕒 作成日時: {created_time}"
 
 
+def clean_parameter_text(text: str) -> str:
+    """<ac:parameter> タグ内部にHTMLタグが混入してConfluence APIが500エラーになるのを防ぐため、
+    HTMLタグを完全に除去し、実体参照エスケープしたプレーンテキストを返す。"""
+    if not text:
+        return ""
+    clean = re.sub(r"<[^>]+>", "", text)
+    return html.escape(clean.strip())
+
+
+# Notionコールアウト背景色 -> Confluence パネルマクロ用 HEX カラー定義
+CALLOUT_PANEL_COLORS = {
+    "default": {"bg": "#f1f1ef", "border": "#e3e2e0"},
+    "gray": {"bg": "#f1f1ef", "border": "#e3e2e0"},
+    "brown": {"bg": "#f4eeee", "border": "#e8dfdf"},
+    "orange": {"bg": "#faebdd", "border": "#f4d8be"},
+    "yellow": {"bg": "#fbf3db", "border": "#f4e6b5"},
+    "green": {"bg": "#edf3ec", "border": "#dbe8d9"},
+    "blue": {"bg": "#edf5fb", "border": "#dbeaf6"},
+    "purple": {"bg": "#f6f3f9", "border": "#eae3f2"},
+    "pink": {"bg": "#faf1f5", "border": "#f2dfea"},
+    "red": {"bg": "#fdebec", "border": "#f9d3d6"},
+}
+
+
 class NotionToConfluenceConverter:
     MERMAID_KEYWORDS = (
         "graph ", "flowchart ", "sequencediagram", "statediagram", "classdiagram",
@@ -518,9 +542,10 @@ class NotionToConfluenceConverter:
                 current_heading = text
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
+                    param_title = clean_parameter_text(text) or "詳細"
                     output.append(
                         f'<ac:structured-macro ac:name="expand">'
-                        f'<ac:parameter ac:name="title">{text if text else "詳細"}</ac:parameter>'
+                        f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
                         f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
@@ -533,9 +558,10 @@ class NotionToConfluenceConverter:
                 current_heading = text
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
+                    param_title = clean_parameter_text(text) or "詳細"
                     output.append(
                         f'<ac:structured-macro ac:name="expand">'
-                        f'<ac:parameter ac:name="title">{text if text else "詳細"}</ac:parameter>'
+                        f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
                         f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
@@ -548,9 +574,10 @@ class NotionToConfluenceConverter:
                 current_heading = text
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
+                    param_title = clean_parameter_text(text) or "詳細"
                     output.append(
                         f'<ac:structured-macro ac:name="expand">'
-                        f'<ac:parameter ac:name="title">{text if text else "詳細"}</ac:parameter>'
+                        f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
                         f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
@@ -634,58 +661,40 @@ class NotionToConfluenceConverter:
                 from src.icon_mapper import resolve_notion_icon_to_emoji
                 callout_data = b.get("callout", {})
                 color = callout_data.get("color", "default").lower()
+                color_key = color.replace("_background", "").strip()
+                color_info = CALLOUT_PANEL_COLORS.get(color_key, CALLOUT_PANEL_COLORS["default"])
+
                 icon_obj = callout_data.get("icon") or {}
                 emoji = resolve_notion_icon_to_emoji(icon_obj)
                 text = self.convert_rich_text(callout_data.get("rich_text", []))
 
-                # マクロ名と背景色・Confluence側システムアイコンの対応:
-                # - note: 黄色背景 ＋ ⚠️ アイコン
-                # - warning: 赤色背景 ＋ ❌ アイコン
-                # - tip: 緑色背景 ＋ ✔ アイコン
-                # - info: 青色背景 ＋ ⓘ アイコン
-                is_red = any(c in color for c in ("red", "pink")) or emoji in {"🚨", "🛑", "⛔", "❌", "🔥"}
-                is_yellow = any(c in color for c in ("yellow", "orange")) or emoji in {"⚠️", "❗", "❕", "⚡"}
-                is_green = "green" in color or emoji in {"💡", "✨", "⭐", "🌟", "🌱", "🔑", "✅"}
-
-                if is_red:
-                    macro_name = "warning"  # 赤背景・❌
-                elif is_yellow:
-                    macro_name = "note"     # 黄色背景・⚠️
-                elif is_green:
-                    macro_name = "tip"      # 緑色背景・✔
-                else:
-                    macro_name = "info"     # 青色背景・ⓘ
-
-                # Confluenceの各マクロは左端に固定アイコン（ⓘ, ⚠️, ✔, ❌）を自動描画するため、
-                # それらと意味が重複・競合する絵文字（ℹ️, ⚠️, 💡, 📝, etc）は本文先頭に入れず、
-                # マクロのシステムアイコンに任せることで「異なる意味のアイコンが2重に並ぶ」問題を完全に解消。
-                # ロケット（🚀）やターゲット（🎯）など、特殊なカスタムアイコンの場合のみ先頭に残す。
-                standard_callout_emojis = {
-                    "ℹ️", "⚠️", "💡", "📝", "❌", "❗", "❕", "🚨", "🛑", "⚡",
-                    "✨", "⭐", "🌟", "🌱", "🔑", "✅", "📌", "📋", "✏️", "🗒️", "📖", "🔖", "🔍", "💬", "📢"
-                }
-                if emoji and emoji not in standard_callout_emojis:
-                    text = f"{emoji} {text}" if text else emoji
+                # Confluenceのinfoマクロに固定表示される(i)アイコンを排除し、
+                # Notion本来のアイコン（絵文字・Notionアイコン）のみを単一表示するためpanelマクロを採用
+                prefix = f"{emoji} " if emoji else ""
+                full_text = f"{prefix}{text}" if text else (emoji or "")
 
                 children_html = ""
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"])
 
                 output.append(
-                    f'<ac:structured-macro ac:name="{macro_name}">'
-                    f'<ac:rich-text-body><p>{text}</p>{children_html}</ac:rich-text-body>'
+                    f'<ac:structured-macro ac:name="panel">'
+                    f'<ac:parameter ac:name="bgColor">{color_info["bg"]}</ac:parameter>'
+                    f'<ac:parameter ac:name="borderColor">{color_info["border"]}</ac:parameter>'
+                    f'<ac:rich-text-body><p>{full_text}</p>{children_html}</ac:rich-text-body>'
                     f'</ac:structured-macro>'
                 )
 
             elif b_type == "toggle":
                 toggle_data = b.get("toggle", {})
                 title_text = self.convert_rich_text(toggle_data.get("rich_text", [])) or "詳細"
+                param_title = clean_parameter_text(title_text) or "詳細"
                 children_html = ""
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=title_text)
                 output.append(
                     f'<ac:structured-macro ac:name="expand">'
-                    f'<ac:parameter ac:name="title">{title_text}</ac:parameter>'
+                    f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
                     f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
                     f'</ac:structured-macro>'
                 )
