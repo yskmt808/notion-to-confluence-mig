@@ -101,6 +101,89 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
         # row-2 のリンク列は有効なURLであること
         self.assertIn("https://example.atlassian.net/wiki/spaces/TEST/pages/99999", row2_data)
 
+    def test_database_csv_normalizes_newlines_in_cells(self):
+        """CSVカラム値に含まれる改行文字が半角スペースに正規化され、<data>セクションが厳格に1行1レコードを維持することを検証"""
+        conv = NotionToConfluenceConverter()
+        multiline_desc = "一行目\n二行目\r\n三行目"
+        db_node = PageNode(
+            id="db-2",
+            title="改行テストDB",
+            node_type="database",
+            properties={
+                "schema": {
+                    "タスク名": {"type": "title"},
+                    "詳細説明": {"type": "rich_text"},
+                }
+            },
+            children=[
+                PageNode(
+                    id="row-1",
+                    title="タスク1\nタイトル改行",
+                    node_type="database_row",
+                    properties={
+                        "タスク名": {"type": "title", "value": "タスク1\nタイトル改行"},
+                        "詳細説明": {"type": "rich_text", "value": multiline_desc},
+                    },
+                )
+            ],
+        )
+
+        csv_str = conv.generate_database_csv(db_node, {"row-1": "https://example.atlassian.net/wiki/spaces/TEST/pages/1001"})
+        lines = csv_str.splitlines()
+
+        data_start = lines.index("<data>")
+        data_end = lines.index("</data>")
+
+        # <data> の直後はヘッダー行、その次がレコード行、その次が </data> となり、ちょうど2行であること
+        data_content_lines = lines[data_start + 1 : data_end]
+        self.assertEqual(len(data_content_lines), 2, f"<data> should only have header and 1 row line, got: {data_content_lines}")
+
+        record_line = data_content_lines[1]
+        self.assertNotIn("\n", record_line)
+        self.assertNotIn("\r", record_line)
+        self.assertIn("一行目 二行目 三行目", record_line)
+
+    def test_html_extractor_handles_newlines_in_csv_values(self):
+        """HTMLエクスポート内のCSVでカラム値に改行がある場合、text型として識別されファイル名マッチも成功することを検証"""
+        import tempfile
+        import zipfile
+        from src.html_extractor import HtmlZipExtractor
+
+        # 改行を含むタスク名および複数行説明のCSV
+        csv_content = """名前,説明,ステータス
+"タスクA\n改行付き","これは\n複数行の\n詳細です",進行中
+"""
+        # Notionエクスポートではファイル名中の改行が半角スペースに置換される
+        child_html_content = "<html><head><title>タスクA 改行付き</title></head><body><div class='page-body'><p>本文</p></div></body></html>"
+        db_html_content = "<html><head><title>テストDB</title></head><body></body></html>"
+
+        tf = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        tf_path = tf.name
+        tf.close()
+
+        import os
+        try:
+            with zipfile.ZipFile(tf_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("テストDB 00000000000000000000000000000001.csv", csv_content.encode("utf-8-sig"))
+                zf.writestr("テストDB 00000000000000000000000000000001.html", db_html_content.encode("utf-8"))
+                zf.writestr("テストDB/タスクA 改行付き aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.html", child_html_content.encode("utf-8"))
+
+            extractor = HtmlZipExtractor(tf_path)
+            root = extractor.extract_tree()
+            self.assertEqual(len(root.children), 1)
+            db_row = root.children[0]
+
+            # 改行がスペースに正規化されてタイトルに設定されていること
+            self.assertEqual(db_row.title, "タスクA 改行付き")
+            # HTMLファイルがマッチしてIDが取得できていること
+            self.assertEqual(db_row.id, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+            # 説明プロパティが select ではなく text として分類されていること
+            self.assertEqual(db_row.properties["説明"]["type"], "text")
+            self.assertIn("\n", db_row.properties["説明"]["value"])
+        finally:
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
 
 if __name__ == "__main__":
     unittest.main()

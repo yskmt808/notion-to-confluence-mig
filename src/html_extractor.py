@@ -258,10 +258,12 @@ class HtmlZipExtractor:
 
         for row in rows:
             # タスク名またはタイトル列
-            row_title = row.get("タスク名") or row.get("名前") or row.get("Title") or row.get("Name")
-            if not row_title:
+            raw_title = row.get("タスク名") or row.get("名前") or row.get("Title") or row.get("Name")
+            if not raw_title:
                 # 最初の列をタイトルとする
-                row_title = next(iter(row.values()), "Untitled Record")
+                raw_title = next(iter(row.values()), "Untitled Record")
+            # タイトル内の改行文字をスペースに正規化（ファイル名やConfluenceタイトルとの不整合を防止）
+            row_title = re.sub(r"[\r\n]+", " ", raw_title).strip() if raw_title else "Untitled Record"
 
             # 行IDの特定（CSV値内のHTMLリンク、またはタイトル名マッチング）
             row_id = None
@@ -277,8 +279,9 @@ class HtmlZipExtractor:
 
             if not row_html_file:
                 # タイトルによるファイル名マッチング
+                # NotionのHTMLエクスポートでは改行が空白に置換されてファイル名が生成されるため、正規化したタイトルで探索
                 for r_id, r_path in row_html_map.items():
-                    if row_title in r_path:
+                    if row_title in r_path or (raw_title and raw_title.replace("\r", "").replace("\n", " ") in r_path):
                         row_id = r_id
                         row_html_file = r_path
                         break
@@ -301,37 +304,46 @@ class HtmlZipExtractor:
             for col_name, val in row.items():
                 if not val:
                     continue
+                clean_col = col_name.strip()
+                clean_val = val.strip()
                 # リレーションのパース（例: "タイトル (フォルダ/ファイル名 00000000...html)"）
-                rel_match = UUID_PATTERN.findall(val)
-                if rel_match and ".html" in val:
+                rel_match = UUID_PATTERN.findall(clean_val)
+                if rel_match and ".html" in clean_val:
                     target_id = normalize_id(rel_match[-1])
-                    row_properties[col_name] = {
+                    row_properties[clean_col] = {
                         "type": "relation",
                         "relation": [{"id": target_id}],
-                        "value": [{"id": target_id, "text": val.split("(")[0].strip()}],
+                        "value": [{"id": target_id, "text": clean_val.split("(")[0].strip()}],
                     }
-                elif col_name in ("カテゴリ", "Tags", "Labels") and "," in val:
+                elif clean_col in ("カテゴリ", "Tags", "Labels") and "," in clean_val:
                     # 複数選択
-                    items = [item.strip() for item in val.split(",") if item.strip()]
-                    row_properties[col_name] = {
+                    items = [item.strip() for item in clean_val.split(",") if item.strip()]
+                    row_properties[clean_col] = {
                         "type": "multi_select",
                         "multi_select": [{"name": item} for item in items],
                         "value": [{"name": item} for item in items],
                     }
-                elif val in ("Yes", "No", "true", "false", "True", "False"):
+                elif clean_val in ("Yes", "No", "true", "false", "True", "False"):
                     # チェックボックス
-                    is_checked = val in ("Yes", "true", "True")
-                    row_properties[col_name] = {
+                    is_checked = clean_val in ("Yes", "true", "True")
+                    row_properties[clean_col] = {
                         "type": "checkbox",
                         "checkbox": is_checked,
                         "value": is_checked,
                     }
                 else:
-                    row_properties[col_name] = {
-                        "type": "select",
-                        "select": {"name": val},
-                        "value": val,
-                    }
+                    # 値に改行が含まれている場合は、タグ選択肢(select)ではなくテキスト(text)として保持
+                    if "\n" in clean_val or "\r" in clean_val:
+                        row_properties[clean_col] = {
+                            "type": "text",
+                            "value": clean_val,
+                        }
+                    else:
+                        row_properties[clean_col] = {
+                            "type": "select",
+                            "select": {"name": clean_val},
+                            "value": clean_val,
+                        }
 
             row_node = PageNode(
                 id=row_id,

@@ -282,9 +282,14 @@ class NotionToConfluenceConverter:
                 val = prop.get("value")
                 return html.escape(str(val)) if val is not None else "-"
 
-        elif p_type in ("title", "rich_text", "number", "email", "phone_number", "formula"):
+        elif p_type in ("title", "rich_text", "text", "number", "email", "phone_number", "formula"):
             val = prop.get("value")
-            return html.escape(str(val)) if val is not None else "-"
+            if val is None:
+                return "-"
+            s_val = str(val)
+            if p_type in ("rich_text", "text") and ("\n" in s_val or "\r" in s_val):
+                return html.escape(s_val).replace("\r\n", "<br/>").replace("\n", "<br/>").replace("\r", "<br/>")
+            return html.escape(s_val)
 
         else:
             val = prop.get("value")
@@ -1165,13 +1170,19 @@ class NotionToConfluenceConverter:
         return f'<table class="wrapped"><tbody>{"".join(html_rows)}</tbody></table>'
 
     def _escape_csv_cell(self, val: Any) -> str:
-        """Confluence Database CSV用の安全なセルエスケープ。"""
+        """Confluence Database CSV用の安全なセルエスケープ。
+        Confluence Databases API (<data> CSV表現) はセル内改行をサポートせず行分割とみなすため、
+        改行文字は半角スペースに正規化して1行1レコードを厳格に保証する。
+        """
         if val is None:
             return '""'
         s = str(val).strip()
         if not s or s == "-":
             return '""'
-        if any(c in s for c in (',', '"', '\n', '\r')):
+        # 改行文字が含まれている場合、半角スペースに正規化して単一物理行を維持
+        if '\n' in s or '\r' in s:
+            s = re.sub(r'[\r\n]+', ' ', s).strip()
+        if any(c in s for c in (',', '"')):
             escaped = s.replace('"', '""')
             return f'"{escaped}"'
         return s
