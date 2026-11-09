@@ -472,10 +472,13 @@ def main():
     conf_token = os.getenv("CONFLUENCE_API_TOKEN")
     conf_space = os.getenv("CONFLUENCE_SPACE_KEY")
 
-    # 新規ツリー作成 (--new-tree) または ZIP 移行時の親ID設定
+    # Confluence移行先の親ページIDの決定
+    # 優先順位: 1. CLI引数 (--confluence-parent-id) -> 2. .env (CONFLUENCE_PARENT_PAGE_ID) ※--new-tree 指定時を除く
     conf_parent_id = args.confluence_parent_id
-    if not conf_parent_id and not args.new_tree and not use_zip:
-        conf_parent_id = os.getenv("CONFLUENCE_PARENT_PAGE_ID")
+    if not conf_parent_id and not args.new_tree:
+        env_parent = os.getenv("CONFLUENCE_PARENT_PAGE_ID")
+        if env_parent and env_parent.strip():
+            conf_parent_id = env_parent.strip()
 
     if not args.dry_run and (not conf_url or not conf_user or not conf_token or not conf_space):
         print("エラー: Confluence の設定 (.env) が不足しています。")
