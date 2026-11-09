@@ -23,16 +23,33 @@ from src.extractor import PageNode
 
 logger = logging.getLogger(__name__)
 
-UUID_PATTERN = re.compile(r"([0-9a-fA-F]{32})")
+UUID_PATTERN = re.compile(
+    r"(?<![0-9a-fA-F])([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})(?![0-9a-fA-F])"
+)
+
+
+def extract_uuids(text: str) -> List[str]:
+    """URLエンコードされた文字列等から安全に32桁UUIDを抽出する（%20等の16進数衝突を防止）。"""
+    if not text:
+        return []
+    unquoted = urllib.parse.unquote(str(text))
+    matches = UUID_PATTERN.findall(unquoted)
+    if not matches and unquoted != text:
+        matches = UUID_PATTERN.findall(str(text))
+    return matches
 
 
 def normalize_id(raw_id: str) -> str:
     """32桁の16進数文字列をハイフン付きUUID形式に正規化する。"""
-    cleaned = raw_id.strip().replace("-", "")
-    match = UUID_PATTERN.search(cleaned)
-    if match:
-        cleaned = match.group(1).lower()
-    if len(cleaned) == 32:
+    if not raw_id:
+        return ""
+    unquoted = urllib.parse.unquote(str(raw_id)).strip()
+    matches = UUID_PATTERN.findall(unquoted)
+    if matches:
+        cleaned = matches[-1].replace("-", "").lower()
+    else:
+        cleaned = unquoted.replace("-", "").lower()
+    if len(cleaned) == 32 and all(c in "0123456789abcdef" for c in cleaned):
         return f"{cleaned[:8]}-{cleaned[8:12]}-{cleaned[12:16]}-{cleaned[16:20]}-{cleaned[20:]}"
     return raw_id.strip()
 
@@ -64,21 +81,29 @@ class HtmlZipExtractor:
             logger.info(f"Identified root HTML file: {root_file}")
 
             # 3. データベースの特定: CSVファイルと同名(拡張子違い)のHTML、またはUUID一致するCSVをデータベースと判定
+            # Note: Notionエクスポートでは `{DB名} {UUID}.csv` と `{DB名} {UUID}_all.csv` の両方が出力される場合があるため、
+            # `_all.csv` よりも通常の `.csv` を優先してマッピングする。
             db_csv_map = dict(self.global_db_csv_map)  # グローバルDBマップを引き継ぐ
-            for c in csv_files:
+            sorted_csv_files = sorted(csv_files, key=lambda x: (1 if x.endswith("_all.csv") else 0, x))
+            for c in sorted_csv_files:
                 base_c = os.path.splitext(c)[0]
-                db_id_match = UUID_PATTERN.findall(c)
+                clean_base_c = re.sub(r"_all$", "", base_c)
+                db_id_match = extract_uuids(c)
                 if db_id_match:
                     db_id = normalize_id(db_id_match[-1])
-                    db_csv_map[db_id] = c
+                    if db_id not in db_csv_map or not c.endswith("_all.csv"):
+                        db_csv_map[db_id] = c
                 # UUIDがない場合でも、拡張子を除いたファイルパスでマッピング
-                db_csv_map[base_c] = c
+                if base_c not in db_csv_map or not c.endswith("_all.csv"):
+                    db_csv_map[base_c] = c
+                if clean_base_c not in db_csv_map or not c.endswith("_all.csv"):
+                    db_csv_map[clean_base_c] = c
 
             # 同名HTMLが存在する場合のマッピング補完
             for h in html_files:
                 base_h = os.path.splitext(h)[0]
                 if base_h in db_csv_map:
-                    h_uid = UUID_PATTERN.findall(h)
+                    h_uid = extract_uuids(h)
                     if h_uid:
                         db_csv_map[normalize_id(h_uid[-1])] = db_csv_map[base_h]
 
@@ -92,76 +117,90 @@ class HtmlZipExtractor:
         """BeautifulSoupオブジェクトからNotionのページアイコン（絵文字またはNotion標準SVG）を抽出する。"""
         from src.icon_mapper import resolve_notion_icon_to_emoji, is_unicode_emoji
 
-        # 1. meta[name=data-notion-page-icon]
+        # 1. meta[name=data-notion-page-icon] または link[rel=icon]
         icon_meta = soup.find("meta", attrs={"name": "data-notion-page-icon"})
         if icon_meta and icon_meta.get("content"):
             icon = resolve_notion_icon_to_emoji(icon_meta["content"])
             if icon:
                 return icon
 
-        # 2. article または div.page の data-notion-page-icon 属性
+        icon_link = soup.find("link", attrs={"rel": lambda r: r and "icon" in (r if isinstance(r, list) else [r])})
+        if icon_link and icon_link.get("href"):
+            icon = resolve_notion_icon_to_emoji(icon_link["href"])
+            if icon:
+                return icon
+
+        # 2. article または div.page の data-notion-page-icon / data-icon 属性
         page_art = (
             soup.find("article", class_=lambda c: c and "page" in c)
             or soup.find("article")
             or soup.find(class_="page")
         )
-        if page_art and page_art.get("data-notion-page-icon"):
-            icon = resolve_notion_icon_to_emoji(page_art["data-notion-page-icon"])
-            if icon:
-                return icon
+        if page_art:
+            for attr_name in ("data-notion-page-icon", "data-icon", "data-emoji"):
+                if page_art.get(attr_name):
+                    icon = resolve_notion_icon_to_emoji(page_art[attr_name])
+                    if icon:
+                        return icon
 
         # 3. page-header-icon コンテナ内の探索
         header_icon_div = soup.find(class_=lambda c: c and "page-header-icon" in c)
         if header_icon_div:
+            for attr_name in ("data-notion-page-icon", "data-icon", "data-emoji"):
+                if header_icon_div.get(attr_name):
+                    icon = resolve_notion_icon_to_emoji(header_icon_div[attr_name])
+                    if icon:
+                        return icon
             img = header_icon_div.find("img")
-            if img and img.get("src"):
-                icon = resolve_notion_icon_to_emoji(img["src"])
-                if icon:
-                    return icon
-            icon_span = header_icon_div.find("span", class_="icon")
-            if icon_span and icon_span.get("data-emoji"):
-                icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
-                if icon:
-                    return icon
+            if img:
+                for attr_name in ("src", "data-src", "alt"):
+                    if img.get(attr_name):
+                        icon = resolve_notion_icon_to_emoji(img[attr_name])
+                        if icon:
+                            return icon
+            icon_span = header_icon_div.find("span", class_="icon") or header_icon_div.find("span")
             if icon_span:
+                for attr_name in ("data-emoji", "data-icon", "aria-label"):
+                    if icon_span.get(attr_name):
+                        icon = resolve_notion_icon_to_emoji(icon_span[attr_name])
+                        if icon:
+                            return icon
                 txt = icon_span.get_text(strip=True)
-                if is_unicode_emoji(txt):
+                if txt:
                     icon = resolve_notion_icon_to_emoji(txt)
                     if icon:
                         return icon
             txt = header_icon_div.get_text(strip=True)
-            if is_unicode_emoji(txt):
+            if txt:
                 icon = resolve_notion_icon_to_emoji(txt)
                 if icon:
                     return icon
 
-        # 4. header コンテナ内の探索
+        # 4. header コンテナ内の探索 (プロパティテーブル内 .property-icon は除外)
         header = soup.find("header")
         if header:
-            icon_span = header.find("span", class_="icon")
-            if icon_span:
+            for img in header.find_all("img"):
+                if "page-cover-image" in (img.get("class") or []):
+                    continue
+                if img.find_parent("table", class_="properties"):
+                    continue
+                for attr_name in ("src", "alt"):
+                    if img.get(attr_name):
+                        icon = resolve_notion_icon_to_emoji(img[attr_name])
+                        if icon:
+                            return icon
+            for icon_span in header.find_all("span", class_="icon"):
+                if "property-icon" in (icon_span.get("class") or []) or icon_span.find_parent("table", class_="properties"):
+                    continue
                 if icon_span.get("data-emoji"):
                     icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
                     if icon:
                         return icon
                 txt = icon_span.get_text(strip=True)
-                if is_unicode_emoji(txt):
+                if txt:
                     icon = resolve_notion_icon_to_emoji(txt)
                     if icon:
                         return icon
-
-        # 5. 全体からのフォールバック探索
-        icon_span = soup.find("span", class_="icon")
-        if icon_span:
-            if icon_span.get("data-emoji"):
-                icon = resolve_notion_icon_to_emoji(icon_span["data-emoji"])
-                if icon:
-                    return icon
-            txt = icon_span.get_text(strip=True)
-            if is_unicode_emoji(txt):
-                icon = resolve_notion_icon_to_emoji(txt)
-                if icon:
-                    return icon
 
         return None
 
@@ -222,8 +261,32 @@ class HtmlZipExtractor:
                 td = tr.find("td")
                 if th and td:
                     p_name = th.get_text(strip=True)
-                    p_val = td.get_text(strip=True)
-                    page_properties[p_name] = {"type": "text", "value": p_val}
+                    # リレーションリンクの検出
+                    rel_links = td.find_all("a")
+                    relations = []
+                    for a in rel_links:
+                        target_id = None
+                        if a.get("data-notion-page-id"):
+                            target_id = normalize_id(a["data-notion-page-id"])
+                        else:
+                            href_uids = extract_uuids(a.get("href", ""))
+                            if href_uids:
+                                target_id = normalize_id(href_uids[-1])
+                        if target_id:
+                            relations.append({
+                                "id": target_id,
+                                "text": a.get_text(strip=True) or target_id[:8],
+                            })
+                    if relations:
+                        page_properties[p_name] = {
+                            "type": "relation",
+                            "relations": relations,
+                            "relation": relations,
+                            "value": relations,
+                        }
+                    else:
+                        p_val = td.get_text(strip=True)
+                        page_properties[p_name] = {"type": "text", "value": p_val}
 
         node = PageNode(
             id=node_id,
@@ -317,16 +380,68 @@ class HtmlZipExtractor:
         rows = list(reader)
 
         # 同名ディレクトリ内の各行HTMLファイルをインデックス化
-        base_dir = re.sub(r"\s+[0-9a-fA-F]{32}\.html$", "", db_html_path) + "/"
-        row_html_map = {}  # row_id -> html_path
+        clean_db_path = re.sub(r"_all\.html$", ".html", db_html_path)
+        base_dir = re.sub(r"\s+[0-9a-fA-F]{32}\.html$", "", clean_db_path)
+        if base_dir.endswith(".html"):
+            base_dir = os.path.splitext(base_dir)[0]
+        base_dir = base_dir.rstrip("/") + "/"
+
+        def _norm_title_key(t: str) -> str:
+            if not t:
+                return ""
+            # 句読点・記号・連続空白を除去して照合用の正規化キーを生成
+            t = urllib.parse.unquote(t).strip().lower()
+            return re.sub(r"[\s_:\-\.,\(\)\[\]#]+", "", t)
+
+        row_html_map: Dict[str, str] = {}  # row_id -> html_path
+        row_html_by_title: Dict[str, Tuple[str, str]] = {}  # norm_title -> (row_id, html_path)
+        row_html_by_stem: Dict[str, Tuple[str, str]] = {}  # norm_stem -> (row_id, html_path)
+
         for f in zf.namelist():
             if f.startswith(base_dir) and f.endswith(".html"):
-                m = UUID_PATTERN.findall(f)
-                if m:
-                    row_id = normalize_id(m[-1])
-                    row_html_map[row_id] = f
+                m = extract_uuids(f)
+                r_id = normalize_id(m[-1]) if m else normalize_id(f)
+                row_html_map[r_id] = f
+
+                # ファイル名ステム
+                stem = os.path.splitext(os.path.basename(f))[0]
+                stem_no_id = re.sub(r"\s+[0-9a-fA-F]{32}$", "", stem).strip()
+                row_html_by_stem[_norm_title_key(stem_no_id)] = (r_id, f)
+
+                # HTML内のタイトルを事前読み込み
+                try:
+                    f_soup = BeautifulSoup(zf.read(f).decode("utf-8"), "html.parser")
+                    f_title_el = f_soup.find("title") or f_soup.find(class_="page-title")
+                    if f_title_el:
+                        f_title = f_title_el.get_text(strip=True)
+                        row_html_by_title[_norm_title_key(f_title)] = (r_id, f)
+                except Exception:
+                    pass
+
+        # DB HTML（テーブル表示用HTML）が存在する場合、cell-title 内のリンクから行タイトルと行UUIDを抽出
+        html_title_to_uuid: Dict[str, str] = {}
+        target_db_html = db_html_path if db_html_path in zf.namelist() else (clean_db_path if clean_db_path in zf.namelist() else None)
+        if target_db_html:
+            try:
+                db_soup = BeautifulSoup(zf.read(target_db_html).decode("utf-8"), "html.parser")
+                for cell in db_soup.find_all(class_=lambda c: c and "cell-title" in c):
+                    a_el = cell.find("a")
+                    if a_el:
+                        a_txt = a_el.get_text(strip=True)
+                        a_target_id = None
+                        if a_el.get("data-notion-page-id"):
+                            a_target_id = normalize_id(a_el["data-notion-page-id"])
+                        else:
+                            a_uids = extract_uuids(a_el.get("href", ""))
+                            if a_uids:
+                                a_target_id = normalize_id(a_uids[-1])
+                        if a_target_id and a_txt:
+                            html_title_to_uuid[_norm_title_key(a_txt)] = a_target_id
+            except Exception as e:
+                logger.debug(f"Failed parsing db_html_path for row mapping: {e}")
 
         logger.info(f"Extracting {len(rows)} records from database CSV: [{db_node.title}]")
+        used_row_ids = set()
 
         for row in rows:
             clean_row = {k.lstrip("\ufeff"): v for k, v in row.items()}
@@ -338,39 +453,66 @@ class HtmlZipExtractor:
                 or clean_row.get("Name")
                 or clean_row.get("タイトル")
             )
+            title_col_val = raw_title
             if not raw_title:
                 # 最初の列をタイトルとする
                 raw_title = next(iter(clean_row.values()), "Untitled Record")
+                title_col_val = raw_title
+
             # NotionのCSVエクスポートにおけるリンクアーティファクト " (パス/ファイル名.html)" を除去
             raw_title = re.sub(r"\s*\([^)]*\.html\)$", "", raw_title).strip()
             # タイトル内の改行文字をスペースに正規化（ファイル名やConfluenceタイトルとの不整合を防止）
             row_title = re.sub(r"[\r\n]+", " ", raw_title).strip() if raw_title else "Untitled Record"
             row_title = urllib.parse.unquote(row_title)
+            norm_k = _norm_title_key(row_title)
 
-            # 行IDの特定（CSV値内のHTMLリンク、またはタイトル名マッチング）
+            # 行IDの特定（タイトル列のみを検査し、リレーション列のID誤爆を防止）
             row_id = None
             row_html_file = None
-            for col_val in clean_row.values():
-                unquoted_col_val = urllib.parse.unquote(col_val)
-                m = UUID_PATTERN.findall(unquoted_col_val) or UUID_PATTERN.findall(col_val)
-                if m:
-                    cand_id = normalize_id(m[-1])
-                    if cand_id in row_html_map:
+
+            # 1. タイトル列に埋め込まれたUUID
+            if title_col_val:
+                t_uids = extract_uuids(title_col_val)
+                if t_uids:
+                    cand_id = normalize_id(t_uids[-1])
+                    if cand_id in row_html_map and cand_id not in used_row_ids:
                         row_id = cand_id
                         row_html_file = row_html_map[cand_id]
-                        break
 
+            # 2. DB HTML の cell-title からのマッピング
+            if not row_html_file and norm_k in html_title_to_uuid:
+                cand_id = html_title_to_uuid[norm_k]
+                if cand_id in row_html_map and cand_id not in used_row_ids:
+                    row_id = cand_id
+                    row_html_file = row_html_map[cand_id]
+
+            # 3. HTML内の <title> 完全一致・正規化一致
+            if not row_html_file and norm_k in row_html_by_title:
+                cand_id, cand_path = row_html_by_title[norm_k]
+                if cand_id not in used_row_ids:
+                    row_id = cand_id
+                    row_html_file = cand_path
+
+            # 4. ファイル名ステム一致
+            if not row_html_file and norm_k in row_html_by_stem:
+                cand_id, cand_path = row_html_by_stem[norm_k]
+                if cand_id not in used_row_ids:
+                    row_id = cand_id
+                    row_html_file = cand_path
+
+            # 5. 部分一致
             if not row_html_file:
-                # タイトルによるファイル名マッチング
-                # NotionのHTMLエクスポートでは改行が空白に置換されてファイル名が生成されるため、正規化したタイトルで探索
                 for r_id, r_path in row_html_map.items():
-                    if row_title in r_path or (raw_title and raw_title.replace("\r", "").replace("\n", " ") in r_path):
+                    if r_id in used_row_ids:
+                        continue
+                    if norm_k and norm_k in _norm_title_key(r_path):
                         row_id = r_id
                         row_html_file = r_path
                         break
 
             if not row_id:
                 row_id = f"{db_node.id}_row_{len(db_node.children)}"
+            used_row_ids.add(row_id)
 
             # レコード本文ブロック、アイコン、カバーおよびコメントの抽出
             row_blocks = []
@@ -388,9 +530,6 @@ class HtmlZipExtractor:
                     row_blocks = self._parse_elements_to_blocks(row_body, zf, os.path.dirname(row_html_file))
                 row_comments = self._extract_page_comments(row_soup)
 
-            if not row_icon:
-                row_icon = "📄"
-
             # プロパティ辞書の整形
             row_properties = {}
             for col_name, val in clean_row.items():
@@ -398,15 +537,43 @@ class HtmlZipExtractor:
                     continue
                 clean_col = col_name.strip()
                 clean_val = val.strip()
-                # リレーションのパース（例: "タイトル (フォルダ/ファイル名 00000000...html)"）
+
+                # リレーションのパース（単一およびカンマ区切りの複数リレーション、URLリンク形式に対応）
+                # 例1: "タイトル (フォルダ/ファイル名 00000000...html)"
+                # 例2: "Task A (https://www.notion.so/..., Task B (...html))"
                 unquoted_clean_val = urllib.parse.unquote(clean_val)
-                rel_match = UUID_PATTERN.findall(unquoted_clean_val) or UUID_PATTERN.findall(clean_val)
-                if rel_match and ".html" in clean_val:
-                    target_id = normalize_id(rel_match[-1])
+                rel_uids = extract_uuids(unquoted_clean_val) or extract_uuids(clean_val)
+                is_rel = False
+                if rel_uids and (".html" in clean_val or "notion.so" in clean_val or "notion.com" in clean_val):
+                    is_rel = True
+
+                if is_rel:
+                    rel_items = []
+                    # カンマ区切りまたはパターンで分割
+                    # "(...)" 形式の各トークンからタイトルとUUIDを抽出
+                    token_matches = re.findall(r"([^,\(\)]*?)\s*\(([^)]+)\)", clean_val)
+                    if token_matches:
+                        for t_name, t_ref in token_matches:
+                            t_uids = extract_uuids(t_ref)
+                            if t_uids:
+                                tid = normalize_id(t_uids[-1])
+                                rel_items.append({
+                                    "id": tid,
+                                    "text": t_name.strip() or tid[:8],
+                                })
+                    if not rel_items:
+                        # トークン分割できなかった場合は抽出した全UUIDをリレーション化
+                        for u in rel_uids:
+                            tid = normalize_id(u)
+                            rel_items.append({
+                                "id": tid,
+                                "text": clean_val.split("(")[0].strip() or tid[:8],
+                            })
                     row_properties[clean_col] = {
                         "type": "relation",
-                        "relation": [{"id": target_id}],
-                        "value": [{"id": target_id, "text": clean_val.split("(")[0].strip()}],
+                        "relations": rel_items,
+                        "relation": rel_items,
+                        "value": rel_items,
                     }
                 elif clean_col in ("カテゴリ", "Tags", "Labels") and "," in clean_val:
                     # 複数選択
@@ -1064,7 +1231,8 @@ class HtmlZipExtractor:
         skip_classes: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """HTMLタグ配下のインラインテキスト（太字・斜体・コード・リンク等）をNotion rich_text形式にパースする。"""
-        skip_classes = skip_classes or []
+        skip_classes = list(skip_classes or [])
+        skip_classes.extend(["icon", "page-header-icon", "property-icon"])
         rich_texts = []
 
         def walk(el: Any, marks: Dict[str, Any]):
@@ -1073,7 +1241,7 @@ class HtmlZipExtractor:
                     text = str(child)
                     if not text:
                         continue
-                    rich_texts.append({
+                    item_dict = {
                         "type": "text",
                         "text": {"content": text, "link": {"url": marks.get("link")} if marks.get("link") else None},
                         "plain_text": text,
@@ -1085,7 +1253,10 @@ class HtmlZipExtractor:
                             "code": marks.get("code", False),
                             "color": marks.get("color", "default"),
                         },
-                    })
+                    }
+                    if marks.get("page_id"):
+                        item_dict["page_id"] = marks["page_id"]
+                    rich_texts.append(item_dict)
                 elif isinstance(child, Tag):
                     child_classes = child.get("class", [])
                     if any(sc in child_classes for sc in skip_classes):
@@ -1105,6 +1276,12 @@ class HtmlZipExtractor:
                         new_marks["code"] = True
                     elif c_tag == "a":
                         new_marks["link"] = child.get("href")
+                        if child.get("data-notion-page-id"):
+                            new_marks["page_id"] = normalize_id(child["data-notion-page-id"])
+                        elif child.get("href"):
+                            h_uids = extract_uuids(child["href"])
+                            if h_uids:
+                                new_marks["page_id"] = normalize_id(h_uids[-1])
                     elif c_tag == "mark":
                         hl = child.get("data-notion-highlight")
                         if hl:

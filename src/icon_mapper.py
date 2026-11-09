@@ -74,7 +74,7 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "fish": "🐟",
     "bug": "🐛",
     "butterfly": "🦋",
-    # オフィス・文房具・ファイル (Office & Stationery)
+    # オフィス・文房具・タスク (Office, Stationery & Tasks)
     "book": "📖",
     "bookmark": "🔖",
     "calendar": "📅",
@@ -91,10 +91,18 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "inbox": "📥",
     "folder": "📁",
     "folders": "📁",
-    "file": "📄",
-    "files": "📄",
-    "document": "📄",
+    "file": "📃",
+    "files": "🗂️",
+    "document": "📝",
+    "documents": "📑",
     "page": "📄",
+    "pages": "📑",
+    "draft": "📝",
+    "checklist": "☑️",
+    "task": "📋",
+    "tasks": "📋",
+    "todo": "☑️",
+    "list": "📑",
     "note": "📝",
     "notebook": "📓",
     "notepad": "🗒️",
@@ -122,6 +130,7 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "tag": "🏷️",
     "tags": "🏷️",
     "flag": "🚩",
+    "flags": "🚩",
     "check": "✅",
     "checks": "✅",
     "checkmark": "✅",
@@ -147,6 +156,8 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "users": "👥",
     "person": "👤",
     "people": "👥",
+    "team": "👥",
+    "group": "👥",
     "smile": "😊",
     "smiley": "😊",
     "heart": "❤️",
@@ -182,10 +193,23 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "database": "🗄️",
     "server": "🖥️",
     "wifi": "📶",
+    # プロジェクト・進捗 (Projects, Agile & Status)
+    "target": "🎯",
+    "compass": "🧭",
+    "roadmap": "🗺️",
+    "milestone": "🏁",
+    "sprint": "🏃",
+    "guide": "📖",
+    "manual": "📚",
+    "policy": "📜",
+    "release": "🚀",
+    "status": "🚥",
+    "progress": "📈",
+    "metric": "📊",
+    "analytics": "📉",
     # ビジネス・建物 (Business, Finance & Places)
     "chart": "📊",
     "graph": "📈",
-    "target": "🎯",
     "trophy": "🏆",
     "medal": "🏅",
     "crown": "👑",
@@ -208,7 +232,6 @@ NOTION_ICON_TO_EMOJI: Dict[str, str] = {
     "school": "🏫",
     "factory": "🏭",
     "map": "🗺️",
-    "compass": "🧭",
     # 飲食・ライフスタイル (Food & Lifestyle)
     "coffee": "☕",
     "tea": "🍵",
@@ -240,12 +263,13 @@ _COLOR_SUFFIX_RE = re.compile(r"_(gray|lightgray|brown|orange|yellow|green|blue|
 
 def extract_icon_name_from_path(path_or_url: str) -> str:
     """
-    '/icons/aquarius_gray.svg' や 'https://app.notion.com/icons/airplane_purple.svg'
+    '/icons/aquarius_gray.svg?v=1' や 'https://app.notion.com/icons/airplane_purple.svg'
     からアイコン名（'aquarius', 'airplane'）を抽出する。
     """
     if not path_or_url:
         return ""
     clean = urllib.parse.unquote(path_or_url).strip()
+    clean = clean.split("?")[0].split("#")[0]
     basename = os.path.basename(clean)
     name_no_ext = os.path.splitext(basename)[0]
     # カラーサフィックス (_gray 等) を除去
@@ -324,7 +348,7 @@ def resolve_notion_icon_to_emoji(icon_val: Any) -> Optional[str]:
                 return NOTION_ICON_TO_EMOJI[prefix]
             # 未定義のNotion公式SVGアイコンの場合は汎用アイコン
             if "/icons/" in icon_str:
-                return "📄"
+                return "🔹"
             return None
 
         # 直接アイコン名が渡された場合

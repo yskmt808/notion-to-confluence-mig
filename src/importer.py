@@ -614,7 +614,12 @@ class ConfluenceImporter:
             existing_map = self.checkpoint.get_migration_map()
             if existing_map:
                 self.migration_map = existing_map
-                logger.info(f"Initialized migration map with {len(existing_map)} nodes from checkpoint.")
+                for n_id, info in existing_map.items():
+                    c_title = info.get("title")
+                    if c_title:
+                        self._reserved_titles.add(c_title)
+                        self._node_to_title[n_id] = c_title
+                logger.info(f"Initialized migration map with {len(existing_map)} nodes from checkpoint ({len(self._reserved_titles)} titles reserved).")
 
     def import_tree(
         self,
@@ -773,16 +778,20 @@ class ConfluenceImporter:
                 self.dashboard.record_pass2_skip(node.title)
             return
 
-        if node.node_type == "page" and node.blocks:
+        if node.node_type in ("page", "database_row") and (node.blocks or node.properties):
             with self._lock:
                 page_info = self.migration_map.get(node.id)
             if page_info:
                 conf_id = page_info["confluence_id"]
                 try:
                     if self.dashboard:
-                        self.dashboard.set_worker_busy(node.title, node_type="page")
+                        self.dashboard.set_worker_busy(node.title, node_type=node.node_type)
                     incoming = getattr(self, "incoming_links_map", {}).get(node.id, [])
-                    new_body = self.converter.generate_page_content(node, incoming_links=incoming)
+                    db_url = getattr(node, "parent_db_url", None)
+                    entry_id = getattr(node, "entry_id", None)
+                    new_body = self.converter.generate_page_content(
+                        node, db_url=db_url, entry_id=entry_id, incoming_links=incoming
+                    )
                     if self.telemetry:
                         for m in re.findall(r'<ac:structured-macro ac:name="([^"]+)"', new_body):
                             self.telemetry.record_macro(m)
@@ -861,6 +870,8 @@ class ConfluenceImporter:
                 c_id = c_info["confluence_id"]
                 c_latest = self.client.get_page_by_id(c_id, expand="version")
                 c_ver = c_latest.get("version", {}).get("number", 1) if c_latest else 1
+                c_title = c_info.get("title") or child_node.title
+                child_node.entry_id = entry_id
                 child_body = self.converter.generate_page_content(
                     child_node,
                     db_url=db_web_url,
@@ -869,12 +880,14 @@ class ConfluenceImporter:
                 self.client.update_page(
                     page_id=c_id,
                     space_key=self.space_key,
-                    title=child_node.title,
+                    title=c_title,
                     body=child_body,
                     current_version=c_ver,
                     parent_id=confluence_page_id,
                 )
-                logger.info(f"Embedded native database row view into child page [{child_node.title}] (entry: {entry_id})")
+                if child_node.icon:
+                    self.client.set_page_emoji(c_id, child_node.icon)
+                logger.info(f"Embedded native database row view into child page [{c_title}] (entry: {entry_id})")
             except Exception as e:
                 logger.warning(f"Could not reparent and embed row view for child page {c_id}: {e}")
                 if self.telemetry:
@@ -896,6 +909,58 @@ class ConfluenceImporter:
         else:
             for c, eid in indexed_items:
                 _update_single_child(c, eid)
+
+    def _reparent_pending_children_concurrently(
+        self,
+        pending_children: List[PageNode],
+        db_web_url: str,
+        confluence_page_id: str,
+    ):
+        """まだConfluence DBのインデックス待ちである子ページの親IDをDB IDに変更し階層不一致を防ぐ。"""
+        def _reparent_single(child_node: PageNode):
+            if self.cancel_manager:
+                self.cancel_manager.check_cancelled()
+            try:
+                with self._lock:
+                    c_info = self.migration_map.get(child_node.id)
+                if not c_info:
+                    return
+                c_id = c_info["confluence_id"]
+                c_latest = self.client.get_page_by_id(c_id, expand="version")
+                c_ver = c_latest.get("version", {}).get("number", 1) if c_latest else 1
+                c_title = c_info.get("title") or child_node.title
+                child_body = self.converter.generate_page_content(
+                    child_node,
+                    db_url=db_web_url,
+                    entry_id=None,
+                )
+                self.client.update_page(
+                    page_id=c_id,
+                    space_key=self.space_key,
+                    title=c_title,
+                    body=child_body,
+                    current_version=c_ver,
+                    parent_id=confluence_page_id,
+                )
+                if child_node.icon:
+                    self.client.set_page_emoji(c_id, child_node.icon)
+                logger.info(f"Reparented pending child page [{c_title}] to parent DB [{confluence_page_id}]")
+            except Exception as e:
+                logger.warning(f"Could not reparent pending child page {child_node.title}: {e}")
+
+        workers = min(self.page_workers, len(pending_children))
+        if workers > 1:
+            logger.info(f"Reparenting {len(pending_children)} pending child pages to DB [{confluence_page_id}]...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_reparent_single, c) for c in pending_children]
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.warning(f"Worker error in reparenting pending child: {e}")
+        else:
+            for c in pending_children:
+                _reparent_single(c)
 
     def resolve_pending_database_row_views(self, root_node: PageNode):
         """Pass 2 または --resume 時に、インデックス待ちだったデータベースの子ページ行ビューを並行して非同期解決する。"""
@@ -1187,11 +1252,21 @@ class ConfluenceImporter:
             target_title = cleaned_title
             existing_page = self.client.get_page_by_title(space_key=self.space_key, title=target_title)
 
+            # 既存ページの ID が migration_map で既に別の notion_node_id にマッピングされている場合は上書き禁止
+            existing_page_claimed_by_other = False
+            if existing_page:
+                eid = str(existing_page.get("id"))
+                for mid, minfo in self.migration_map.items():
+                    if mid != notion_node_id and str(minfo.get("confluence_id")) == eid:
+                        existing_page_claimed_by_other = True
+                        break
+
             # 既存ページが存在し、かつ同一実行内でまだどのノードにも予約されていない場合に限り上書きを許可
             can_overwrite = (
                 existing_page is not None
                 and allow_existing_overwrite
                 and target_title not in self._reserved_titles
+                and not existing_page_claimed_by_other
             )
 
             if not can_overwrite and (existing_page is not None or target_title in self._reserved_titles):
@@ -1229,6 +1304,11 @@ class ConfluenceImporter:
         if self.checkpoint and self.checkpoint.is_pass1_done(node.id):
             cached = self.checkpoint.get_node_info(node.id)
             confluence_page_id = cached["confluence_id"]
+            saved_title = cached.get("title") or node.title
+            node.title = saved_title
+            with self._lock:
+                self._reserved_titles.add(saved_title)
+                self._node_to_title[node.id] = saved_title
             confluence_url = cached.get("url", f"{self.client.base_url}/spaces/{self.space_key}/pages/{confluence_page_id}")
             logger.info(f"[RESUME] Skipping creation for [{node.title}] (already migrated to ID {confluence_page_id})")
             if self.dashboard:
@@ -1236,7 +1316,7 @@ class ConfluenceImporter:
 
             self.migration_map[node.id] = {
                 "confluence_id": confluence_page_id,
-                "title": node.title,
+                "title": saved_title,
                 "url": confluence_url,
                 "node_type": node.node_type,
             }
@@ -1271,6 +1351,11 @@ class ConfluenceImporter:
                 space_key=self.space_key,
                 title=node.title,
             )
+            if existing_db and overwrite:
+                logger.info(f"Removing existing Confluence Database for fresh recreation: [{node.title}] (ID: {existing_db['id']})")
+                self.client.delete_database(existing_db["id"])
+                existing_db = None
+
             existing_db_url = (
                 f"{self.client.base_url}/spaces/{self.space_key}/database/{existing_db['id']}"
                 if existing_db else None
@@ -1514,6 +1599,7 @@ class ConfluenceImporter:
             db_web_url = f"{self.client.base_url}/spaces/{self.space_key}/database/{confluence_page_id}"
 
             indexed_children = []
+            pending_children = []
             pending_child_ids = []
             for child in node.children:
                 with self._lock:
@@ -1523,13 +1609,16 @@ class ConfluenceImporter:
                     if c_id in page_to_entry_map:
                         indexed_children.append((child, page_to_entry_map[c_id]))
                     else:
+                        pending_children.append(child)
                         pending_child_ids.append(child.id)
 
             if indexed_children:
                 self._embed_row_views_concurrently(indexed_children, db_web_url, confluence_page_id)
 
-            if pending_child_ids:
-                logger.info(f"[Approach B] Deferred {len(pending_child_ids)} row views for database [{node.title}] (indexing in progress; resolve via --resume)")
+            if pending_children:
+                # 親階層の不一致（Parent hierarchy mismatch）を防ぐため、インデックス待ちの子ページも即座に親をDBに移動
+                self._reparent_pending_children_concurrently(pending_children, db_web_url, confluence_page_id)
+                logger.info(f"[Approach B] Deferred {len(pending_child_ids)} row views for database [{node.title}] (reparented; index resolve via --resume)")
 
             with self._lock:
                 self.migration_map[node.id] = {

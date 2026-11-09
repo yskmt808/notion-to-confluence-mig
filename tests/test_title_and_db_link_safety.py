@@ -256,7 +256,7 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
             }
         }
 
-        # 1. rich_text 内の内部リンク
+        # 1. rich_text 内の内部リンク（Confluenceインラインリンクオブジェクト形式）
         rich_text = [{
             "type": "text",
             "text": {
@@ -266,18 +266,82 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
             "plain_text": "Block A へのリンク",
         }]
         html_out = conv.convert_rich_text(rich_text)
-        self.assertIn('data-card-appearance="inline"', html_out)
-        self.assertIn("https://example.atlassian.net/wiki/spaces/TEST/pages/88888", html_out)
+        self.assertIn('<ac:link ac:card-appearance="inline">', html_out)
+        self.assertIn('<ri:page ri:content-title="Block A: プロジェクト管理・基盤" />', html_out)
 
-        # 2. child_page ブロックのスマートリンク
+        # 2. child_page ブロックのインラインリンクオブジェクト
         blocks = [{
             "id": "4117be77-284d-8159-abc8-fa6cce1ccf00",
             "type": "child_page",
             "child_page": {"title": "Block A: プロジェクト管理・基盤"},
         }]
         storage_out = conv.blocks_to_storage_format(blocks)
-        self.assertIn('data-card-appearance="inline"', storage_out)
-        self.assertIn("https://example.atlassian.net/wiki/spaces/TEST/pages/88888", storage_out)
+        self.assertIn('<ac:link ac:card-appearance="inline">', storage_out)
+        self.assertIn('<ri:page ri:content-title="Block A: プロジェクト管理・基盤" />', storage_out)
+
+    def test_resume_does_not_overwrite_page_with_same_name_db_row(self):
+        """--resume時に既存の通常ページと同名のDBレコードページが作成された場合、既存ページを上書きせずサフィックスが付与されること"""
+        from unittest.mock import MagicMock
+        from src.importer import ConfluenceImporter
+
+        mock_checkpoint = MagicMock()
+        mock_checkpoint.get_migration_map.return_value = {
+            "page_node_1": {
+                "confluence_id": "11111",
+                "title": "タスク一覧",
+                "url": "https://example.atlassian.net/wiki/spaces/TEST/pages/11111",
+                "node_type": "page",
+            }
+        }
+
+        importer = ConfluenceImporter(
+            url="https://example.atlassian.net/wiki",
+            username="user",
+            token="token",
+            space_key="TEST",
+            checkpoint=mock_checkpoint,
+        )
+
+        # 既存ページの検索モック（タイトル "タスク一覧" でID "11111" を返す）
+        importer.client.get_page_by_title = MagicMock(side_effect=lambda space_key, title: (
+            {"id": "11111", "title": "タスク一覧"} if title == "タスク一覧" else None
+        ))
+
+        # 別のDB行レコードノード（同名 "タスク一覧"）のタイトル採番をテスト
+        assigned_title, existing_page = importer._resolve_unique_page_title(
+            base_title="タスク一覧",
+            notion_node_id="db_row_node_2",
+            allow_existing_overwrite=True,
+        )
+
+        # 既存通常ページ (ID: 11111) は別ノードによって予約されているため、上書きされずサフィックスが付与される
+        self.assertEqual(assigned_title, "タスク一覧 (2)")
+        self.assertIsNone(existing_page)
+
+    def test_relation_property_formatting_supports_multiple_targets(self):
+        """リレーション列の複数ターゲットおよびmigration_map/id_to_title_mapからのタイトル解決"""
+        conv = NotionToConfluenceConverter(timezone="Asia/Tokyo")
+        conv.id_to_title_map = {
+            "11111111-2222-3333-4444-555555555555": "親タスクA",
+            "66666666-7777-8888-9999-000000000000": "子タスクB",
+        }
+
+        prop = {
+            "type": "relation",
+            "relations": [
+                {"id": "11111111-2222-3333-4444-555555555555"},
+                {"id": "66666666-7777-8888-9999-000000000000"},
+            ],
+        }
+
+        # 1. ページ用XHTMLフォーマット（インラインリンクオブジェクト）
+        out_xhtml = conv.format_property_for_confluence(prop)
+        self.assertIn('<ri:page ri:content-title="親タスクA" />', out_xhtml)
+        self.assertIn('<ri:page ri:content-title="子タスクB" />', out_xhtml)
+
+        # 2. CSV用フォーマット（カンマ区切りタイトル）
+        out_csv = conv._format_prop_for_csv(prop, prop_name="関連タスク", fallback_title="")
+        self.assertEqual(out_csv, "親タスクA, 子タスクB")
 
 
 if __name__ == "__main__":

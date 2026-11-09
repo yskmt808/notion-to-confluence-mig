@@ -14,7 +14,20 @@ from src.extractor import PageNode
 
 logger = logging.getLogger(__name__)
 
-UUID_PATTERN = re.compile(r"([0-9a-fA-F]{32})")
+UUID_PATTERN = re.compile(
+    r"(?<![0-9a-fA-F])([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})(?![0-9a-fA-F])"
+)
+
+
+def extract_uuids(text: str) -> List[str]:
+    """URLエンコードされた文字列等から安全に32桁UUIDを抽出する。"""
+    if not text:
+        return []
+    unquoted = urllib.parse.unquote(str(text))
+    matches = UUID_PATTERN.findall(unquoted)
+    if not matches and unquoted != text:
+        matches = UUID_PATTERN.findall(str(text))
+    return matches
 
 
 NOTION_TO_CONFLUENCE_COLOR_MAP = {
@@ -245,15 +258,31 @@ class NotionToConfluenceConverter:
             return "👤 " + ", ".join(html.escape(n) for n in names)
 
         elif p_type == "relation":
-            relations = prop.get("relations", [])
+            relations = prop.get("relations") or prop.get("relation") or []
             if not relations:
                 return "-"
             links = []
             for r in relations:
                 target_id = r.get("id", "")
-                target_title = self.id_to_title_map.get(target_id)
-                if target_title:
-                    escaped_title = html.escape(target_title)
+                norm_id = target_id.replace("-", "").lower()
+                target_title = None
+                target_info = None
+                if self.id_to_title_map:
+                    target_title = self.id_to_title_map.get(target_id) or self.id_to_title_map.get(norm_id)
+                if self.migration_map:
+                    target_info = self.migration_map.get(target_id) or self.migration_map.get(norm_id)
+                    if not target_info:
+                        for mid, minfo in self.migration_map.items():
+                            if mid.replace("-", "").lower() == norm_id:
+                                target_info = minfo
+                                break
+
+                disp_title = (target_info.get("title") if target_info else None) or target_title or r.get("text")
+                if target_info and target_info.get("node_type") == "database":
+                    db_url = target_info.get("url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
+                    links.append(f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(db_url)}</a>')
+                elif disp_title:
+                    escaped_title = html.escape(disp_title)
                     links.append(
                         f'<ac:link ac:card-appearance="inline">'
                         f'<ri:page ri:content-title="{escaped_title}" />'
@@ -433,10 +462,17 @@ class NotionToConfluenceConverter:
             href = link_obj.get("url") if isinstance(link_obj, dict) else None
             if not href and item.get("href"):
                 href = item.get("href")
-            if href:
+            item_page_id = item.get("page_id")
+            if href or item_page_id:
                 # Notion内部リンク / クロスブロックリンク（UUID検出）
-                m = UUID_PATTERN.findall(href)
-                target_uuid = m[-1].lower() if m else None
+                target_uuid = None
+                if item_page_id:
+                    target_uuid = item_page_id.replace("-", "").lower()
+                elif href:
+                    m = extract_uuids(href)
+                    if m:
+                        target_uuid = m[-1].replace("-", "").lower()
+
                 target_title = None
                 target_info = None
 
@@ -452,22 +488,17 @@ class NotionToConfluenceConverter:
 
                 if target_info and target_info.get("node_type") == "database":
                     db_url = target_info.get("web_url") or target_info.get("url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
-                    escaped = f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(target_info.get("title", escaped))}</a>'
-                elif target_info and target_info.get("confluence_id"):
-                    cid = target_info["confluence_id"]
-                    disp_title = target_info.get("title") or target_title or escaped
+                    escaped = f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(db_url)}</a>'
+                elif target_info or target_title:
+                    disp_title = (target_info.get("title") if target_info else None) or target_title or escaped
                     escaped_title = html.escape(disp_title)
-                    target_url = target_info.get("url") or f"{self.confluence_base_url}/spaces/{self.space_key}/pages/{cid}"
-                    escaped = f'<a href="{html.escape(target_url)}" data-card-appearance="inline">{escaped_title}</a>'
-                elif target_title:
-                    escaped_title = html.escape(target_title)
                     escaped = (
                         f'<ac:link ac:card-appearance="inline">'
                         f'<ri:page ri:content-title="{escaped_title}" />'
                         f'<ac:link-body>{escaped}</ac:link-body>'
                         f'</ac:link>'
                     )
-                else:
+                elif href:
                     escaped = f'<a href="{html.escape(href)}">{escaped}</a>'
 
             result.append(escaped)
@@ -746,23 +777,14 @@ class NotionToConfluenceConverter:
                                     target_info = m
                                     break
 
-                if target_info and target_info.get("confluence_id"):
-                    cid = target_info["confluence_id"]
-                    disp_title = target_info.get("title") or child_title
-                    escaped_title = html.escape(disp_title)
-                    target_url = target_info.get("url") or f"{self.confluence_base_url}/spaces/{self.space_key}/pages/{cid}"
-                    # Confluenceネイティブのインラインスマートリンクオブジェクト（URL + data-card-appearance="inline"）
-                    output.append(
-                        f'<p><a href="{html.escape(target_url)}" data-card-appearance="inline">{escaped_title}</a></p>'
-                    )
-                else:
-                    escaped_title = html.escape(child_title)
-                    output.append(
-                        f'<p><ac:link ac:card-appearance="inline">'
-                        f'<ri:page ri:content-title="{escaped_title}" />'
-                        f'<ac:link-body>{escaped_title}</ac:link-body>'
-                        f'</ac:link></p>'
-                    )
+                disp_title = (target_info.get("title") if target_info else None) or child_title
+                escaped_title = html.escape(disp_title)
+                output.append(
+                    f'<p><ac:link ac:card-appearance="inline">'
+                    f'<ri:page ri:content-title="{escaped_title}" />'
+                    f'<ac:link-body>{escaped_title}</ac:link-body>'
+                    f'</ac:link></p>'
+                )
 
             elif b_type == "child_database":
                 if b.get("is_linked_database"):
@@ -897,7 +919,7 @@ class NotionToConfluenceConverter:
                         # Confluence Databases は page ではなく database オブジェクトのため、スマートリンク（URL）として出力
                         escaped_db_url = html.escape(db_url)
                         output.append(
-                            f'<p><a href="{escaped_db_url}" data-card-appearance="inline">{escaped_title}</a></p>'
+                            f'<p><a href="{escaped_db_url}" data-card-appearance="inline">{escaped_db_url}</a></p>'
                         )
                     else:
                         output.append(
@@ -1270,13 +1292,20 @@ class NotionToConfluenceConverter:
             names = [u.get("name") for u in users if u.get("name")]
             return ", ".join(names) if names else ""
         elif p_type == "relation":
-            relations = prop.get("relations", [])
+            relations = prop.get("relations") or prop.get("relation") or []
             titles = []
             for r in relations:
                 t_id = r.get("id")
-                t_title = self.id_to_title_map.get(t_id)
-                titles.append(t_title if t_title else t_id[:8])
-            return ", ".join(titles) if titles else ""
+                norm_id = t_id.replace("-", "").lower() if t_id else ""
+                t_title = None
+                if self.id_to_title_map:
+                    t_title = self.id_to_title_map.get(t_id) or self.id_to_title_map.get(norm_id)
+                if not t_title and self.migration_map:
+                    m = self.migration_map.get(t_id) or self.migration_map.get(norm_id)
+                    if m:
+                        t_title = m.get("title")
+                titles.append(t_title if t_title else (r.get("text") or (t_id[:8] if t_id else "")))
+            return ", ".join(t for t in titles if t)
         elif p_type == "rollup":
             r_type = prop.get("rollup_type")
             if r_type == "array":
@@ -1294,6 +1323,7 @@ class NotionToConfluenceConverter:
         データベースノードから、単一選択 (single-select) と複数選択 (multi-select) のフィールド名を分類して返す。
         - single_select: select, status, checkbox
         - multi_select: multi_select
+        全レコードの値を検証し、改行や長いテキストが含まれる列は除外（text扱い）する。
         """
         single_select = []
         multi_select = []
@@ -1306,13 +1336,31 @@ class NotionToConfluenceConverter:
                 elif p_type == "multi_select":
                     multi_select.append(p_name)
         elif db_node.children:
-            sample_props = db_node.children[0].properties
-            for p_name, p_val in sample_props.items():
-                p_type = p_val.get("type", "") if isinstance(p_val, dict) else ""
+            col_types: Dict[str, str] = {}
+            col_has_multiline: Set[str] = set()
+
+            for child in db_node.children:
+                for p_name, p_val in child.properties.items():
+                    if isinstance(p_val, dict):
+                        p_type = p_val.get("type", "text")
+                        raw_v = p_val.get("value")
+                    else:
+                        p_type = "text"
+                        raw_v = p_val
+
+                    if p_type == "text" or (raw_v and ("\n" in str(raw_v) or "\r" in str(raw_v) or len(str(raw_v)) > 50)):
+                        col_has_multiline.add(p_name)
+                    elif p_name not in col_types:
+                        col_types[p_name] = p_type
+
+            for p_name, p_type in col_types.items():
+                if p_name in col_has_multiline:
+                    continue
                 if p_type in ("status", "select", "checkbox"):
                     single_select.append(p_name)
                 elif p_type == "multi_select":
                     multi_select.append(p_name)
+
         return single_select, multi_select
 
     def generate_database_csv(self, db_node: PageNode, page_link_map: Dict[str, str]) -> str:
@@ -1341,10 +1389,32 @@ class NotionToConfluenceConverter:
                 fields.append((p_name, conf_type, cfg))
                 prop_names.append(p_name)
         elif db_node.children:
-            sample_props = db_node.children[0].properties
-            for p_name, p_val in sample_props.items():
-                p_type = p_val.get("type", "text") if isinstance(p_val, dict) else "text"
-                if p_type in ("select", "status", "multi_select", "checkbox"):
+            # 全子ノードのプロパティを走査して網羅的なスキーマを構築
+            all_col_names: List[str] = []
+            col_types: Dict[str, str] = {}
+            col_has_multiline: Set[str] = set()
+
+            for child in db_node.children:
+                for p_name, p_val in child.properties.items():
+                    if p_name not in all_col_names:
+                        all_col_names.append(p_name)
+                    if isinstance(p_val, dict):
+                        p_type = p_val.get("type", "text")
+                        raw_v = p_val.get("value")
+                    else:
+                        p_type = "text"
+                        raw_v = p_val
+
+                    if p_type == "text" or (raw_v and ("\n" in str(raw_v) or "\r" in str(raw_v) or len(str(raw_v)) > 50)):
+                        col_has_multiline.add(p_name)
+                    elif p_name not in col_types:
+                        col_types[p_name] = p_type
+
+            for p_name in all_col_names:
+                p_type = col_types.get(p_name, "text")
+                if p_name in col_has_multiline:
+                    conf_type = "text"
+                elif p_type in ("select", "status", "multi_select", "checkbox"):
                     conf_type = "tag"
                 elif p_type == "date":
                     conf_type = "date"
@@ -1356,6 +1426,7 @@ class NotionToConfluenceConverter:
                     conf_type = "user"
                 else:
                     conf_type = "text"
+
                 cfg = 'number_format:number' if conf_type == "number" else ''
                 fields.append((p_name, conf_type, cfg))
                 prop_names.append(p_name)
