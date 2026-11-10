@@ -321,7 +321,7 @@ def resolve_notion_icon_to_emoji(icon_val: Any) -> Optional[str]:
             # API 2022-06-28 / 2025-09-03: {"type": "icon", "icon": {"name": "aquarius", "color": "gray"}}
             sub_icon = icon_val.get("icon") or {}
             name = sub_icon.get("name", "")
-            return NOTION_ICON_TO_EMOJI.get(name.lower(), "📄")
+            return NOTION_ICON_TO_EMOJI.get(name.lower())
         elif itype in ("external", "file"):
             sub_obj = icon_val.get(itype) or {}
             url = sub_obj.get("url", "")
@@ -346,9 +346,6 @@ def resolve_notion_icon_to_emoji(icon_val: Any) -> Optional[str]:
             prefix = name.split("-")[0]
             if prefix in NOTION_ICON_TO_EMOJI:
                 return NOTION_ICON_TO_EMOJI[prefix]
-            # 未定義のNotion公式SVGアイコンの場合は汎用アイコン
-            if "/icons/" in icon_str:
-                return "🔹"
             return None
 
         # 直接アイコン名が渡された場合

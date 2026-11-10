@@ -54,6 +54,100 @@ def normalize_id(raw_id: str) -> str:
     return raw_id.strip()
 
 
+_MONTH_MAP = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+_TIME_SUFFIX_RE = r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*(?:AM|PM|am|pm))?(?:\s*\(?[A-Za-z0-9_+:\-\/]+\)?)?)?$"
+
+
+def _parse_date_string(val: str) -> Optional[str]:
+    """NotionのCSV/HTMLに出現する日付文字列を YYYY-MM-DD 形式に変換する。日付でない場合は None を返す。"""
+    if not val or not isinstance(val, str):
+        return None
+    s = val.strip().lstrip("@").strip()
+    if not s or "\n" in s or "\r" in s:
+        return None
+
+    # 範囲表記 (→, ->, 〜) がある場合は開始日部分を抽出
+    start_part = re.split(r"\s*(?:→|->|〜)\s*", s)[0].strip()
+    if not start_part:
+        return None
+
+    # 1. YYYY-MM-DD または YYYY/MM/DD (ISO日時 2026-11-10T14:30... も含む)
+    m_iso = re.match(
+        r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?(?:\s*(?:AM|PM|am|pm))?(?:\s*\(?[A-Za-z0-9_+:\-\/]+\)?)?)?$",
+        start_part,
+    )
+    if m_iso:
+        y, mo, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        try:
+            datetime(y, mo, d)
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+        except ValueError:
+            return None
+
+    # 2. YYYY年M月D日 (曜日や時刻が付随する場合も含む)
+    m_jp = re.match(
+        r"^(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日(?:\s*[\(（][^\)）]{1,5}[\)）])?" + _TIME_SUFFIX_RE,
+        start_part,
+    )
+    if m_jp:
+        y, mo, d = int(m_jp.group(1)), int(m_jp.group(2)), int(m_jp.group(3))
+        try:
+            datetime(y, mo, d)
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+        except ValueError:
+            return None
+
+    # 3. Month D, YYYY / Mon D, YYYY (例: November 10, 2026 / Nov 10, 2026 10:00 AM)
+    m_en1 = re.match(
+        r"^([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})" + _TIME_SUFFIX_RE,
+        start_part,
+    )
+    if m_en1:
+        mo_name = m_en1.group(1).lower()
+        if mo_name in _MONTH_MAP:
+            mo = _MONTH_MAP[mo_name]
+            d = int(m_en1.group(2))
+            y = int(m_en1.group(3))
+            try:
+                datetime(y, mo, d)
+                return f"{y:04d}-{mo:02d}-{d:02d}"
+            except ValueError:
+                return None
+
+    # 4. D Month YYYY / D Mon YYYY (例: 10 November 2026)
+    m_en2 = re.match(
+        r"^(\d{1,2})\s+([A-Za-z]+)\.?,?\s+(\d{4})" + _TIME_SUFFIX_RE,
+        start_part,
+    )
+    if m_en2:
+        mo_name = m_en2.group(2).lower()
+        if mo_name in _MONTH_MAP:
+            d = int(m_en2.group(1))
+            mo = _MONTH_MAP[mo_name]
+            y = int(m_en2.group(3))
+            try:
+                datetime(y, mo, d)
+                return f"{y:04d}-{mo:02d}-{d:02d}"
+            except ValueError:
+                return None
+
+    return None
+
+
 class HtmlZipExtractor:
     """NotionのHTMLエクスポートZIPファイルを解析してPageNodeツリーを構築するクラス。"""
 
@@ -253,40 +347,8 @@ class HtmlZipExtractor:
         comments = self._extract_page_comments(soup)
 
         # プロパティテーブルの抽出（存在する場合）
-        page_properties = {}
         prop_table = soup.find("table", class_="properties")
-        if prop_table:
-            for tr in prop_table.find_all("tr"):
-                th = tr.find("th")
-                td = tr.find("td")
-                if th and td:
-                    p_name = th.get_text(strip=True)
-                    # リレーションリンクの検出
-                    rel_links = td.find_all("a")
-                    relations = []
-                    for a in rel_links:
-                        target_id = None
-                        if a.get("data-notion-page-id"):
-                            target_id = normalize_id(a["data-notion-page-id"])
-                        else:
-                            href_uids = extract_uuids(a.get("href", ""))
-                            if href_uids:
-                                target_id = normalize_id(href_uids[-1])
-                        if target_id:
-                            relations.append({
-                                "id": target_id,
-                                "text": a.get_text(strip=True) or target_id[:8],
-                            })
-                    if relations:
-                        page_properties[p_name] = {
-                            "type": "relation",
-                            "relations": relations,
-                            "relation": relations,
-                            "value": relations,
-                        }
-                    else:
-                        p_val = td.get_text(strip=True)
-                        page_properties[p_name] = {"type": "text", "value": p_val}
+        page_properties = self._extract_properties_from_table(prop_table)
 
         node = PageNode(
             id=node_id,
@@ -617,6 +679,220 @@ class HtmlZipExtractor:
                 comments=row_comments,
             )
             db_node.children.append(row_node)
+
+    @staticmethod
+    def _parse_date_string(val: str) -> Optional[str]:
+        return _parse_date_string(val)
+
+    def _extract_properties_from_table(
+        self,
+        prop_table: Optional[Tag],
+        col_types_out: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """<table class="properties"> から各行の型と値を抽出する。"""
+        result: Dict[str, Dict[str, Any]] = {}
+        if not prop_table:
+            return result
+
+        for tr in prop_table.find_all("tr"):
+            th = tr.find("th")
+            td = tr.find("td")
+            if not th or not td:
+                continue
+            p_name = th.get_text(strip=True)
+            if not p_name:
+                continue
+
+            tr_classes = tr.get("class") or []
+            if isinstance(tr_classes, str):
+                tr_classes = [tr_classes]
+
+            detected_type = None
+            for cls in tr_classes:
+                if cls.startswith("property-row-") and cls != "property-row":
+                    raw_t = cls[len("property-row-"):]
+                    if raw_t in ("multi_select",):
+                        detected_type = "multi_select"
+                    elif raw_t in ("select",):
+                        detected_type = "select"
+                    elif raw_t in ("status",):
+                        detected_type = "status"
+                    elif raw_t in ("date", "created_time", "last_edited_time"):
+                        detected_type = "date"
+                    elif raw_t in ("checkbox",):
+                        detected_type = "checkbox"
+                    elif raw_t in ("url",):
+                        detected_type = "url"
+                    elif raw_t in ("number",):
+                        detected_type = "number"
+                    elif raw_t in ("relation",):
+                        detected_type = "relation"
+                    elif raw_t in ("text", "rich_text", "email", "phone_number"):
+                        detected_type = "text"
+
+            if col_types_out is not None and detected_type:
+                if detected_type == "multi_select" or p_name not in col_types_out:
+                    col_types_out[p_name] = detected_type
+
+            # 1. リレーションリンクの検出
+            rel_links = td.find_all("a")
+            relations = []
+            for a in rel_links:
+                target_id = None
+                if a.get("data-notion-page-id"):
+                    target_id = normalize_id(a["data-notion-page-id"])
+                else:
+                    href = a.get("href", "")
+                    if not href.startswith(("http://", "https://")) or "notion.so" in href or "notion.com" in href:
+                        href_uids = extract_uuids(href)
+                        if href_uids:
+                            target_id = normalize_id(href_uids[-1])
+                if target_id:
+                    relations.append({
+                        "id": target_id,
+                        "text": a.get_text(strip=True) or target_id[:8],
+                    })
+            if relations:
+                if col_types_out is not None:
+                    col_types_out.setdefault(p_name, "relation")
+                result[p_name] = {
+                    "type": "relation",
+                    "relations": relations,
+                    "relation": relations,
+                    "value": relations,
+                }
+                continue
+
+            # 2. 日付 (property-row-date または <time> タグ)
+            time_tags = td.find_all("time")
+            if detected_type == "date" or time_tags:
+                iso_start = None
+                iso_end = None
+                if time_tags:
+                    t0 = time_tags[0]
+                    raw_s = t0.get("datetime") or t0.get_text(strip=True)
+                    iso_start = _parse_date_string(raw_s) or _parse_date_string(t0.get_text(strip=True))
+                    if len(time_tags) >= 2:
+                        t1 = time_tags[1]
+                        raw_e = t1.get("datetime") or t1.get_text(strip=True)
+                        iso_end = _parse_date_string(raw_e) or _parse_date_string(t1.get_text(strip=True))
+                    elif any(sep in t0.get_text() for sep in ("→", "->", "〜")):
+                        parts = re.split(r"\s*(?:→|->|〜)\s*", t0.get_text(strip=True))
+                        if len(parts) >= 2:
+                            iso_end = _parse_date_string(parts[1])
+                else:
+                    td_txt = td.get_text(strip=True)
+                    iso_start = _parse_date_string(td_txt)
+                    if iso_start and any(sep in td_txt for sep in ("→", "->", "〜")):
+                        parts = re.split(r"\s*(?:→|->|〜)\s*", td_txt)
+                        if len(parts) >= 2:
+                            iso_end = _parse_date_string(parts[1])
+
+                if col_types_out is not None:
+                    col_types_out.setdefault(p_name, "date")
+                if iso_start:
+                    prop_obj: Dict[str, Any] = {
+                        "type": "date",
+                        "start": iso_start,
+                        "value": iso_start,
+                    }
+                    if iso_end:
+                        prop_obj["end"] = iso_end
+                    result[p_name] = prop_obj
+                continue
+
+            # 3. 複数選択 / 単一選択 / ステータス (<span class="selected-value">)
+            sel_spans = td.find_all("span", class_=lambda c: c and "selected-value" in c)
+            if detected_type == "multi_select" or len(sel_spans) > 1:
+                if col_types_out is not None:
+                    col_types_out[p_name] = "multi_select"
+                if sel_spans:
+                    items = [s.get_text(strip=True) for s in sel_spans if s.get_text(strip=True)]
+                else:
+                    raw_t = td.get_text(strip=True)
+                    items = [x.strip() for x in raw_t.split(",") if x.strip()] if raw_t else []
+                if items:
+                    item_objs = [{"name": it, "value": it} for it in items]
+                    result[p_name] = {
+                        "type": "multi_select",
+                        "items": item_objs,
+                        "multi_select": item_objs,
+                        "value": item_objs,
+                    }
+                continue
+
+            if detected_type in ("select", "status") or len(sel_spans) == 1:
+                actual_t = "status" if detected_type == "status" else "select"
+                if col_types_out is not None and col_types_out.get(p_name) != "multi_select":
+                    col_types_out.setdefault(p_name, actual_t)
+                val_str = sel_spans[0].get_text(strip=True) if sel_spans else td.get_text(strip=True)
+                if val_str:
+                    result[p_name] = {
+                        "type": actual_t,
+                        actual_t: {"name": val_str},
+                        "value": val_str,
+                    }
+                continue
+
+            # 4. チェックボックス
+            cb_el = td.find(class_=lambda c: c and "checkbox" in c)
+            if detected_type == "checkbox" or cb_el is not None:
+                if col_types_out is not None:
+                    col_types_out.setdefault(p_name, "checkbox")
+                if cb_el is not None:
+                    cb_cls = cb_el.get("class") or []
+                    if isinstance(cb_cls, str):
+                        cb_cls = [cb_cls]
+                    is_checked = any("checkbox-on" in c for c in cb_cls)
+                else:
+                    txt = td.get_text(strip=True)
+                    is_checked = txt in ("Yes", "true", "True", "☑", "✅")
+                result[p_name] = {
+                    "type": "checkbox",
+                    "checkbox": is_checked,
+                    "value": is_checked,
+                }
+                continue
+
+            # 5. URL
+            if detected_type == "url":
+                a_el = td.find("a")
+                u_val = a_el.get("href") if (a_el and a_el.get("href")) else td.get_text(strip=True)
+                if u_val:
+                    result[p_name] = {
+                        "type": "url",
+                        "url": u_val,
+                        "value": u_val,
+                    }
+                continue
+
+            # 6. 数値
+            if detected_type == "number":
+                n_val = td.get_text(strip=True)
+                if n_val:
+                    result[p_name] = {
+                        "type": "number",
+                        "number": n_val,
+                        "value": n_val,
+                    }
+                continue
+
+            # 7. その他テキスト (日付形式なら日付として判別)
+            p_val = td.get_text(strip=True)
+            if p_val:
+                iso_d = _parse_date_string(p_val)
+                if iso_d and detected_type != "text":
+                    if col_types_out is not None:
+                        col_types_out.setdefault(p_name, "date")
+                    result[p_name] = {
+                        "type": "date",
+                        "start": iso_d,
+                        "value": iso_d,
+                    }
+                else:
+                    result[p_name] = {"type": "text", "value": p_val}
+
+        return result
 
     @staticmethod
     def _parse_data_uri(src: str) -> Optional[Tuple[bytes, str, str]]:

@@ -200,27 +200,37 @@ class NotionToConfluenceConverter:
 
         if p_type in ("select", "status"):
             val = prop.get("value")
+            if not val and isinstance(prop.get(p_type), dict):
+                val = prop[p_type].get("name") or prop[p_type].get("value")
             if not val:
                 return "-"
             color = prop.get("color", "default")
             return _render_badge(str(val), color)
 
         elif p_type == "multi_select":
-            items = prop.get("items", [])
+            items = (
+                prop.get("items")
+                or prop.get("multi_select")
+                or (prop.get("value") if isinstance(prop.get("value"), list) else [])
+            )
             if not items:
                 return "-"
             badges = []
             for item in items:
-                val = item.get("value")
+                if isinstance(item, dict):
+                    val = item.get("value") or item.get("name")
+                    color = item.get("color", "default")
+                else:
+                    val = str(item) if item else None
+                    color = "default"
                 if not val:
                     continue
-                color = item.get("color", "default")
                 badges.append(_render_badge(str(val), color))
             return " ".join(badges) if badges else "-"
 
         elif p_type == "date":
-            start = prop.get("start")
-            end = prop.get("end")
+            start = prop.get("start") or (prop.get("date") or {}).get("start") or prop.get("value")
+            end = prop.get("end") or (prop.get("date") or {}).get("end")
             if not start:
                 return "-"
             clean_start = str(start).split("T")[0]
@@ -1258,16 +1268,29 @@ class NotionToConfluenceConverter:
             return str(val) if val else ""
         elif p_type in ("select", "status"):
             val = prop.get("value")
+            if not val and isinstance(prop.get(p_type), dict):
+                val = prop[p_type].get("name") or prop[p_type].get("value")
             return str(val) if val else ""
         elif p_type == "multi_select":
-            items = prop.get("items", [])
-            vals = [it.get("value") for it in items if it.get("value")]
+            items = (
+                prop.get("items")
+                or prop.get("multi_select")
+                or (prop.get("value") if isinstance(prop.get("value"), list) else [])
+            )
+            vals = []
+            for it in items:
+                if isinstance(it, dict):
+                    v = it.get("value") or it.get("name")
+                else:
+                    v = str(it) if it else None
+                if v:
+                    vals.append(str(v))
             return "|".join(vals) if vals else ""
         elif p_type == "date":
-            start = prop.get("start")
+            start = prop.get("start") or (prop.get("date") or {}).get("start") or prop.get("value")
             if not start:
                 return ""
-            return start.split("T")[0]
+            return str(start).split("T")[0]
         elif p_type == "checkbox":
             return "完了" if prop.get("value") else "未完了"
         elif p_type == "url":
@@ -1323,14 +1346,23 @@ class NotionToConfluenceConverter:
         データベースノードから、単一選択 (single-select) と複数選択 (multi-select) のフィールド名を分類して返す。
         - single_select: select, status, checkbox
         - multi_select: multi_select
-        全レコードの値を検証し、改行や長いテキストが含まれる列は除外（text扱い）する。
+        全レコードの値を検証し、改行が含まれる列やキーカラムは除外する。
         """
         single_select = []
         multi_select = []
         schema = db_node.properties.get("schema", {})
+        key_col_name = db_node.properties.get("title_column")
+        if not key_col_name and schema:
+            for p_name, p_info in schema.items():
+                if isinstance(p_info, dict) and p_info.get("type") == "title":
+                    key_col_name = p_name
+                    break
+
         if schema:
             for p_name, p_info in schema.items():
                 p_type = p_info.get("type", "")
+                if p_name == key_col_name or p_type == "title":
+                    continue
                 if p_type in ("status", "select", "checkbox"):
                     single_select.append(p_name)
                 elif p_type == "multi_select":
@@ -1348,13 +1380,16 @@ class NotionToConfluenceConverter:
                         p_type = "text"
                         raw_v = p_val
 
-                    if p_type == "text" or (raw_v and ("\n" in str(raw_v) or "\r" in str(raw_v) or len(str(raw_v)) > 50)):
+                    if p_name == key_col_name or p_type == "title":
+                        continue
+
+                    if p_type == "text" or (raw_v and ("\n" in str(raw_v) or "\r" in str(raw_v))):
                         col_has_multiline.add(p_name)
                     elif p_name not in col_types:
                         col_types[p_name] = p_type
 
             for p_name, p_type in col_types.items():
-                if p_name in col_has_multiline:
+                if p_name in col_has_multiline or p_name == key_col_name:
                     continue
                 if p_type in ("status", "select", "checkbox"):
                     single_select.append(p_name)
@@ -1365,13 +1400,32 @@ class NotionToConfluenceConverter:
 
     def generate_database_csv(self, db_node: PageNode, page_link_map: Dict[str, str]) -> str:
         """Confluence Databases (type: database) 用の構造化CSV (<fields>, <views>, <data>) を生成する。"""
-        fields: List[Tuple[str, str, str]] = [("リンク", "confluence-page-link", "")]
-
         schema = db_node.properties.get("schema", {})
+        key_col_name = db_node.properties.get("title_column")
+        if not key_col_name and schema:
+            for p_name, p_info in schema.items():
+                if isinstance(p_info, dict) and p_info.get("type") == "title":
+                    key_col_name = p_name
+                    break
+        if not key_col_name and db_node.children:
+            for child in db_node.children:
+                for p_name, p_val in child.properties.items():
+                    if isinstance(p_val, dict) and p_val.get("type") == "title":
+                        key_col_name = p_name
+                        break
+                if key_col_name:
+                    break
+        if not key_col_name:
+            key_col_name = "リンク"
+
+        fields: List[Tuple[str, str, str]] = [(key_col_name, "confluence-page-link", "")]
+
         prop_names = []
         if schema:
             for p_name, p_info in schema.items():
                 p_type = p_info.get("type", "rich_text")
+                if p_name == key_col_name or p_type == "title":
+                    continue
                 if p_type in ("select", "status", "multi_select", "checkbox"):
                     conf_type = "tag"
                 elif p_type == "date":
@@ -1396,8 +1450,6 @@ class NotionToConfluenceConverter:
 
             for child in db_node.children:
                 for p_name, p_val in child.properties.items():
-                    if p_name not in all_col_names:
-                        all_col_names.append(p_name)
                     if isinstance(p_val, dict):
                         p_type = p_val.get("type", "text")
                         raw_v = p_val.get("value")
@@ -1405,7 +1457,13 @@ class NotionToConfluenceConverter:
                         p_type = "text"
                         raw_v = p_val
 
-                    if p_type == "text" or (raw_v and ("\n" in str(raw_v) or "\r" in str(raw_v) or len(str(raw_v)) > 50)):
+                    if p_name == key_col_name or p_type == "title":
+                        continue
+
+                    if p_name not in all_col_names:
+                        all_col_names.append(p_name)
+
+                    if p_type == "text" or (raw_v and ("\n" in str(raw_v) or "\r" in str(raw_v))):
                         col_has_multiline.add(p_name)
                     elif p_name not in col_types:
                         col_types[p_name] = p_type
@@ -1590,7 +1648,10 @@ class NotionToConfluenceConverter:
 
         # 全レコードのプロパティキーを収集
         first_row_props = db_node.children[0].properties
-        keys = ["タスク名"] if "タスク名" in first_row_props else []
+        title_col = (db_node.properties or {}).get("title_column")
+        if not title_col:
+            title_col = "タスク名" if "タスク名" in first_row_props else (next(iter(first_row_props.keys()), "名前") if first_row_props else "名前")
+        keys = [title_col]
         for k in first_row_props.keys():
             if k not in keys:
                 keys.append(k)

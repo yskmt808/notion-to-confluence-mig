@@ -95,12 +95,12 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
         lines = csv_str.splitlines()
         data_start = lines.index("<data>")
 
-        # ヘッダー: リンク,名前
+        # ヘッダー: 名前 (confluence-page-link)
         row1_data = lines[data_start + 2]
         row2_data = lines[data_start + 3]
 
         # row-1 のリンク列は空文字列であること（タイトルが混入していないこと）
-        self.assertTrue(row1_data.startswith('"",'), f"Expected empty page-link but got: {row1_data}")
+        self.assertTrue(row1_data == '""' or row1_data.startswith('"",'), f"Expected empty page-link but got: {row1_data}")
         # row-2 のリンク列は有効なURLであること
         self.assertIn("https://example.atlassian.net/wiki/spaces/TEST/pages/99999", row2_data)
 

@@ -401,18 +401,40 @@ class ConfluenceClient:
         expected_count: int = 1,
         timeout_sec: int = 45,
     ) -> List[Dict[str, Any]]:
-        """Confluence Databases のエントリ一覧を取得する（インデックス完了までポーリング待機）。"""
-        url = f"{self.base_url}/api/v2/databases/{database_id}/entries"
+        """Confluence Databases のエントリ一覧を取得する（インデックス完了までポーリング待機・ページネーション対応）。"""
+        base_entries_url = f"{self.base_url}/api/v2/databases/{database_id}/entries"
         start_time = time.time()
-        last_results = []
+        last_results: List[Dict[str, Any]] = []
         while time.time() - start_time < timeout_sec:
             try:
-                res = requests.get(url, auth=self.auth, timeout=15)
-                if res.ok:
-                    results = res.json().get("results", [])
-                    last_results = results
-                    if len(results) >= expected_count:
-                        return results
+                all_results: List[Dict[str, Any]] = []
+                next_url: Optional[str] = base_entries_url
+                is_first = True
+                while next_url:
+                    if is_first:
+                        res = requests.get(next_url, params={"limit": 100}, auth=self.auth, timeout=15)
+                        is_first = False
+                    else:
+                        res = requests.get(next_url, auth=self.auth, timeout=15)
+                    if not res.ok:
+                        break
+                    data = res.json()
+                    page_results = data.get("results", [])
+                    all_results.extend(page_results)
+                    next_link = (data.get("_links") or {}).get("next")
+                    if next_link and page_results:
+                        if next_link.startswith(("http://", "https://")):
+                            next_url = next_link
+                        elif next_link.startswith("/api/") and self.base_url.rstrip("/").endswith("/wiki"):
+                            next_url = f"{self.base_url.rstrip('/')}{next_link}"
+                        else:
+                            next_url = urllib.parse.urljoin(self.base_url, next_link)
+                    else:
+                        next_url = None
+                if all_results:
+                    last_results = all_results
+                if len(all_results) >= expected_count:
+                    return all_results
             except Exception:
                 pass
             time.sleep(2)
@@ -1276,15 +1298,24 @@ class ConfluenceImporter:
                     candidate = f"{cleaned_title} ({suffix})"
                     if len(candidate) > 255:
                         candidate = candidate[:255]
-                    if (
-                        candidate not in self._reserved_titles
-                        and not self.client.get_page_by_title(space_key=self.space_key, title=candidate)
-                    ):
-                        target_title = candidate
-                        break
+                    if candidate not in self._reserved_titles:
+                        cand_existing = self.client.get_page_by_title(space_key=self.space_key, title=candidate)
+                        if cand_existing is None:
+                            target_title = candidate
+                            existing_page = None
+                            break
+                        elif allow_existing_overwrite:
+                            cand_eid = str(cand_existing.get("id"))
+                            cand_claimed_by_other = any(
+                                mid != notion_node_id and str(minfo.get("confluence_id")) == cand_eid
+                                for mid, minfo in self.migration_map.items()
+                            )
+                            if not cand_claimed_by_other:
+                                target_title = candidate
+                                existing_page = cand_existing
+                                break
                     suffix += 1
                 logger.info(f"Resolved duplicate page title conflict in Confluence: [{base_title}] -> [{target_title}] (Node ID: {notion_node_id})")
-                existing_page = None  # 新規作成扱い
 
             self._reserved_titles.add(target_title)
             self._node_to_title[notion_node_id] = target_title

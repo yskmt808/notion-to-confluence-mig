@@ -32,7 +32,7 @@ class TestIconMapperAndSubpageLink(unittest.TestCase):
             "🍀",
         )
         # 4. 未知のアイコンや不正な文字列（一律の :page_facing_up: 化を防止）
-        self.assertEqual(resolve_notion_icon_to_emoji("/icons/unknown_icon_gray.svg"), "🔹")
+        self.assertIsNone(resolve_notion_icon_to_emoji("/icons/unknown_icon_gray.svg"))
         self.assertIsNone(resolve_notion_icon_to_emoji("not an emoji or icon"))
         self.assertIsNone(resolve_notion_icon_to_emoji(None))
 
