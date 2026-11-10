@@ -374,5 +374,44 @@ python migrate.py --zip export.zip --show-all-pages
 
 ## 7. 将来拡張仕様・ロードマップ (Planned Specifications)
 
-1. **10,000行超の大規模DB実用性検証とフォールバック**:
-   - Confluence Databasesのブラウザ描画性能・検索インデックス負荷の限界値を実測し、閾値を超える場合の自動分割DBプロビジョニング仕様の策定。
+### 7.1 10,000行超の大規模DB実用性検証とフォールバック（未実装）
+- Confluence Databasesのブラウザ描画性能・検索インデックス負荷の限界値を実測し、閾値を超える場合の自動分割DBプロビジョニング仕様の策定。
+
+### 7.2 複数回実行（分割移行）を跨ぐリンク・DBビュー連結および未解決参照の事後自動更新仕様（未実装）
+
+複数のHTMLエクスポートZIPや異なるページツリーを別々のスクリプト実行で段階的に移行する場合に、実行を跨いでページ間リンク・DBリレーション・DBビュー（リンクドデータベース）を相互連結するための仕様です。
+
+#### 1. 移行レジストリファイル（移行済み情報の受け渡し）
+* **CLIオプション**:
+  - `--registry <path>`: 指定ファイルが存在する場合は既存の移行済みノード情報・未解決参照リストを読み込み、実行完了時に今回の移行結果をマージ（追記・更新）して同一ファイルへ保存する。
+  - `--link-registry <path ...>`: 複数の過去実行結果ファイル（`migration_result.json` 等）を参照用として読み込む。
+* **ノードごとに記録するスキーマ**:
+  - `notion_id`: 正規化32桁hexのNotion UUID（ページ間リンク・メンション・リレーション・`link_to_page` のID照合キー）
+  - `raw_title`: `--title-prefix` 付与前の元のNotionタイトル（`<h3 class="collection-title">` 等のDBビュー名照合キー）
+  - `title`: Confluence上の実ページ／DBタイトル（`<ri:page ri:content-title="..." />` 用）
+  - `confluence_id`: ConfluenceのページIDまたはDatabase ID
+  - `space_key`: 移行先Confluenceスペースキー
+  - `url`: ConfluenceページまたはDatabaseのスマートリンクURL
+  - `node_type`: `"page"` / `"database"` / `"database_row"`
+  - `views` / `views_info`: Confluence Database上に作成済みのビュー名と `saved-view-id` の対応情報
+* **スコープの分離**:
+  - 外部レジストリから読み込んだノード（`external_migration_map`）は「リンク・DBビューの名前解決専用」として扱い、今回実行時のページ更新対象や同一実行内の重複タイトル予約（`_reserved_titles`）とは分離する。
+
+#### 2. 順方向解決（過去の実行で移行済みのページ・DBを参照する場合）
+* ページ内リンク、メンション、DBリレーション、DBビュー（`is_linked_database: True`）の変換時に、今回の `migration_map` と外部レジストリ（`external_migration_map`）の双方を検索する。
+* 過去に移行済みのDBに対するビューであり、今回のページ側で指定されたビュー構成（ボード／ギャラリー／Group byフィルタ等）が対象Confluence Database上に未作成の場合は、外部レジストリの `confluence_id` に対して `create_database_view` / `setup_grouped_database_views` を呼び出してビューを動的追加し、`?saved-view-id=...` 付きスマートリンクとして連結する。
+
+#### 3. 未移行（エクスポート外）のDBビューおよび未解決リンクの動作仕様
+* **デフォルト動作（テーブルフォールバック OFF）**:
+  - リンク先DBが今回の移行対象にも外部レジストリにも存在しない場合、**デフォルトでは `<table class="collection-content">` の通常テーブル展開（フォールバック）は行わず、ページ上には未解決マーク（プレースホルダー表示および事後自動置換用の識別属性・マーカー）のみを出力**する。
+  - 同時に、未解決だったDBビュー（参照元ページID、参照先DBタイトル `raw_title`、要求されたビュー種別・グループ化条件）および未解決ページリンク（参照元ページID、参照先Notion UUID）を、**移行結果（`migration_result.json` およびレジストリファイルの `unresolved_references` セクション）に構造化して記録**する。
+* **オプション指定時のフォールバック動作（`--fallback-db-view-table`）**:
+  - 明示的にフォールバックオプションを有効化した場合のみ、未解決のDBビューについてHTMLエクスポート内の `<table class="collection-content">` をConfluenceの標準テーブルとして出力する。
+
+#### 4. 逆方向の自動更新（方式A：後から参照先DB・ページが移行された場合の事後リンク解決）
+* **動作フロー**:
+  1. 先行する実行（実行1）でページ群を移行した際、その時点では未移行だったDBビューやページリンクがページ内に未解決マークとして出力され、レジストリの `unresolved_references` に記録される。
+  2. 後続の実行（実行2）で `--registry` を指定して元DBやリンク先ページを移行した際、今回新たに作成されたノードの `notion_id` および `raw_title`（DB名）をレジストリ内の `unresolved_references` と自動照合する。
+  3. **移行元ZIPを再指定することなく**、解決可能となった過去ページ（`confluence_id`）のStorage Format（XHTML）をConfluence API経由で取得し、ページ内の未解決マーク部分を確定したConfluence Databaseスマートリンク（必要なビュー作成を含む）または `<ac:link>` に直接置換してページを更新する。
+  4. 解決が完了したエントリはレジストリの `unresolved_references` から除去し、`resolved_references` として履歴を更新する。
+
