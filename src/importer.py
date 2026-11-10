@@ -593,6 +593,56 @@ class ConfluenceClient:
             logger.debug(f"search_users error with cql '{cql}': {e}")
         return []
 
+    def get_current_user(self) -> Optional[Dict[str, Any]]:
+        """現在のAPI認証ユーザー情報を取得する。"""
+        url = f"{self.base_url}/rest/api/user/current"
+        try:
+            res = requests.get(url, auth=self.auth, timeout=15)
+            if res.ok:
+                return res.json()
+        except Exception as e:
+            logger.warning(f"Failed to get current user: {e}")
+        return None
+
+    def set_page_private(self, page_id: str, account_id: Optional[str] = None) -> bool:
+        """ページを移行実行者のみが閲覧・編集可能なプライベート権限（read, update制限）に設定する。"""
+        if not account_id:
+            user_info = self.get_current_user()
+            if user_info:
+                account_id = user_info.get("accountId")
+        if not account_id:
+            logger.warning(f"Could not determine current user accountId. Skipping private restriction for page {page_id}.")
+            return False
+
+        url = f"{self.base_url}/rest/api/content/{page_id}/restriction"
+        payload = [
+            {
+                "operation": "read",
+                "restrictions": {
+                    "user": [{"type": "known", "accountId": account_id}],
+                    "group": [],
+                },
+            },
+            {
+                "operation": "update",
+                "restrictions": {
+                    "user": [{"type": "known", "accountId": account_id}],
+                    "group": [],
+                },
+            },
+        ]
+        try:
+            res = requests.put(url, json=payload, auth=self.auth, headers=self.headers, timeout=15)
+            if res.ok:
+                logger.info(f"Successfully set private restriction (read/update) for page {page_id} to user {account_id}")
+                return True
+            else:
+                logger.warning(f"Failed to set private restriction for page {page_id}: {res.status_code} - {res.text}")
+                return False
+        except Exception as e:
+            logger.warning(f"Error setting private restriction for page {page_id}: {e}")
+            return False
+
 
 class ConfluenceImporter:
     def __init__(
@@ -609,6 +659,7 @@ class ConfluenceImporter:
         dashboard: Optional[Any] = None,
         user_mapper: Optional[Any] = None,
         metadata_template: Optional[str] = None,
+        private_mode: bool = False,
     ):
         self.space_key = space_key
         self.checkpoint = checkpoint
@@ -618,12 +669,19 @@ class ConfluenceImporter:
         self.dashboard = dashboard
         self.user_mapper = user_mapper
         self.metadata_template = metadata_template
+        self.private_mode = private_mode
+        self._current_user_account_id: Optional[str] = None
         from src.timezone_util import resolve_timezone, format_iso_datetime
         self.timezone = resolve_timezone(timezone)
         self._lock = threading.RLock()
         self._reserved_titles: Set[str] = set()
         self._node_to_title: Dict[str, str] = {}
         self.client = ConfluenceClient(url, username, token)
+        if self.private_mode:
+            current_user = self.client.get_current_user()
+            if current_user:
+                self._current_user_account_id = current_user.get("accountId")
+                logger.info(f"Private mode active: Root page will be restricted to accountId: {self._current_user_account_id}")
         conv_kwargs = {"timezone": self.timezone, "user_mapper": self.user_mapper}
         if self.metadata_template is not None:
             conv_kwargs["metadata_template"] = self.metadata_template
@@ -650,6 +708,7 @@ class ConfluenceImporter:
         overwrite: bool = True,
     ) -> Dict[str, Dict[str, str]]:
         """PageNodeのツリーをConfluenceへ階層構造を維持して再帰的にインポートする。"""
+        root_node._is_root = True
         # 全ノードのNotion ID -> Title マップを構築（リレーションのスマートリンク解決用）
         id_title_map = {}
         def collect_titles(n: PageNode):
@@ -1674,6 +1733,8 @@ class ConfluenceImporter:
                     )
             if self.dashboard:
                 self.dashboard.record_pass1_done(node.title, node_type="database")
+            if self.private_mode and getattr(node, "_is_root", False):
+                self.client.set_page_private(confluence_page_id, account_id=self._current_user_account_id)
             return confluence_page_id
 
         target_title, existing_page = self._resolve_unique_page_title(
@@ -1751,6 +1812,10 @@ class ConfluenceImporter:
         # ページ絵文字アイコンの設定
         if node.icon:
             self.client.set_page_emoji(confluence_page_id, node.icon)
+
+        # プライベート移行モード（ルートページへの閲覧・編集制限適用）
+        if self.private_mode and getattr(node, "_is_root", False):
+            self.client.set_page_private(confluence_page_id, account_id=self._current_user_account_id)
 
         # データベース行の場合、Page Properties Reportマクロ連動用のラベルを付与
         if node.node_type == "database_row":

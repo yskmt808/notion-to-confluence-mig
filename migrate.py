@@ -385,6 +385,18 @@ def main():
         help="ページ数が多数の場合でもサマライズせず、全ページリスト・全階層ツリーを標準出力に展開表示する",
     )
     parser.add_argument(
+        "--private",
+        action="store_true",
+        help="移行先ページの権限を実行者本人のみのプライベート設定（閲覧・編集制限）にする",
+    )
+    parser.add_argument(
+        "--visibility",
+        type=str,
+        choices=["space", "private"],
+        default="space",
+        help="移行先ページの公開範囲 ('space' または 'private', デフォルト: 'space')",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="詳細ログを出力する",
@@ -659,6 +671,7 @@ def main():
         dashboard=dashboard,
         user_mapper=user_mapper,
         metadata_template=meta_tpl,
+        private_mode=(args.private or args.visibility == "private"),
     )
 
     setup_logger(args.verbose, dashboard_mode=dashboard.enabled)
