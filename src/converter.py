@@ -62,6 +62,7 @@ NOTION_TEXT_COLOR_MAP = {
     "orange": "#c25c04",
     "yellow": "#b58700",
     "green": "#2b8457",
+    "teal": "#2b8457",
     "blue": "#1f75cb",
     "purple": "#7647c2",
     "pink": "#b83085",
@@ -74,6 +75,7 @@ NOTION_BG_COLOR_MAP = {
     "orange_background": "#faece3",
     "yellow_background": "#fbf3db",
     "green_background": "#edf3ec",
+    "teal_background": "#edf3ec",
     "blue_background": "#e7f3f8",
     "purple_background": "#f4f0f7",
     "pink_background": "#fbf0f4",
@@ -107,6 +109,7 @@ CALLOUT_PANEL_COLORS = {
     "orange": {"bg": "#faebdd", "border": "#f4d8be"},
     "yellow": {"bg": "#fbf3db", "border": "#f4e6b5"},
     "green": {"bg": "#edf3ec", "border": "#dbe8d9"},
+    "teal": {"bg": "#edf3ec", "border": "#dbe8d9"},
     "blue": {"bg": "#edf5fb", "border": "#dbeaf6"},
     "purple": {"bg": "#f6f3f9", "border": "#eae3f2"},
     "pink": {"bg": "#faf1f5", "border": "#f2dfea"},
@@ -336,7 +339,7 @@ class NotionToConfluenceConverter:
             val = prop.get("value")
             return html.escape(str(val)) if val is not None else "-"
 
-    def convert_rich_text(self, rich_text_list: List[Dict[str, Any]]) -> str:
+    def convert_rich_text(self, rich_text_list: List[Dict[str, Any]], default_color: str = "default") -> str:
         """Notionのrich_text配列をConfluence Storage FormatのXHTML文字列に変換する。
         メンション（日付、ページ、データベース、ユーザー、リンクプレビュー等）や書式、カラーも完全サポート。"""
         if not rich_text_list:
@@ -460,7 +463,13 @@ class NotionToConfluenceConverter:
 
             # テキストカラー / 背景色
             color = annotations.get("color", "default")
+            if color == "default" and default_color != "default":
+                color = default_color
             if color and color != "default":
+                if color == "teal":
+                    color = "green"
+                elif color == "teal_background":
+                    color = "green_background"
                 if color in NOTION_TEXT_COLOR_MAP:
                     escaped = f'<span style="color: {NOTION_TEXT_COLOR_MAP[color]};">{escaped}</span>'
                 elif color in NOTION_BG_COLOR_MAP:
@@ -546,7 +555,8 @@ class NotionToConfluenceConverter:
                 if current_list_type != "bulleted":
                     flush_list()
                     current_list_type = "bulleted"
-                text = self.convert_rich_text(b.get("bulleted_list_item", {}).get("rich_text", []))
+                b_color = b.get("bulleted_list_item", {}).get("color", "default")
+                text = self.convert_rich_text(b.get("bulleted_list_item", {}).get("rich_text", []), default_color=b_color)
                 nested_html = ""
                 if b.get("children_blocks"):
                     nested_html = self.blocks_to_storage_format(b["children_blocks"])
@@ -557,7 +567,8 @@ class NotionToConfluenceConverter:
                 if current_list_type != "numbered":
                     flush_list()
                     current_list_type = "numbered"
-                text = self.convert_rich_text(b.get("numbered_list_item", {}).get("rich_text", []))
+                b_color = b.get("numbered_list_item", {}).get("color", "default")
+                text = self.convert_rich_text(b.get("numbered_list_item", {}).get("rich_text", []), default_color=b_color)
                 nested_html = ""
                 if b.get("children_blocks"):
                     nested_html = self.blocks_to_storage_format(b["children_blocks"])
@@ -571,7 +582,8 @@ class NotionToConfluenceConverter:
                 todo_data = b.get("to_do", {})
                 is_checked = todo_data.get("checked", False)
                 status = "complete" if is_checked else "incomplete"
-                text = self.convert_rich_text(todo_data.get("rich_text", []))
+                b_color = todo_data.get("color", "default")
+                text = self.convert_rich_text(todo_data.get("rich_text", []), default_color=b_color)
                 nested_html = ""
                 if b.get("children_blocks"):
                     nested_html = self.blocks_to_storage_format(b["children_blocks"])
@@ -584,7 +596,9 @@ class NotionToConfluenceConverter:
             flush_list()
 
             if b_type == "paragraph":
-                text = self.convert_rich_text(b.get("paragraph", {}).get("rich_text", []))
+                p_data = b.get("paragraph", {})
+                p_color = p_data.get("color", "default")
+                text = self.convert_rich_text(p_data.get("rich_text", []), default_color=p_color)
                 children_html = ""
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"])
@@ -592,7 +606,8 @@ class NotionToConfluenceConverter:
 
             elif b_type == "heading_1":
                 h_data = b.get("heading_1", {})
-                text = self.convert_rich_text(h_data.get("rich_text", []))
+                h_color = h_data.get("color", "default")
+                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=h_color)
                 current_heading = text
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
@@ -608,7 +623,8 @@ class NotionToConfluenceConverter:
 
             elif b_type == "heading_2":
                 h_data = b.get("heading_2", {})
-                text = self.convert_rich_text(h_data.get("rich_text", []))
+                h_color = h_data.get("color", "default")
+                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=h_color)
                 current_heading = text
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
@@ -624,7 +640,8 @@ class NotionToConfluenceConverter:
 
             elif b_type == "heading_3":
                 h_data = b.get("heading_3", {})
-                text = self.convert_rich_text(h_data.get("rich_text", []))
+                h_color = h_data.get("color", "default")
+                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=h_color)
                 current_heading = text
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
@@ -705,7 +722,9 @@ class NotionToConfluenceConverter:
                     )
 
             elif b_type == "quote":
-                text = self.convert_rich_text(b.get("quote", {}).get("rich_text", []))
+                q_data = b.get("quote", {})
+                q_color = q_data.get("color", "default")
+                text = self.convert_rich_text(q_data.get("rich_text", []), default_color=q_color)
                 children_html = ""
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"])
@@ -731,11 +750,19 @@ class NotionToConfluenceConverter:
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"])
 
+                body_parts = []
+                if full_text:
+                    body_parts.append(f"<p>{full_text}</p>")
+                if children_html:
+                    body_parts.append(children_html)
+                if not body_parts:
+                    body_parts.append("<p></p>")
+
                 output.append(
                     f'<ac:structured-macro ac:name="panel">'
                     f'<ac:parameter ac:name="bgColor">{color_info["bg"]}</ac:parameter>'
                     f'<ac:parameter ac:name="borderColor">{color_info["border"]}</ac:parameter>'
-                    f'<ac:rich-text-body><p>{full_text}</p>{children_html}</ac:rich-text-body>'
+                    f'<ac:rich-text-body>{"".join(body_parts)}</ac:rich-text-body>'
                     f'</ac:structured-macro>'
                 )
 

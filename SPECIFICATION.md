@@ -415,3 +415,23 @@ python migrate.py --zip export.zip --show-all-pages
   3. **移行元ZIPを再指定することなく**、解決可能となった過去ページ（`confluence_id`）のStorage Format（XHTML）をConfluence API経由で取得し、ページ内の未解決マーク部分を確定したConfluence Databaseスマートリンク（必要なビュー作成を含む）または `<ac:link>` に直接置換してページを更新する。
   4. 解決が完了したエントリはレジストリの `unresolved_references` から除去し、`resolved_references` として履歴を更新する。
 
+### 7.3 移行先ページの公開範囲・プライベート権限設定仕様（未実装）
+
+個人のプライベートページ群を他メンバーに公開せずConfluenceへ移行できるよう、移行実行者本人のみに閲覧・編集権限を制限するシンプルな権限設定仕様です。
+
+#### 1. 公開モードの切り替え (`--visibility` または `--private`)
+* **`space`（デフォルト）**:
+  - ページ制限（Content Restrictions）を設定せず、移行先スペースの標準権限（スペース内公開）に従う。
+* **`private`（`--private` または `--visibility private`）**:
+  - 移行スクリプトを実行しているAPI認証ユーザー（移行実行者本人）のみが閲覧・編集可能なプライベートページとして移行する。
+
+#### 2. 認証ユーザー取得と制限適用フロー
+1. **移行実行者のAccount ID取得**:
+   - 移行開始時に Confluence REST API `GET /wiki/rest/api/user/current` を呼び出し、実行者本人の `accountId` を自動取得する（追加のユーザーID指定は不要）。
+2. **Pass 1 ルートページ作成直後の即時ロック**:
+   - 移行処理中に一時的にもページがスペース内に公開されることを防ぐため、**Pass 1 で移行ツリーの最上位ページ（ルートノード）を作成した直後に**、Confluence Content Restrictions API (`PUT /wiki/rest/api/content/{id}/restriction`) を呼び出し、実行者本人の `accountId` のみに対する `read`（閲覧制限）および `update`（編集制限）を設定する。
+3. **配下ページ・データベースへの自動継承**:
+   - Confluence Cloudの仕様により、親ページに設定された `read`（閲覧制限）は配下の全子ページ・孫ページ・Confluence Database・DBレコード子ページへ自動的に継承されるため、ツリー全体が移行実行者専用の非公開状態となる。
+   - また、移行実行者本人は許可リストに含まれているため、後続の子ページ並行作成、Pass 2 の相互リンク・行ビュー更新、`--resume` 再開、および Step 3 の自動整合性検証はすべてそのまま正常に動作する。
+
+

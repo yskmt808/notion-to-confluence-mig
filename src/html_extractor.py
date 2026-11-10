@@ -1059,14 +1059,14 @@ class HtmlZipExtractor:
             # 3. 箇条書きリスト
             elif tag == "ul" and "bulleted-list" in classes:
                 for li in el.find_all("li", recursive=False):
-                    child_blocks = []
-                    indented = li.find(class_="indented")
-                    if indented:
-                        child_blocks = self._parse_elements_to_blocks(indented, zf, current_dir, db_csv_map=db_csv_map)
+                    li_id = li.get("id") or el_id
+                    rich_texts, child_blocks = self._extract_list_item_content(
+                        li, zf, current_dir, db_csv_map=db_csv_map
+                    )
                     blocks.append({
-                        "id": el_id,
+                        "id": li_id,
                         "type": "bulleted_list_item",
-                        "bulleted_list_item": {"rich_text": self._parse_inline_rich_text(li, skip_classes=["indented"])},
+                        "bulleted_list_item": {"rich_text": rich_texts},
                         "children_blocks": child_blocks,
                         "has_children": bool(child_blocks),
                     })
@@ -1074,14 +1074,14 @@ class HtmlZipExtractor:
             # 4. 番号付きリスト
             elif tag == "ol" and "numbered-list" in classes:
                 for li in el.find_all("li", recursive=False):
-                    child_blocks = []
-                    indented = li.find(class_="indented")
-                    if indented:
-                        child_blocks = self._parse_elements_to_blocks(indented, zf, current_dir, db_csv_map=db_csv_map)
+                    li_id = li.get("id") or el_id
+                    rich_texts, child_blocks = self._extract_list_item_content(
+                        li, zf, current_dir, db_csv_map=db_csv_map
+                    )
                     blocks.append({
-                        "id": el_id,
+                        "id": li_id,
                         "type": "numbered_list_item",
-                        "numbered_list_item": {"rich_text": self._parse_inline_rich_text(li, skip_classes=["indented"])},
+                        "numbered_list_item": {"rich_text": rich_texts},
                         "children_blocks": child_blocks,
                         "has_children": bool(child_blocks),
                     })
@@ -1089,21 +1089,21 @@ class HtmlZipExtractor:
             # 5. ToDoリスト
             elif tag == "ul" and "to-do-list" in classes:
                 for li in el.find_all("li", recursive=False):
-                    inp = li.find("input", type="checkbox")
+                    li_id = li.get("id") or el_id
+                    inp = li.find("input", type="checkbox", recursive=False) or li.find("input", type="checkbox")
                     is_checked = False
                     if inp:
                         is_checked = inp.has_attr("checked") or "checkbox-on" in inp.get("class", [])
 
-                    child_blocks = []
-                    indented = li.find(class_="indented")
-                    if indented:
-                        child_blocks = self._parse_elements_to_blocks(indented, zf, current_dir, db_csv_map=db_csv_map)
+                    rich_texts, child_blocks = self._extract_list_item_content(
+                        li, zf, current_dir, db_csv_map=db_csv_map, skip_classes=["indented", "checkbox"]
+                    )
 
                     blocks.append({
-                        "id": el_id,
+                        "id": li_id,
                         "type": "to_do",
                         "to_do": {
-                            "rich_text": self._parse_inline_rich_text(li, skip_classes=["indented", "checkbox"]),
+                            "rich_text": rich_texts,
                             "checked": is_checked,
                         },
                         "children_blocks": child_blocks,
@@ -1136,15 +1136,11 @@ class HtmlZipExtractor:
 
             # 7. 引用
             elif tag == "blockquote":
-                child_blocks = []
-                # 内部にpやリスト等の子要素がある場合
-                child_tags = [c for c in el.children if isinstance(c, Tag)]
-                if child_tags and any(t.name in ("p", "ul", "ol", "blockquote") for t in child_tags):
-                    child_blocks = self._parse_elements_to_blocks(el, zf, current_dir, db_csv_map=db_csv_map)
+                rich_texts, child_blocks = self._extract_list_item_content(el, zf, current_dir, db_csv_map=db_csv_map)
                 blocks.append({
                     "id": el_id,
                     "type": "quote",
-                    "quote": {"rich_text": self._parse_inline_rich_text(el)},
+                    "quote": {"rich_text": rich_texts},
                     "children_blocks": child_blocks,
                     "has_children": bool(child_blocks),
                 })
@@ -1174,14 +1170,20 @@ class HtmlZipExtractor:
 
                 resolved_emoji = resolve_notion_icon_to_emoji(icon_val) if icon_val else None
 
+                callout_rich_text, callout_children = self._extract_callout_content(
+                    el, zf, current_dir, db_csv_map=db_csv_map
+                )
+
                 blocks.append({
                     "id": el_id,
                     "type": "callout",
                     "callout": {
-                        "rich_text": self._parse_inline_rich_text(el, skip_classes=["icon"]),
+                        "rich_text": callout_rich_text,
                         "icon": {"type": "emoji", "emoji": resolved_emoji} if resolved_emoji else None,
                         "color": bg_color,
                     },
+                    "children_blocks": callout_children,
+                    "has_children": bool(callout_children),
                 })
 
             # 9. コードブロック
@@ -1501,15 +1503,231 @@ class HtmlZipExtractor:
 
         return blocks
 
+    def _is_block_tag(self, node: Tag) -> bool:
+        """与えられたHTML要素がブロック要素（リスト・コールアウト・画像・テーブル・コード等）であるかを判定する。"""
+        if not isinstance(node, Tag) or not node.name:
+            return False
+        t_name = node.name.lower()
+        t_classes = node.get("class") or []
+        if isinstance(t_classes, str):
+            t_classes = [t_classes]
+        if t_name in ("ul", "ol", "aside", "figure", "blockquote", "pre", "table", "details", "hr", "h1", "h2", "h3", "nav"):
+            return True
+        if any(
+            c in t_classes
+            for c in (
+                "indented",
+                "callout",
+                "column-list",
+                "column_list",
+                "collection-content",
+                "link-to-page",
+                "image",
+                "table-of-contents",
+                "table_of_contents",
+            )
+        ):
+            return True
+        if t_name == "img" and "icon" not in t_classes and "page-header-icon" not in t_classes and "property-icon" not in t_classes:
+            return True
+        return False
+
+    def _extract_list_item_content(
+        self,
+        li: Tag,
+        zf: zipfile.ZipFile,
+        current_dir: str,
+        db_csv_map: Optional[Dict[str, str]] = None,
+        skip_classes: Optional[List[str]] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """<li> 要素から、自身のインライン rich_text と配下のネストされた子ブロック群 (children_blocks) を分離して抽出する。
+        コールアウト (<aside>) やネストされたリスト (<ul>/<ol>)、画像 (<figure>) 等が .indented 内にある場合も、
+        <li> 直下に配置されている場合も、本文テキストに混入させず正確に子ブロックとして抽出する。
+        """
+        import copy
+        skip_cls = list(skip_classes or ["indented"])
+        inline_container = Tag(name="span")
+        block_container = Tag(name="div")
+        first_p_consumed = False
+
+        for child in li.children:
+            if isinstance(child, NavigableString):
+                inline_container.append(copy.copy(child))
+            elif isinstance(child, Tag):
+                c_name = child.name.lower()
+                c_classes = child.get("class") or []
+                if isinstance(c_classes, str):
+                    c_classes = [c_classes]
+
+                if "indented" in c_classes:
+                    for sub in child.children:
+                        if isinstance(sub, Tag):
+                            block_container.append(copy.copy(sub))
+                elif self._is_block_tag(child):
+                    block_container.append(copy.copy(child))
+                elif c_name == "p":
+                    # 最初の <p> かつ既存のインラインテキストが空の場合はリスト項目自身のテキストとして採用
+                    has_nested_block = any(self._is_block_tag(sub) for sub in child.children if isinstance(sub, Tag))
+                    if not first_p_consumed and not inline_container.get_text(strip=True) and not has_nested_block:
+                        first_p_consumed = True
+                        for sub in child.children:
+                            inline_container.append(copy.copy(sub))
+                    else:
+                        block_container.append(copy.copy(child))
+                elif c_name in ("span", "div") and any(self._is_block_tag(sub) for sub in child.children if isinstance(sub, Tag)):
+                    for sub in child.children:
+                        if isinstance(sub, NavigableString):
+                            inline_container.append(copy.copy(sub))
+                        elif isinstance(sub, Tag):
+                            sub_cls = sub.get("class") or []
+                            if isinstance(sub_cls, str):
+                                sub_cls = [sub_cls]
+                            if "indented" in sub_cls:
+                                for s2 in sub.children:
+                                    if isinstance(s2, Tag):
+                                        block_container.append(copy.copy(s2))
+                            elif self._is_block_tag(sub) or sub.name.lower() == "p":
+                                block_container.append(copy.copy(sub))
+                            else:
+                                inline_container.append(copy.copy(sub))
+                else:
+                    inline_container.append(copy.copy(child))
+
+        rich_texts = self._parse_inline_rich_text(inline_container, skip_classes=skip_cls)
+        # 先頭・末尾の改行や空白のみのノードを整理
+        if rich_texts:
+            rich_texts[0]["plain_text"] = rich_texts[0]["plain_text"].lstrip("\n\r ")
+            if "text" in rich_texts[0] and isinstance(rich_texts[0]["text"], dict):
+                rich_texts[0]["text"]["content"] = rich_texts[0]["text"].get("content", "").lstrip("\n\r ")
+            rich_texts[-1]["plain_text"] = rich_texts[-1]["plain_text"].rstrip("\n\r ")
+            if "text" in rich_texts[-1] and isinstance(rich_texts[-1]["text"], dict):
+                rich_texts[-1]["text"]["content"] = rich_texts[-1]["text"].get("content", "").rstrip("\n\r ")
+            rich_texts = [rt for rt in rich_texts if rt.get("plain_text")]
+
+        child_blocks = self._parse_elements_to_blocks(block_container, zf, current_dir, db_csv_map=db_csv_map)
+        return rich_texts, child_blocks
+
+    def _extract_callout_content(
+        self,
+        el: Tag,
+        zf: zipfile.ZipFile,
+        current_dir: str,
+        db_csv_map: Optional[Dict[str, str]] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """コールアウト (<aside class="callout">) から、メインテキスト (rich_text) と
+        内部にネストされた子ブロック (埋め込み画像 <figure class="image">、追加段落 <p>、リスト等) を分離抽出する。
+        """
+        import copy
+        # NotionのHTMLエクスポートでは <aside><div style="font-size:1.5em">(icon)</div><div style="width:100%">(content)</div></aside>
+        # の構造になっていることが多い。アイコン用div以外のコンテンツコンテナを特定する。
+        direct_divs = [d for d in el.find_all("div", recursive=False)]
+        content_root: Tag = el
+        if len(direct_divs) >= 2:
+            first_div = direct_divs[0]
+            if first_div.find(class_="icon") or "1.5em" in (first_div.get("style") or ""):
+                if len(direct_divs) == 2 and not any(
+                    isinstance(c, Tag) and c not in direct_divs for c in el.children
+                ):
+                    content_root = direct_divs[1]
+
+        inline_container = Tag(name="span")
+        block_container = Tag(name="div")
+        first_p_consumed = False
+
+        def _process_nodes(nodes):
+            nonlocal first_p_consumed
+            for child in nodes:
+                if isinstance(child, NavigableString):
+                    if not first_p_consumed and not block_container.contents:
+                        inline_container.append(copy.copy(child))
+                    elif str(child).strip():
+                        p_tag = Tag(name="p")
+                        p_tag.append(copy.copy(child))
+                        block_container.append(p_tag)
+                elif isinstance(child, Tag):
+                    c_name = child.name.lower()
+                    c_classes = child.get("class") or []
+                    if isinstance(c_classes, str):
+                        c_classes = [c_classes]
+
+                    # アイコン要素はスキップ
+                    if "icon" in c_classes or (
+                        c_name == "div"
+                        and (child.find(class_="icon") or "1.5em" in (child.get("style") or ""))
+                        and not child.get_text(strip=True)
+                    ):
+                        continue
+
+                    if "indented" in c_classes:
+                        for sub in child.children:
+                            if isinstance(sub, Tag):
+                                block_container.append(copy.copy(sub))
+                    elif c_name == "p":
+                        has_nested_block = any(self._is_block_tag(sub) for sub in child.children if isinstance(sub, Tag))
+                        if not first_p_consumed and not inline_container.get_text(strip=True) and not block_container.contents and not has_nested_block:
+                            first_p_consumed = True
+                            for sub in child.children:
+                                inline_container.append(copy.copy(sub))
+                        elif has_nested_block:
+                            _process_nodes(list(child.children))
+                        else:
+                            block_container.append(copy.copy(child))
+                    elif self._is_block_tag(child):
+                        block_container.append(copy.copy(child))
+                    elif c_name == "div":
+                        _process_nodes(list(child.children))
+                    else:
+                        if not first_p_consumed and not block_container.contents:
+                            inline_container.append(copy.copy(child))
+                        else:
+                            block_container.append(copy.copy(child))
+
+        _process_nodes(list(content_root.children))
+
+        rich_texts = self._parse_inline_rich_text(inline_container, skip_classes=["icon"])
+        if rich_texts:
+            rich_texts[0]["plain_text"] = rich_texts[0]["plain_text"].lstrip("\n\r ")
+            if "text" in rich_texts[0] and isinstance(rich_texts[0]["text"], dict):
+                rich_texts[0]["text"]["content"] = rich_texts[0]["text"].get("content", "").lstrip("\n\r ")
+            rich_texts[-1]["plain_text"] = rich_texts[-1]["plain_text"].rstrip("\n\r ")
+            if "text" in rich_texts[-1] and isinstance(rich_texts[-1]["text"], dict):
+                rich_texts[-1]["text"]["content"] = rich_texts[-1]["text"].get("content", "").rstrip("\n\r ")
+            rich_texts = [rt for rt in rich_texts if rt.get("plain_text")]
+
+        child_blocks = self._parse_elements_to_blocks(block_container, zf, current_dir, db_csv_map=db_csv_map)
+        return rich_texts, child_blocks
+
     def _parse_inline_rich_text(
         self,
         node: Tag,
         skip_classes: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """HTMLタグ配下のインラインテキスト（太字・斜体・コード・リンク等）をNotion rich_text形式にパースする。"""
+        """HTMLタグ配下のインラインテキスト（太字・斜体・コード・リンク・文字色・背景色等）をNotion rich_text形式にパースする。"""
         skip_classes = list(skip_classes or [])
         skip_classes.extend(["icon", "page-header-icon", "property-icon"])
         rich_texts = []
+
+        def _extract_highlight_color(tag_el: Tag) -> Optional[str]:
+            hl = tag_el.get("data-notion-highlight")
+            if not hl:
+                t_cls = tag_el.get("class") or []
+                if isinstance(t_cls, str):
+                    t_cls = [t_cls]
+                for cls_item in t_cls:
+                    if cls_item.startswith("highlight-"):
+                        hl = cls_item[len("highlight-"):]
+                        break
+                    elif cls_item.startswith("block-color-"):
+                        hl = cls_item[len("block-color-"):]
+                        break
+            if hl:
+                # Notion HTMLエクスポートでは green が teal / teal_background として出力されるため正規化
+                if hl == "teal":
+                    return "green"
+                elif hl == "teal_background":
+                    return "green_background"
+                return hl
+            return None
 
         def walk(el: Any, marks: Dict[str, Any]):
             for child in el.children:
@@ -1537,6 +1755,8 @@ class HtmlZipExtractor:
                     child_classes = child.get("class", [])
                     if any(sc in child_classes for sc in skip_classes):
                         continue
+                    if self._is_block_tag(child):
+                        continue
 
                     new_marks = dict(marks)
                     c_tag = child.name.lower()
@@ -1558,13 +1778,18 @@ class HtmlZipExtractor:
                             h_uids = extract_uuids(child["href"])
                             if h_uids:
                                 new_marks["page_id"] = normalize_id(h_uids[-1])
-                    elif c_tag == "mark":
-                        hl = child.get("data-notion-highlight")
-                        if hl:
-                            new_marks["color"] = hl
+
+                    hl_color = _extract_highlight_color(child)
+                    if hl_color and (hl_color != "default" or "color" not in new_marks):
+                        new_marks["color"] = hl_color
+
                     walk(child, new_marks)
 
-        walk(node, {})
+        root_hl = _extract_highlight_color(node)
+        initial_marks: Dict[str, Any] = {}
+        if root_hl and root_hl != "default":
+            initial_marks["color"] = root_hl
+        walk(node, initial_marks)
         return rich_texts
 
 
