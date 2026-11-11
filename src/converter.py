@@ -485,25 +485,36 @@ class NotionToConfluenceConverter:
             if href or item_page_id:
                 # Notion内部リンク / クロスブロックリンク（UUID検出）
                 target_uuid = None
-                if item_page_id:
-                    target_uuid = item_page_id.replace("-", "").lower()
-                elif href:
-                    m = extract_uuids(href)
-                    if m:
-                        target_uuid = m[-1].replace("-", "").lower()
-
                 target_title = None
                 target_info = None
+                anchor_name = None
 
-                if target_uuid:
-                    # ハイフン付き・なし両方に対応
-                    for key in (target_uuid, f"{target_uuid[:8]}-{target_uuid[8:12]}-{target_uuid[12:16]}-{target_uuid[16:20]}-{target_uuid[20:]}"):
+                if href and "#" in href:
+                    anchor_part = href.split("#", 1)[1].strip()
+                    if anchor_part:
+                        anchor_name = anchor_part
+
+                candidate_uuids = []
+                if item_page_id:
+                    candidate_uuids.append(item_page_id.replace("-", "").lower())
+                if href:
+                    for u in extract_uuids(href):
+                        u_norm = u.replace("-", "").lower()
+                        if u_norm not in candidate_uuids:
+                            candidate_uuids.append(u_norm)
+
+                # 候補UUIDからページまたはDBの情報を探索
+                for c_uid in candidate_uuids:
+                    for key in (c_uid, f"{c_uid[:8]}-{c_uid[8:12]}-{c_uid[12:16]}-{c_uid[16:20]}-{c_uid[20:]}"):
                         if self.id_to_title_map and key in self.id_to_title_map:
                             target_title = self.id_to_title_map[key]
                         if self.migration_map and key in self.migration_map:
                             target_info = self.migration_map[key]
                         if target_title or target_info:
+                            target_uuid = c_uid
                             break
+                    if target_title or target_info:
+                        break
 
                 if target_info and target_info.get("node_type") == "database":
                     db_url = target_info.get("web_url") or target_info.get("url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
@@ -511,8 +522,11 @@ class NotionToConfluenceConverter:
                 elif target_info or target_title:
                     disp_title = (target_info.get("title") if target_info else None) or target_title or escaped
                     escaped_title = html.escape(disp_title)
+                    anchor_attr = f' ac:anchor="{html.escape(anchor_name)}"' if anchor_name else ""
+                    # ページ内リンク(アンカー指定あり)の場合は、Confluenceがインラインカード化してアンカーや表示名をページ名に置き換えるのを防ぐため card-appearance を付与しない
+                    card_attr = "" if anchor_name else ' ac:card-appearance="inline"'
                     escaped = (
-                        f'<ac:link ac:card-appearance="inline">'
+                        f'<ac:link{card_attr}{anchor_attr}>'
                         f'<ri:page ri:content-title="{escaped_title}" />'
                         f'<ac:link-body>{escaped}</ac:link-body>'
                         f'</ac:link>'
@@ -1032,6 +1046,13 @@ class NotionToConfluenceConverter:
                 synced_from = synced_data.get("synced_from")
                 children_blocks = b.get("children_blocks", [])
                 if children_blocks:
+                    # 子ブロックが単一の synced_block の場合は多重枠線を避けてアンラップ
+                    while (
+                        len(children_blocks) == 1
+                        and children_blocks[0].get("type") == "synced_block"
+                        and children_blocks[0].get("children_blocks")
+                    ):
+                        children_blocks = children_blocks[0]["children_blocks"]
                     children_html = self.blocks_to_storage_format(children_blocks)
                     # Notionの同期ブロック風に、左端に薄紫のバーを配したコンテナとして描画
                     output.append(

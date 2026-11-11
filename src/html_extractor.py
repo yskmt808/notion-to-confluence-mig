@@ -335,8 +335,11 @@ class HtmlZipExtractor:
         # ノードタイプの判定（データベースか通常ページか）
         is_database = node_id in db_csv_map
         node_type = "database" if is_database else "page"
-        if is_database and not icon:
-            icon = "🗄️"
+        if is_database:
+            if not icon:
+                icon = "🗄️"
+            if title in ("Untitled Page", "Untitled", ""):
+                title = "Untitled Database"
 
         # 本文ブロックのパース
         blocks = []

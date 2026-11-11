@@ -288,11 +288,11 @@ class ConfluenceClient:
         res = requests.get(url, params={"cql": cql}, auth=self.auth, timeout=30)
         if res.status_code == 200:
             results = res.json().get("results", [])
+            expected_trunc = title[:252] + "..." if len(title) > 255 else title
             for r in results:
-                if r.get("title") == title:
+                r_title = r.get("title", "")
+                if r_title == title or r_title == expected_trunc:
                     return r
-            if results:
-                return results[0]
         return None
 
     def get_space_id(self, space_key: str) -> Optional[str]:

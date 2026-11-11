@@ -5,7 +5,7 @@ Notion からページ、ブロック階層、データベースおよびレコ�
 import logging
 import time
 import requests
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from dataclasses import dataclass, field
 from notion_client import Client
 
@@ -108,9 +108,11 @@ class NotionExtractor:
             return "".join(t.get("plain_text", "") for t in title_list)
         return "Untitled Database"
 
-    def _extract_blocks_and_children(self, block_id: str):
+    def _extract_blocks_and_children(self, block_id: str, visited_synced: Optional[Set[str]] = None):
         """ブロック直下の子ブロック群をページネーション対応で全件取得し、
         child_page / child_database を子ノードとして再帰抽出する。"""
+        if visited_synced is None:
+            visited_synced = set()
         blocks = []
         child_nodes: List[PageNode] = []
 
@@ -181,11 +183,28 @@ class NotionExtractor:
                         else:
                             logger.warning(f"Error extracting database {db_id}: {e}")
 
+                elif b_type == "synced_block":
+                    # 同期ブロック: 元ブロックの参照(synced_from)がある場合は同期元ブロックから子要素を取得
+                    synced_data = b.get("synced_block") or {}
+                    synced_from = synced_data.get("synced_from")
+                    target_id = synced_from.get("block_id") if synced_from else b["id"]
+
+                    if target_id not in visited_synced:
+                        new_visited = set(visited_synced)
+                        new_visited.add(target_id)
+                        nested_blocks, nested_children = self._extract_blocks_and_children(target_id, new_visited)
+                        b["children_blocks"] = nested_blocks
+                        child_nodes.extend(nested_children)
+                    else:
+                        logger.warning(f"Circular synced_block reference detected for {target_id}")
+                        b["children_blocks"] = []
+                    blocks.append(b)
+
                 else:
                     # 通常のブロック
                     # ネストされたブロック（toggle, bulleted_list等）があれば再帰的に取得
                     if b.get("has_children"):
-                        nested_blocks, nested_children = self._extract_blocks_and_children(b["id"])
+                        nested_blocks, nested_children = self._extract_blocks_and_children(b["id"], visited_synced)
                         b["children_blocks"] = nested_blocks
                         child_nodes.extend(nested_children)
                     blocks.append(b)

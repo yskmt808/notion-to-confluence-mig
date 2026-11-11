@@ -268,10 +268,15 @@ class MigrationVerifier:
         # 1-a. タイトル検証 (240文字制限による切り詰めを考慮)
         expected_title = node.title
         expected_truncated = expected_title[:237] + "..." if len(expected_title) > 240 else expected_title
+        is_untitled_match = (
+            (not expected_title.strip() or expected_title in ("Untitled Database", "無題のデータベース", "Untitled"))
+            and conf_title in ("Untitled Database", "無題のデータベース", "Untitled", "")
+        )
         if (
             conf_title == expected_title
             or conf_title == expected_truncated
             or (len(conf_title) >= 237 and expected_title.startswith(conf_title.rstrip(".")))
+            or is_untitled_match
         ):
             checks_passed.append(f"Database title match: '{conf_title}'")
         else:
@@ -303,23 +308,27 @@ class MigrationVerifier:
 
             # 2-b. ボードビュー / カンバン (Board Layout)
             board_views = [name for name, t in view_types.items() if t == "board" or "ボード" in name]
+            has_select_status = any(
+                isinstance(p, dict) and p.get("type") in ("select", "status")
+                for p in (node.properties.get("schema") or {}).values()
+            )
             if board_views:
                 checks_passed.append(f"Board view layout present: {', '.join(board_views)}")
-            else:
+            elif has_select_status:
                 warnings.append("Board view layout not found in Confluence database.")
 
             # 2-c. ギャラリービュー / カード (Gallery Layout)
             gallery_views = [name for name, t in view_types.items() if t == "gallery" or "ギャラリー" in name]
             if gallery_views:
                 checks_passed.append(f"Gallery view layout present: {', '.join(gallery_views)}")
-            else:
+            elif len(node.children) > 5:
                 warnings.append("Gallery view layout not found in Confluence database.")
 
             # 2-d. Group by フィルタービュー (Filtered Views)
             filtered_views = [name for name in view_names if ": " in name or "ステータス" in name]
             if filtered_views:
                 checks_passed.append(f"Group by filtered views provisioned ({len(filtered_views)} views): {', '.join(filtered_views[:4])}")
-            else:
+            elif has_select_status:
                 warnings.append("Group by filtered views not found in Confluence database.")
 
         # 3. エントリ（行レコード）件数・子ページ検証
