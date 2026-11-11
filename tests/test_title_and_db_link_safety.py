@@ -256,8 +256,21 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
             }
         }
 
-        # 1. rich_text 内の内部リンク（Confluenceインラインリンクオブジェクト形式）
-        rich_text = [{
+        # 1. rich_text 内の内部リンク（ページタイトル一致時はConfluenceインラインリンクオブジェクト形式）
+        rich_text_page_title = [{
+            "type": "text",
+            "text": {
+                "content": "Block A: プロジェクト管理・基盤",
+                "link": {"url": "https://app.notion.com/p/Block-A-4117be77284d8159abc8fa6cce1ccf00?pvs=21"}
+            },
+            "plain_text": "Block A: プロジェクト管理・基盤",
+        }]
+        html_out = conv.convert_rich_text(rich_text_page_title)
+        self.assertIn('<ac:link ac:card-appearance="inline">', html_out)
+        self.assertIn('<ri:page ri:content-title="Block A: プロジェクト管理・基盤" />', html_out)
+
+        # 1-2. カスタムリンク名の場合はページ名への上書きを防ぐため card-appearance を付与しない
+        rich_text_custom = [{
             "type": "text",
             "text": {
                 "content": "Block A へのリンク",
@@ -265,9 +278,9 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
             },
             "plain_text": "Block A へのリンク",
         }]
-        html_out = conv.convert_rich_text(rich_text)
-        self.assertIn('<ac:link ac:card-appearance="inline">', html_out)
-        self.assertIn('<ri:page ri:content-title="Block A: プロジェクト管理・基盤" />', html_out)
+        html_custom = conv.convert_rich_text(rich_text_custom)
+        self.assertNotIn('<ac:link ac:card-appearance="inline">', html_custom)
+        self.assertIn('<ac:link-body>Block A へのリンク</ac:link-body>', html_custom)
 
         # 2. child_page ブロックのインラインリンクオブジェクト
         blocks = [{

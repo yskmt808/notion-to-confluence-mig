@@ -229,6 +229,18 @@ class MigrationVerifier:
             else:
                 issues.append(f"Unsupported Notion blocks detected ({', '.join(u_names)}), but fallback note was not found in Confluence body.")
 
+        # 5-c. カスタムリンク名がページタイトルで上書きされる不正なインラインスマートカードの検知
+        soup_storage = BeautifulSoup(storage_body, "html.parser")
+        for a_link in soup_storage.find_all(lambda t: t.name in ("ac:link", "link")):
+            if a_link.get("ac:card-appearance") == "inline":
+                ri_page = a_link.find(lambda t: t.name in ("ri:page", "page"))
+                page_title = ri_page.get("ri:content-title", "") if ri_page else ""
+                link_body = a_link.find(lambda t: t.name in ("ac:link-body", "link-body", "ac:plain-text-link-body"))
+                if link_body:
+                    body_txt = link_body.get_text(strip=True)
+                    if body_txt and page_title and body_txt != page_title and not body_txt.startswith(("http://", "https://")):
+                        issues.append(f"Inline smart card link overwriting custom link text '{body_txt}' with target page title '{page_title}'.")
+
         # 6. 主要テキストの含有チェック（Notionブロック内のプレーンテキストが欠落していないか）
         missing_snippets = []
         for b in node.blocks:
@@ -238,12 +250,12 @@ class MigrationVerifier:
                 rich_texts = data.get("rich_text", [])
                 for rt in rich_texts:
                     plain = rt.get("plain_text", "").strip()
-                    # 5文字以上のテキストについて検証
-                    if len(plain) >= 5 and plain not in extracted_text and plain not in storage_body:
-                        # タグやエスケープの違いを考慮
+                    # 2文字以上のテキストについて検証
+                    if len(plain) >= 2:
                         normalized_plain = re.sub(r"\s+", "", plain)
-                        normalized_body = re.sub(r"\s+", "", extracted_text)
-                        if normalized_plain not in normalized_body:
+                        normalized_extracted = re.sub(r"\s+", "", extracted_text)
+                        normalized_storage = re.sub(r"\s+", "", storage_body)
+                        if normalized_plain not in normalized_extracted and normalized_plain not in normalized_storage:
                             missing_snippets.append(plain[:30])
 
         if missing_snippets:

@@ -267,6 +267,114 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         # インライン指定 (pink_background) はそのまま保持されること
         self.assertIn('<span style="background-color: #fbf0f4;', html)
 
+    def test_converter_pdf_block_single_macro_no_duplicate_link(self):
+        """PDFブロックがview-fileマクロ単一で出力され、重複リンクが生成されないこと。"""
+        blocks = [
+            {
+                "type": "pdf",
+                "pdf": {"file": {"url": "test.pdf"}},
+                "_attachment_filename": "test.pdf",
+                "_attachment_uploaded": True,
+            }
+        ]
+        html = self.converter.blocks_to_storage_format(blocks)
+        self.assertIn('<ac:structured-macro ac:name="view-file"', html)
+        self.assertEqual(html.count('<ac:structured-macro ac:name="view-file"'), 1)
+        self.assertNotIn('<ac:link>', html)
+
+    def test_converter_custom_link_text_no_card_appearance(self):
+        """カスタム表示名（例: 熊本城）を持つページリンクで ac:card-appearance="inline" が付与されないこと。"""
+        self.converter.id_to_title_map = {"p123": "エラーパターン"}
+        rich_texts = [
+            {
+                "type": "text",
+                "text": {"content": "熊本城", "link": {"url": "/p123"}},
+                "plain_text": "熊本城",
+                "page_id": "p123",
+            }
+        ]
+        html = self.converter.convert_rich_text(rich_texts)
+        self.assertIn('ri:content-title="エラーパターン"', html)
+        self.assertIn('<ac:link-body>熊本城</ac:link-body>', html)
+        self.assertNotIn('ac:card-appearance="inline"', html)
+
+    def test_html_extractor_unwraps_synced_block_div(self):
+        """同期ブロック（ネストされたdiv）内のコールアウトが正常に抽出されること。"""
+        html_content = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+  <article id="p-1" class="page">
+    <div class="page-body">
+      <div dir="auto">
+        <div dir="auto">
+          <aside class="block-color-blue_background callout" id="callout-synced">
+            <p>同期ブロック１</p>
+          </aside>
+        </div>
+      </div>
+    </div>
+  </article>
+</body>
+</html>"""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_zip:
+            tmp_zip_path = tmp_zip.name
+
+        try:
+            with zipfile.ZipFile(tmp_zip_path, "w") as zf:
+                zf.writestr("test_sync.html", html_content)
+
+            extractor = HtmlZipExtractor(tmp_zip_path)
+            tree = extractor.extract_tree()
+            self.assertEqual(len(tree.blocks), 1)
+            b = tree.blocks[0]
+            self.assertEqual(b["type"], "callout")
+            self.assertEqual(b["id"], "callout-synced")
+            self.assertEqual(b["callout"]["rich_text"][0]["plain_text"], "同期ブロック１")
+        finally:
+            if os.path.exists(tmp_zip_path):
+                os.remove(tmp_zip_path)
+
+    def test_importer_skips_empty_database_row(self):
+        """空のデータベース行（無題・本文なし・プロパティなし）が検出されスキップされること。"""
+        from src.importer import ConfluenceImporter
+
+        empty_row = PageNode(
+            id="row-empty",
+            title="Untitled Page",
+            node_type="database_row",
+            properties={"schema": {}, "title": {}},
+            blocks=[],
+        )
+        self.assertTrue(ConfluenceImporter.is_empty_database_row(empty_row))
+
+        non_empty_row = PageNode(
+            id="row-data",
+            title="タスクA",
+            node_type="database_row",
+            properties={"Status": "完了"},
+            blocks=[],
+        )
+        self.assertFalse(ConfluenceImporter.is_empty_database_row(non_empty_row))
+
+    def test_verifier_detects_smart_card_overwriting_custom_text(self):
+        """ac:card-appearance="inline" がカスタムリンク名を上書きする状況を検証がFAILとして検出すること。"""
+        mock_client = MagicMock()
+        mock_client.get_page_by_id.return_value = {
+            "id": "p-1",
+            "title": "エラーパターン",
+            "body": {
+                "storage": {
+                    "value": '<p><ac:link ac:card-appearance="inline"><ri:page ri:content-title="エラーパターン" /><ac:link-body>熊本城</ac:link-body></ac:link></p>'
+                }
+            },
+        }
+        verifier = MigrationVerifier(mock_client)
+        node = PageNode(id="p-1", title="エラーパターン", node_type="page", blocks=[])
+        res = verifier.verify_page_node(node, "p-1")
+        self.assertEqual(res["status"], "FAIL")
+        self.assertTrue(any("overwriting custom link text '熊本城'" in issue for issue in res["issues"]))
+
 
 if __name__ == "__main__":
     unittest.main()

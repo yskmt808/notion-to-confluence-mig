@@ -1429,6 +1429,31 @@ class ConfluenceImporter:
             self._node_to_title[notion_node_id] = target_title
             return target_title, existing_page
 
+    @staticmethod
+    def is_empty_database_row(row_node: PageNode) -> bool:
+        """データベース行が完全に空レコード（タイトル無題、本文なし、プロパティ値なし）であるかを判定する。"""
+        if getattr(row_node, "node_type", "") != "database_row":
+            return False
+        title_clean = (row_node.title or "").strip()
+        is_untitled = not title_clean or title_clean in ("Untitled Page", "無題", "Untitled")
+        has_body = False
+        for b in (row_node.blocks or []):
+            if b.get("type") != "paragraph":
+                has_body = True
+                break
+            p_text = "".join(rt.get("plain_text", "") for rt in b.get("paragraph", {}).get("rich_text", [])).strip()
+            if p_text:
+                has_body = True
+                break
+        has_props = False
+        for k, v in (row_node.properties or {}).items():
+            if k in ("schema", "title"):
+                continue
+            if v not in (None, "", [], {}):
+                has_props = True
+                break
+        return is_untitled and not has_body and not has_props
+
     def _import_node_recursive(
         self,
         node: PageNode,
@@ -1438,6 +1463,11 @@ class ConfluenceImporter:
         """単一ノードをConfluenceに作成・更新し、子ノードも再帰処理する。"""
         if self.cancel_manager:
             self.cancel_manager.check_cancelled()
+
+        # 空のデータベースレコード行は子ページ作成をスキップ
+        if self.is_empty_database_row(node):
+            logger.info(f"Skipping empty database row page creation: [{node.title}] (ID: {node.id})")
+            return None
 
         # レジューム判定: 既にPass 1完了済みノードの場合はConfluence作成をスキップ
         if self.checkpoint and self.checkpoint.is_pass1_done(node.id):
@@ -1507,6 +1537,9 @@ class ConfluenceImporter:
                 child.parent_db_title = node.title
                 if existing_db_url:
                     child.parent_db_url = existing_db_url
+                if self.is_empty_database_row(child):
+                    logger.info(f"Skipping empty database row child page: [{child.title}] (ID: {child.id})")
+                    continue
                 if self.checkpoint and self.checkpoint.is_pass1_done(child.id):
                     cached = self.checkpoint.get_node_info(child.id)
                     cid = cached["confluence_id"]

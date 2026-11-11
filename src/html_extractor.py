@@ -1559,7 +1559,20 @@ class HtmlZipExtractor:
                                 logger.warning(f"Image attachment not found in ZIP: src='{src}', resolved='{resolved_path}'")
                         blocks.append(block_obj)
 
-            # 16. その他・未知のNotion固有要素 (例: breadcrumb 等)
+            # 16. 同期ブロックやネストされたラッパー (div / section または内部にブロック要素を内包する要素)
+            elif (
+                any(self._is_block_tag(sub) for sub in el.children if isinstance(sub, Tag))
+                or (
+                    tag in ("div", "section")
+                    and "column-list" not in classes
+                    and "column" not in classes
+                    and any(self._is_block_tag(sub) for sub in el.find_all() if isinstance(sub, Tag))
+                )
+            ):
+                sub_blocks = self._parse_elements_to_blocks(el, zf, current_dir, db_csv_map=db_csv_map)
+                blocks.extend(sub_blocks)
+
+            # 17. その他・未知のNotion固有要素 (例: breadcrumb 等)
             else:
                 # テキストが存在していれば段落として拾う
                 el_text = el.text.strip()

@@ -523,8 +523,16 @@ class NotionToConfluenceConverter:
                     disp_title = (target_info.get("title") if target_info else None) or target_title or escaped
                     escaped_title = html.escape(disp_title)
                     anchor_attr = f' ac:anchor="{html.escape(anchor_name)}"' if anchor_name else ""
-                    # ページ内リンク(アンカー指定あり)の場合は、Confluenceがインラインカード化してアンカーや表示名をページ名に置き換えるのを防ぐため card-appearance を付与しない
-                    card_attr = "" if anchor_name else ' ac:card-appearance="inline"'
+                    # 表示テキストがターゲットページのタイトルと異なる場合（カスタムリンク名）、
+                    # またはアンカー指定がある場合は、Confluenceがインラインカード化して表示テキストをページ名に置き換えるのを防ぐため card-appearance を付与しない
+                    raw_plain = item.get("plain_text") or (item.get("text") or {}).get("content", "")
+                    has_custom_label = bool(
+                        raw_plain
+                        and raw_plain.strip()
+                        and raw_plain.strip() != disp_title.strip()
+                        and not raw_plain.strip().startswith(("http://", "https://"))
+                    )
+                    card_attr = "" if (anchor_name or has_custom_label) else ' ac:card-appearance="inline"'
                     escaped = (
                         f'<ac:link{card_attr}{anchor_attr}>'
                         f'<ri:page ri:content-title="{escaped_title}" />'
@@ -1169,15 +1177,10 @@ class NotionToConfluenceConverter:
                 caption = self.convert_rich_text(pdf_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
                 if b.get("_attachment_uploaded", True):
-                    safe_fn_cdata = filename.replace("]]>", "]]]]><![CDATA[>")
                     output.append(
                         f'<p><ac:structured-macro ac:name="view-file">'
                         f'<ac:parameter ac:name="name"><ri:attachment ri:filename="{html.escape(filename)}" /></ac:parameter>'
-                        f'</ac:structured-macro></p>'
-                        f'<p><ac:link>'
-                        f'<ri:attachment ri:filename="{html.escape(filename)}" />'
-                        f'<ac:plain-text-link-body><![CDATA[📄 {safe_fn_cdata} (クリックしてプレビュー・ダウンロード)]]></ac:plain-text-link-body>'
-                        f'</ac:link></p>{caption_html}'
+                        f'</ac:structured-macro></p>{caption_html}'
                     )
                 elif pdf_url:
                     output.append(
