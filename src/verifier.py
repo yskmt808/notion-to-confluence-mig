@@ -5,7 +5,9 @@ Playwrightなどのブラウザを介さず、NotionとConfluenceのAPIデータ
 """
 
 import logging
+import os
 import re
+import urllib.parse
 import requests
 from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
@@ -144,6 +146,36 @@ class MigrationVerifier:
                     issues.append(f"Callout block (color: {color}, icon: {emoji}) expected one of {expected_macros} or 'panel', but not found in Confluence.")
             if found_callouts:
                 checks_passed.append(f"Callout macros verified: {', '.join(sorted(set(found_callouts)))}")
+
+        # 添付ファイル実体検証: ブロックツリーから添付ファイル名を収集し、Confluenceの添付ファイル一覧と比較
+        expected_attachment_filenames: List[str] = []
+
+        def _collect_attachment_filenames(blocks_list: List[Dict[str, Any]]):
+            for b in blocks_list:
+                b_type = b.get("type", "")
+                fn = b.get("_attachment_filename")
+                if not fn and b_type in ("file", "pdf", "image", "audio", "video"):
+                    f_info = b.get(b_type, {})
+                    f_file = f_info.get("file") or {}
+                    u = f_file.get("url")
+                    if u and not u.startswith(("http://", "https://")):
+                        fn = os.path.basename(urllib.parse.unquote(u))
+                if fn and fn not in expected_attachment_filenames:
+                    expected_attachment_filenames.append(fn)
+
+                if b.get("children_blocks"):
+                    _collect_attachment_filenames(b["children_blocks"])
+
+        _collect_attachment_filenames(node.blocks)
+
+        if expected_attachment_filenames:
+            conf_attachments = self.client.get_page_attachments(confluence_page_id) if hasattr(self.client, "get_page_attachments") else []
+            attached_titles = {att.get("title") for att in conf_attachments if isinstance(att, dict)}
+            for exp_fn in expected_attachment_filenames:
+                if exp_fn in attached_titles:
+                    checks_passed.append(f"Attachment file '{exp_fn}' verified in Confluence attachments.")
+                else:
+                    issues.append(f"Attachment file '{exp_fn}' is missing from Confluence page {confluence_page_id} attachments.")
 
         if "pdf" in block_types:
             if ('<ac:structured-macro ac:name="view-file"' in storage_body or '<ac:link' in storage_body) and ".pdf" in storage_body.lower():

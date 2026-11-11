@@ -6,6 +6,7 @@ import html
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
@@ -24,6 +25,35 @@ from src.extractor import PageNode
 from src.converter import NotionToConfluenceConverter
 
 logger = logging.getLogger(__name__)
+
+ATTACHMENT_MIME_MAP = {
+    ".pdf": "application/pdf",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".zip": "application/zip",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".webp": "image/webp",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".mp4": "video/mp4",
+}
+
+
+def detect_attachment_mime_type(filename: str) -> str:
+    """ファイル名から適切なMIMEタイプを判定する。"""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ATTACHMENT_MIME_MAP:
+        return ATTACHMENT_MIME_MAP[ext]
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
 
 
 def _is_safe_external_url(url: str) -> bool:
@@ -102,6 +132,17 @@ class ConfluenceClient:
         if res.status_code == 200:
             return res.json()
         return None
+
+    def get_page_attachments(self, page_id: str) -> List[Dict[str, Any]]:
+        """指定されたConfluenceページの添付ファイル一覧を取得する。"""
+        url = f"{self.base_url}/rest/api/content/{page_id}/child/attachment"
+        try:
+            res = requests.get(url, auth=self.auth, timeout=30)
+            if res.status_code == 200:
+                return res.json().get("results", [])
+        except Exception as e:
+            logger.warning(f"Failed to get attachments for page {page_id}: {e}")
+        return []
 
     def move_page_position(self, page_id: str, position: str, target_id: str) -> bool:
         """ページをターゲットページに対して相対配置（before / after / append）で並び替える。"""
@@ -194,8 +235,10 @@ class ConfluenceClient:
             raise RuntimeError(f"Failed to update page [{title}] ({page_id}): {res.status_code} - {res.text}")
         return res.json()
 
-    def upload_attachment(self, page_id: str, filename: str, file_bytes: bytes, mime_type: str = "application/octet-stream"):
+    def upload_attachment(self, page_id: str, filename: str, file_bytes: bytes, mime_type: Optional[str] = None):
         """Confluenceページにファイルを添付アップロードする。"""
+        if not mime_type or mime_type == "application/octet-stream":
+            mime_type = detect_attachment_mime_type(filename)
         url = f"{self.base_url}/rest/api/content/{page_id}/child/attachment"
         headers = {"X-Atlassian-Token": "nocheck"}
         files = {"file": (filename, file_bytes, mime_type)}
@@ -1264,8 +1307,7 @@ class ConfluenceImporter:
                 else:
                     logger.info(f"Uploading pre-loaded attachment bytes for page {page_id}: {filename}")
                     try:
-                        ext = os.path.splitext(filename)[1].lower()
-                        mime_type = "image/png" if ext == ".png" else "image/jpeg" if ext in (".jpg", ".jpeg") else "application/octet-stream"
+                        mime_type = detect_attachment_mime_type(filename)
                         self.client.upload_attachment(
                             page_id=page_id,
                             filename=filename,

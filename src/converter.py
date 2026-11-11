@@ -538,6 +538,28 @@ class NotionToConfluenceConverter:
 
         return "".join(result)
 
+    def _get_block_style_attr(self, color: str, base_padding: str = "6px 10px") -> Tuple[str, str]:
+        """ブロックレベルの色指定から、タグのstyle属性とインライン用default_colorを返す。
+        - 背景色(xxx_background): 行全体にスタイルを適用し、インライン重複を防ぐためdefault_colorは'default'とする。
+        - 文字色(xxx): 行全体に文字色スタイルを適用し、default_colorとしても引き継ぐ。
+        """
+        if not color or color == "default":
+            return "", "default"
+        if color == "teal":
+            color = "green"
+        elif color == "teal_background":
+            color = "green_background"
+
+        if color in NOTION_BG_COLOR_MAP:
+            bg_hex = NOTION_BG_COLOR_MAP[color]
+            style_attr = f' style="background-color: {bg_hex}; padding: {base_padding}; border-radius: 4px; margin: 4px 0;"'
+            return style_attr, "default"
+        elif color in NOTION_TEXT_COLOR_MAP:
+            txt_hex = NOTION_TEXT_COLOR_MAP[color]
+            style_attr = f' style="color: {txt_hex};"'
+            return style_attr, color
+        return "", "default"
+
     def blocks_to_storage_format(self, blocks: List[Dict[str, Any]], context_heading: str = "") -> str:
         """NotionブロックのリストをConfluence Storage Format (XHTML) に変換する。
         連続する箇条書き、番号付きリスト、ToDoリストを適切にタグでラップする。"""
@@ -570,11 +592,12 @@ class NotionToConfluenceConverter:
                     flush_list()
                     current_list_type = "bulleted"
                 b_color = b.get("bulleted_list_item", {}).get("color", "default")
-                text = self.convert_rich_text(b.get("bulleted_list_item", {}).get("rich_text", []), default_color=b_color)
+                style_attr, inline_color = self._get_block_style_attr(b_color, base_padding="2px 6px")
+                text = self.convert_rich_text(b.get("bulleted_list_item", {}).get("rich_text", []), default_color=inline_color)
                 nested_html = ""
                 if b.get("children_blocks"):
                     nested_html = self.blocks_to_storage_format(b["children_blocks"])
-                list_buffer.append(f"<li>{text}{nested_html}</li>")
+                list_buffer.append(f"<li{style_attr}>{text}{nested_html}</li>")
                 continue
 
             elif b_type == "numbered_list_item":
@@ -582,11 +605,12 @@ class NotionToConfluenceConverter:
                     flush_list()
                     current_list_type = "numbered"
                 b_color = b.get("numbered_list_item", {}).get("color", "default")
-                text = self.convert_rich_text(b.get("numbered_list_item", {}).get("rich_text", []), default_color=b_color)
+                style_attr, inline_color = self._get_block_style_attr(b_color, base_padding="2px 6px")
+                text = self.convert_rich_text(b.get("numbered_list_item", {}).get("rich_text", []), default_color=inline_color)
                 nested_html = ""
                 if b.get("children_blocks"):
                     nested_html = self.blocks_to_storage_format(b["children_blocks"])
-                list_buffer.append(f"<li>{text}{nested_html}</li>")
+                list_buffer.append(f"<li{style_attr}>{text}{nested_html}</li>")
                 continue
 
             elif b_type == "to_do":
@@ -612,16 +636,18 @@ class NotionToConfluenceConverter:
             if b_type == "paragraph":
                 p_data = b.get("paragraph", {})
                 p_color = p_data.get("color", "default")
-                text = self.convert_rich_text(p_data.get("rich_text", []), default_color=p_color)
+                style_attr, inline_color = self._get_block_style_attr(p_color, base_padding="6px 10px")
+                text = self.convert_rich_text(p_data.get("rich_text", []), default_color=inline_color)
                 children_html = ""
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"])
-                output.append(f"<p>{text if text else '<br />'}</p>{children_html}")
+                output.append(f"<p{style_attr}>{text if text else '<br />'}</p>{children_html}")
 
             elif b_type == "heading_1":
                 h_data = b.get("heading_1", {})
                 h_color = h_data.get("color", "default")
-                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=h_color)
+                style_attr, inline_color = self._get_block_style_attr(h_color, base_padding="6px 10px")
+                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=inline_color)
                 current_heading = text
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
@@ -633,12 +659,13 @@ class NotionToConfluenceConverter:
                         f'</ac:structured-macro>'
                     )
                 else:
-                    output.append(f"<h1>{text}</h1>")
+                    output.append(f"<h1{style_attr}>{text}</h1>")
 
             elif b_type == "heading_2":
                 h_data = b.get("heading_2", {})
                 h_color = h_data.get("color", "default")
-                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=h_color)
+                style_attr, inline_color = self._get_block_style_attr(h_color, base_padding="6px 10px")
+                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=inline_color)
                 current_heading = text
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
@@ -650,12 +677,13 @@ class NotionToConfluenceConverter:
                         f'</ac:structured-macro>'
                     )
                 else:
-                    output.append(f"<h2>{text}</h2>")
+                    output.append(f"<h2{style_attr}>{text}</h2>")
 
             elif b_type == "heading_3":
                 h_data = b.get("heading_3", {})
                 h_color = h_data.get("color", "default")
-                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=h_color)
+                style_attr, inline_color = self._get_block_style_attr(h_color, base_padding="6px 10px")
+                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=inline_color)
                 current_heading = text
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
@@ -667,7 +695,7 @@ class NotionToConfluenceConverter:
                         f'</ac:structured-macro>'
                     )
                 else:
-                    output.append(f"<h3>{text}</h3>")
+                    output.append(f"<h3{style_attr}>{text}</h3>")
 
             elif b_type == "table_of_contents":
                 # Confluence 目次マクロ (TOC Macro)
@@ -738,11 +766,12 @@ class NotionToConfluenceConverter:
             elif b_type == "quote":
                 q_data = b.get("quote", {})
                 q_color = q_data.get("color", "default")
-                text = self.convert_rich_text(q_data.get("rich_text", []), default_color=q_color)
+                style_attr, inline_color = self._get_block_style_attr(q_color, base_padding="8px 12px")
+                text = self.convert_rich_text(q_data.get("rich_text", []), default_color=inline_color)
                 children_html = ""
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"])
-                output.append(f"<blockquote><p>{text}</p>{children_html}</blockquote>")
+                output.append(f"<blockquote{style_attr}><p>{text}</p>{children_html}</blockquote>")
 
             elif b_type == "callout":
                 from src.icon_mapper import resolve_notion_icon_to_emoji

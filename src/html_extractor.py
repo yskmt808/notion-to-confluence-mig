@@ -1023,6 +1023,19 @@ class HtmlZipExtractor:
         db_csv_map = db_csv_map or {}
         blocks = []
 
+        def _get_element_block_color(classes_list: Any) -> str:
+            if isinstance(classes_list, str):
+                classes_list = [classes_list]
+            for c in classes_list or []:
+                if c.startswith("block-color-"):
+                    col = c.replace("block-color-", "")
+                    if col == "teal":
+                        return "green"
+                    elif col == "teal_background":
+                        return "green_background"
+                    return col
+            return "default"
+
         for el in container.children:
             if not isinstance(el, Tag):
                 continue
@@ -1033,43 +1046,48 @@ class HtmlZipExtractor:
 
             # 1. 見出し
             if tag == "h1":
+                b_color = _get_element_block_color(classes)
                 blocks.append({
                     "id": el_id,
                     "type": "heading_1",
-                    "heading_1": {"rich_text": self._parse_inline_rich_text(el), "is_toggleable": False},
+                    "heading_1": {"rich_text": self._parse_inline_rich_text(el, ignore_block_color=True), "color": b_color, "is_toggleable": False},
                 })
             elif tag == "h2":
+                b_color = _get_element_block_color(classes)
                 blocks.append({
                     "id": el_id,
                     "type": "heading_2",
-                    "heading_2": {"rich_text": self._parse_inline_rich_text(el), "is_toggleable": False},
+                    "heading_2": {"rich_text": self._parse_inline_rich_text(el, ignore_block_color=True), "color": b_color, "is_toggleable": False},
                 })
             elif tag == "h3":
+                b_color = _get_element_block_color(classes)
                 blocks.append({
                     "id": el_id,
                     "type": "heading_3",
-                    "heading_3": {"rich_text": self._parse_inline_rich_text(el), "is_toggleable": False},
+                    "heading_3": {"rich_text": self._parse_inline_rich_text(el, ignore_block_color=True), "color": b_color, "is_toggleable": False},
                 })
 
             # 2. 段落
             elif tag == "p":
+                b_color = _get_element_block_color(classes)
                 blocks.append({
                     "id": el_id,
                     "type": "paragraph",
-                    "paragraph": {"rich_text": self._parse_inline_rich_text(el)},
+                    "paragraph": {"rich_text": self._parse_inline_rich_text(el, ignore_block_color=True), "color": b_color},
                 })
 
             # 3. 箇条書きリスト
             elif tag == "ul" and "bulleted-list" in classes:
                 for li in el.find_all("li", recursive=False):
                     li_id = li.get("id") or el_id
+                    li_color = _get_element_block_color(li.get("class", []))
                     rich_texts, child_blocks = self._extract_list_item_content(
                         li, zf, current_dir, db_csv_map=db_csv_map
                     )
                     blocks.append({
                         "id": li_id,
                         "type": "bulleted_list_item",
-                        "bulleted_list_item": {"rich_text": rich_texts},
+                        "bulleted_list_item": {"rich_text": rich_texts, "color": li_color},
                         "children_blocks": child_blocks,
                         "has_children": bool(child_blocks),
                     })
@@ -1078,13 +1096,14 @@ class HtmlZipExtractor:
             elif tag == "ol" and "numbered-list" in classes:
                 for li in el.find_all("li", recursive=False):
                     li_id = li.get("id") or el_id
+                    li_color = _get_element_block_color(li.get("class", []))
                     rich_texts, child_blocks = self._extract_list_item_content(
                         li, zf, current_dir, db_csv_map=db_csv_map
                     )
                     blocks.append({
                         "id": li_id,
                         "type": "numbered_list_item",
-                        "numbered_list_item": {"rich_text": rich_texts},
+                        "numbered_list_item": {"rich_text": rich_texts, "color": li_color},
                         "children_blocks": child_blocks,
                         "has_children": bool(child_blocks),
                     })
@@ -1139,11 +1158,12 @@ class HtmlZipExtractor:
 
             # 7. 引用
             elif tag == "blockquote":
+                b_color = _get_element_block_color(classes)
                 rich_texts, child_blocks = self._extract_list_item_content(el, zf, current_dir, db_csv_map=db_csv_map)
                 blocks.append({
                     "id": el_id,
                     "type": "quote",
-                    "quote": {"rich_text": rich_texts},
+                    "quote": {"rich_text": rich_texts, "color": b_color},
                     "children_blocks": child_blocks,
                     "has_children": bool(child_blocks),
                 })
@@ -1324,7 +1344,7 @@ class HtmlZipExtractor:
                 })
 
             # 14. 画像 / 子ページリンク / 外部ファイル・動画・音声・埋め込み
-            elif tag == "figure" or "link-to-page" in classes:
+            elif tag == "figure" or "link-to-page" in classes or "file" in classes or "source" in classes or "pdf" in classes:
                 a_tag = el.find("a")
                 href = a_tag.get("href") if a_tag else ""
                 img_tag = el.find("img")
@@ -1412,25 +1432,13 @@ class HtmlZipExtractor:
                             blocks.append(block_obj)
                 elif href:
                     lower_href = href.lower()
-                    if lower_href.endswith(".pdf"):
-                        blocks.append({
-                            "id": el_id,
-                            "type": "pdf",
-                            "pdf": {"type": "external", "external": {"url": href}},
-                        })
-                    elif lower_href.endswith((".mp3", ".wav", ".m4a", ".aac")):
-                        blocks.append({
-                            "id": el_id,
-                            "type": "audio",
-                            "audio": {"type": "external", "external": {"url": href}},
-                        })
-                    elif lower_href.endswith((".mp4", ".mov", ".webm")) or "youtube.com" in lower_href or "youtu.be" in lower_href:
-                        blocks.append({
-                            "id": el_id,
-                            "type": "video",
-                            "video": {"type": "external", "external": {"url": href}},
-                        })
-                    elif "bookmark" in classes or el.find(class_="bookmark"):
+                    is_external = href.startswith(("http://", "https://"))
+                    att_filename = os.path.basename(urllib.parse.unquote(href))
+                    zip_bytes = None
+                    if not is_external:
+                        zip_bytes, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, href)
+
+                    if "bookmark" in classes or el.find(class_="bookmark"):
                         blocks.append({
                             "id": el_id,
                             "type": "bookmark",
@@ -1442,12 +1450,70 @@ class HtmlZipExtractor:
                             "type": "embed",
                             "embed": {"url": href},
                         })
+                    elif lower_href.endswith(".pdf"):
+                        pdf_obj = {
+                            "id": el_id,
+                            "type": "pdf",
+                            "pdf": {
+                                "type": "file" if zip_bytes else "external",
+                                "caption": caption_rich,
+                                "external": {"url": href} if is_external or not zip_bytes else None,
+                                "file": {"url": att_filename} if zip_bytes else None,
+                            },
+                            "_attachment_filename": att_filename,
+                        }
+                        if zip_bytes:
+                            pdf_obj["_attachment_bytes"] = zip_bytes
+                            logger.info(f"Loaded inline PDF attachment from ZIP: {resolved_path} ({len(zip_bytes)} bytes)")
+                        blocks.append(pdf_obj)
+                    elif lower_href.endswith((".mp3", ".wav", ".m4a", ".aac")):
+                        audio_obj = {
+                            "id": el_id,
+                            "type": "audio",
+                            "audio": {
+                                "type": "file" if zip_bytes else "external",
+                                "caption": caption_rich,
+                                "external": {"url": href} if is_external or not zip_bytes else None,
+                                "file": {"url": att_filename} if zip_bytes else None,
+                            },
+                            "_attachment_filename": att_filename,
+                        }
+                        if zip_bytes:
+                            audio_obj["_attachment_bytes"] = zip_bytes
+                            logger.info(f"Loaded inline audio attachment from ZIP: {resolved_path} ({len(zip_bytes)} bytes)")
+                        blocks.append(audio_obj)
+                    elif lower_href.endswith((".mp4", ".mov", ".webm")) or "youtube.com" in lower_href or "youtu.be" in lower_href:
+                        video_obj = {
+                            "id": el_id,
+                            "type": "video",
+                            "video": {
+                                "type": "file" if zip_bytes else "external",
+                                "caption": caption_rich,
+                                "external": {"url": href} if is_external or not zip_bytes else None,
+                                "file": {"url": att_filename} if zip_bytes else None,
+                            },
+                            "_attachment_filename": att_filename,
+                        }
+                        if zip_bytes:
+                            video_obj["_attachment_bytes"] = zip_bytes
+                            logger.info(f"Loaded inline video attachment from ZIP: {resolved_path} ({len(zip_bytes)} bytes)")
+                        blocks.append(video_obj)
                     else:
-                        blocks.append({
+                        file_obj = {
                             "id": el_id,
                             "type": "file",
-                            "file": {"type": "external", "external": {"url": href}},
-                        })
+                            "file": {
+                                "type": "file" if zip_bytes else "external",
+                                "caption": caption_rich,
+                                "external": {"url": href} if is_external or not zip_bytes else None,
+                                "file": {"url": att_filename} if zip_bytes else None,
+                            },
+                            "_attachment_filename": att_filename,
+                        }
+                        if zip_bytes:
+                            file_obj["_attachment_bytes"] = zip_bytes
+                            logger.info(f"Loaded inline file attachment from ZIP: {resolved_path} ({len(zip_bytes)} bytes)")
+                        blocks.append(file_obj)
 
             # 15. 単独のimgタグ
             elif tag == "img":
@@ -1528,6 +1594,9 @@ class HtmlZipExtractor:
                 "image",
                 "table-of-contents",
                 "table_of_contents",
+                "file",
+                "source",
+                "pdf",
             )
         ):
             return True
@@ -1687,7 +1756,7 @@ class HtmlZipExtractor:
 
         _process_nodes(list(content_root.children))
 
-        rich_texts = self._parse_inline_rich_text(inline_container, skip_classes=["icon"])
+        rich_texts = self._parse_inline_rich_text(inline_container, skip_classes=["icon"], ignore_block_color=True)
         if rich_texts:
             rich_texts[0]["plain_text"] = rich_texts[0]["plain_text"].lstrip("\n\r ")
             if "text" in rich_texts[0] and isinstance(rich_texts[0]["text"], dict):
@@ -1704,13 +1773,14 @@ class HtmlZipExtractor:
         self,
         node: Tag,
         skip_classes: Optional[List[str]] = None,
+        ignore_block_color: bool = False,
     ) -> List[Dict[str, Any]]:
         """HTMLタグ配下のインラインテキスト（太字・斜体・コード・リンク・文字色・背景色等）をNotion rich_text形式にパースする。"""
         skip_classes = list(skip_classes or [])
         skip_classes.extend(["icon", "page-header-icon", "property-icon"])
         rich_texts = []
 
-        def _extract_highlight_color(tag_el: Tag) -> Optional[str]:
+        def _extract_highlight_color(tag_el: Tag, is_root: bool = False) -> Optional[str]:
             hl = tag_el.get("data-notion-highlight")
             if not hl:
                 t_cls = tag_el.get("class") or []
@@ -1720,7 +1790,7 @@ class HtmlZipExtractor:
                     if cls_item.startswith("highlight-"):
                         hl = cls_item[len("highlight-"):]
                         break
-                    elif cls_item.startswith("block-color-"):
+                    elif not (is_root and ignore_block_color) and cls_item.startswith("block-color-"):
                         hl = cls_item[len("block-color-"):]
                         break
             if hl:
@@ -1788,7 +1858,7 @@ class HtmlZipExtractor:
 
                     walk(child, new_marks)
 
-        root_hl = _extract_highlight_color(node)
+        root_hl = _extract_highlight_color(node, is_root=True)
         initial_marks: Dict[str, Any] = {}
         if root_hl and root_hl != "default":
             initial_marks["color"] = root_hl
