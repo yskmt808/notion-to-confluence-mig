@@ -483,15 +483,22 @@ class ConfluenceClient:
             time.sleep(2)
         return last_results
 
-    def get_database_views(self, database_id: str) -> List[Dict[str, Any]]:
+    def get_database_views(self, database_id: str, retries: int = 3, delay: float = 2.0) -> List[Dict[str, Any]]:
         """Confluence Databases の定義済みビュー一覧を取得する。"""
         url = f"{self.base_url}/api/v2/databases/{database_id}/views"
-        try:
-            res = requests.get(url, auth=self.auth, timeout=15)
-            if res.ok:
-                return res.json().get("results", [])
-        except Exception as e:
-            logger.warning(f"Failed to get database views for {database_id}: {e}")
+        for attempt in range(retries):
+            try:
+                res = requests.get(url, auth=self.auth, timeout=15)
+                if res.ok:
+                    results = res.json().get("results", [])
+                    if results or attempt == retries - 1:
+                        return results
+                elif res.status_code == 404 and attempt < retries - 1:
+                    time.sleep(delay)
+            except Exception as e:
+                logger.warning(f"Failed to get database views for {database_id} (attempt {attempt + 1}): {e}")
+                if attempt < retries - 1:
+                    time.sleep(delay)
         return []
 
     def create_database_view(
