@@ -775,43 +775,41 @@ class ConfluenceImporter:
         total_nodes = _count_tree_nodes(root_node)
         if self.dashboard:
             self.dashboard.start(total_nodes)
+            self.dashboard.set_main_task(f"Pass 1: 事前マッピング・タイトル初期化中...")
 
         if self.dashboard:
-            self.dashboard.set_worker_busy(root_node.title, node_type=root_node.node_type)
-        try:
-            self._import_node_recursive(root_node, parent_id=parent_id, overwrite=overwrite)
-        finally:
-            if self.dashboard:
-                self.dashboard.set_worker_idle()
+            self.dashboard.set_main_task(f"Pass 1: ルートノード移行中 [{root_node.title}]")
+        self._import_node_recursive(root_node, parent_id=parent_id, overwrite=overwrite)
 
         # Pass 2: 全ページのリンク解決と更新 (データベースビュー・相互リンクの完全同期)
         logger.info("Executing Pass 2: Resolving embedded database views, pending row views and cross-page links...")
+        if self.dashboard:
+            self.dashboard.set_main_task("Pass 1 完了: 未解決DB行ビューの非同期解決中...")
         # 1. 未解決のデータベース行ビューを非同期解決 (Approach B / Resume)
         self.resolve_pending_database_row_views(root_node)
 
-        if self.dashboard:
-            self.dashboard.set_worker_busy("相互リンク・ビュー更新準備中...", node_type="準備")
-        try:
-            # 2. データベースの最新ビュー一覧を再取得して確実に migration_map を補完
-            for nid, ninfo in self.migration_map.items():
-                if ninfo.get("node_type") == "database":
-                    db_conf_id = ninfo["confluence_id"]
-                    views = self.client.get_database_views(db_conf_id)
-                    ninfo["views"] = {v["name"]: v["id"] for v in views}
-                    logger.info(f"Refreshed views for database [{ninfo['title']}]: {list(ninfo['views'].keys())}")
-
-            self.converter.migration_map = self.migration_map
-
-            # Task B.9: 受信リンク（バックリンク）関係を解析・構築
-            self.incoming_links_map = self._build_incoming_links_map(root_node)
-            logger.info(f"Built incoming links map for {len(self.incoming_links_map)} target pages.")
-        finally:
+        # 2. データベースの最新ビュー一覧を再取得して確実に migration_map を補完
+        db_items = [(nid, ninfo) for nid, ninfo in self.migration_map.items() if ninfo.get("node_type") == "database"]
+        for i, (nid, ninfo) in enumerate(db_items, 1):
+            db_conf_id = ninfo["confluence_id"]
             if self.dashboard:
-                self.dashboard.set_worker_idle()
+                self.dashboard.set_main_task(f"Pass 2: データベース最新ビュー再取得中 ({i}/{len(db_items)}: [{ninfo['title']}])")
+            views = self.client.get_database_views(db_conf_id)
+            ninfo["views"] = {v["name"]: v["id"] for v in views}
+            logger.info(f"Refreshed views for database [{ninfo['title']}]: {list(ninfo['views'].keys())}")
+
+        self.converter.migration_map = self.migration_map
+
+        if self.dashboard:
+            self.dashboard.set_main_task("Pass 2: 相互リンク・バックリンク構造を解析中...")
+        # Task B.9: 受信リンク（バックリンク）関係を解析・構築
+        self.incoming_links_map = self._build_incoming_links_map(root_node)
+        logger.info(f"Built incoming links map for {len(self.incoming_links_map)} target pages.")
 
         self._resolve_and_update_page_links(root_node)
 
         if self.dashboard:
+            self.dashboard.set_main_task("全ノードの移行完了")
             self.dashboard.finish()
 
         return self.migration_map
@@ -973,11 +971,15 @@ class ConfluenceImporter:
         workers = min(self.page_workers, len(all_nodes))
         if workers > 1:
             logger.info(f"Pass 2: Concurrently resolving links for {len(all_nodes)} nodes with {workers} worker threads...")
+            if self.dashboard:
+                self.dashboard.set_main_task(f"Pass 2: リンク・ビュー並行更新中 (ワーカー待機中: {len(all_nodes)} 件)")
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [executor.submit(self._resolve_and_update_single_node, n) for n in all_nodes]
                 for future in concurrent.futures.as_completed(futures):
                     future.result()
         else:
+            if self.dashboard:
+                self.dashboard.set_main_task(f"Pass 2: リンク・ビュー更新中 ({len(all_nodes)} 件)")
             for n in all_nodes:
                 self._resolve_and_update_single_node(n)
 
@@ -1119,7 +1121,7 @@ class ConfluenceImporter:
                 return
 
             if self.dashboard:
-                self.dashboard.set_worker_busy(f"DB同期: {node.title}", node_type="DB同期")
+                self.dashboard.set_main_task(f"Pass 2: DB同期中 [{node.title}] (残り {len(pending_ids)} 件)")
             try:
                 db_conf_id = db_info["confluence_id"] if db_info else self.checkpoint.get_node_info(node.id).get("confluence_id")
                 expected = len(node.children)
@@ -1575,6 +1577,8 @@ class ConfluenceImporter:
                 workers = min(self.page_workers, len(unmigrated_children))
                 if workers > 1:
                     logger.info(f"Concurrently creating {len(unmigrated_children)} child pages for [{node.title}] with {workers} worker threads...")
+                    if self.dashboard:
+                        self.dashboard.set_main_task(f"Pass 1: DB子レコード並行作成中 (DB: [{node.title}], {len(unmigrated_children)} 件)")
                     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                         future_to_child = {executor.submit(_migrate_child_task, c): c for c in unmigrated_children}
                         for future in concurrent.futures.as_completed(future_to_child):
@@ -2011,6 +2015,8 @@ class ConfluenceImporter:
                 f"Concurrently importing {len(children)} sibling nodes under [{parent_node.title}] "
                 f"(Parent ID: {parent_id}) with {workers} worker threads..."
             )
+            if self.dashboard:
+                self.dashboard.set_main_task(f"Pass 1: 子ノード並行作成中 (親: [{parent_node.title}], {len(children)} 件)")
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 future_to_child = {executor.submit(_child_task, c): c for c in children}
                 for future in concurrent.futures.as_completed(future_to_child):
@@ -2037,6 +2043,8 @@ class ConfluenceImporter:
                         valid_cids.append(str(info["confluence_id"]))
 
                 if len(valid_cids) > 1:
+                    if self.dashboard:
+                        self.dashboard.set_main_task(f"Pass 1: 子ノード並び順を整列中 (親: [{parent_node.title}])")
                     for i in range(1, len(valid_cids)):
                         prev_cid = valid_cids[i - 1]
                         curr_cid = valid_cids[i]

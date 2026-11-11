@@ -67,6 +67,10 @@ class MigrationDashboard:
         self.errors_count = 0
         self.warnings_count = 0
 
+        # メインスレッド実行タスク状態
+        self.main_task: str = "待機中 (Idle)"
+        self._last_plain_main_task: str = ""
+
         # ワーカースレッド状態
         self.worker_slots: Dict[int, str] = {}
         for i in range(1, max(2, page_workers) + 1):
@@ -102,6 +106,7 @@ class MigrationDashboard:
             self.start_time = time.time()
             self.pass1_total = total_nodes
             self.pass2_total = total_nodes
+            self.main_task = "Pass 1 開始準備中..."
 
             if not self.enabled:
                 print(f"📊 移行タスク開始: 合計 {total_nodes} ノード (ワーカースレッド数: {self.page_workers})")
@@ -136,25 +141,33 @@ class MigrationDashboard:
         if self.progress:
             grid.add_row(self.progress)
 
-        # ワーカースレッド稼働状況（ワーカー数が複数の場合のみ表示）
-        if self.page_workers > 1:
-            w_table = Table.grid(padding=(0, 1), expand=False)
-            w_table.add_column("Worker", style="bold cyan", min_width=16, max_width=16, no_wrap=True)
-            w_table.add_column("Task", style="dim", min_width=50, max_width=58, no_wrap=True, overflow="ellipsis")
+        # スレッド稼働状況（メインスレッド + ワーカースレッド）
+        t_table = Table.grid(padding=(0, 1), expand=False)
+        t_table.add_column("Thread", style="bold cyan", min_width=16, max_width=16, no_wrap=True)
+        t_table.add_column("Task", style="none", min_width=50, max_width=58, no_wrap=True, overflow="ellipsis")
 
-            # 上位最大8スレッドを表示
+        # 1. メインスレッドの実行タスク表示行（常に最上部に強調表示）
+        main_style = "bold yellow" if self.main_task not in ("待機中 (Idle)", "完了 (Completed)") else "dim"
+        t_table.add_row("🧵 Main Thread:", f"[{main_style}]{escape(self.main_task)}[/{main_style}]")
+
+        # 2. ワーカースレッド並行稼働状況（ワーカー数が複数の場合のみ表示）
+        if self.page_workers > 1:
             visible_slots = sorted(self.worker_slots.keys())[:min(8, self.page_workers)]
             for slot in visible_slots:
                 status = self.worker_slots[slot]
-                w_table.add_row(f"⚡ Worker #{slot}:", escape(status))
+                worker_style = "dim" if status == "待機中 (Idle)" else "green"
+                t_table.add_row(f"⚡ Worker #{slot}:", f"[{worker_style}]{escape(status)}[/{worker_style}]")
+            panel_title = f"スレッド並行稼働状況 (Main + {self.page_workers} workers)"
+        else:
+            panel_title = "スレッド稼働状況 (Main)"
 
-            w_panel = Panel(
-                w_table,
-                title=f"ワーカースレッド並行稼働状況 ({self.page_workers} threads)",
-                border_style="dim",
-                padding=(0, 1),
-            )
-            grid.add_row(w_panel)
+        t_panel = Panel(
+            t_table,
+            title=panel_title,
+            border_style="dim",
+            padding=(0, 1),
+        )
+        grid.add_row(t_panel)
 
         # メトリクスフッター
         now = time.time()
@@ -236,8 +249,24 @@ class MigrationDashboard:
             self.warnings_count += 1
             self._refresh()
 
+    def set_main_task(self, task_name: str):
+        """メインスレッドで実行中のシーケンシャル処理タスク表示を更新する。"""
+        with self._lock:
+            # 日本語全角文字の端末幅を考慮し、最大50文字程度に安全に切り詰めて行折り返しを防ぐ
+            short_task = task_name if len(task_name) <= 50 else task_name[:47] + "..."
+            self.main_task = short_task
+            if not self.enabled:
+                if self._last_plain_main_task != short_task:
+                    self._last_plain_main_task = short_task
+                    print(f"🧵 [Main Thread] {short_task}")
+            self._refresh()
+
     def set_worker_busy(self, title: str, node_type: str = "page"):
-        """現在のスレッドの作業内容を更新する。"""
+        """現在のスレッドの作業内容を更新する。メインスレッドから呼ばれた場合は set_main_task に委譲する。"""
+        if self.page_workers > 1 and threading.current_thread() is threading.main_thread():
+            self.set_main_task(f"[{node_type}] {title}")
+            return
+
         slot = self._get_worker_slot()
         with self._lock:
             # 日本語全角文字の端末幅を考慮し、最大26文字程度に安全に切り詰めて行折り返しを防ぐ
@@ -247,6 +276,9 @@ class MigrationDashboard:
 
     def set_worker_idle(self):
         """現在のスレッドを待機状態に戻し、スロット番号を返却する。"""
+        if self.page_workers > 1 and threading.current_thread() is threading.main_thread():
+            return
+
         tid = threading.get_ident()
         with self._lock:
             slot = self._thread_to_slot.pop(tid, None)
@@ -271,6 +303,7 @@ class MigrationDashboard:
     def finish(self):
         """ダッシュボードの表示を終了し、最終サマリーを出力する。"""
         with self._lock:
+            self.main_task = "完了 (Completed)"
             if self.enabled and self.live:
                 try:
                     self._refresh()

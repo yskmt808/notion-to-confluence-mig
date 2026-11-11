@@ -95,6 +95,64 @@ class TestMigrationDashboard(unittest.TestCase):
         self.assertEqual(sorted(d._available_slots), [1, 2])
         d.finish()
 
+    def test_main_thread_task_display_and_renderable(self):
+        """メインスレッドのタスク表示行がダッシュボード上で正しく記録・描画されること"""
+        from rich.console import Console
+
+        d = MigrationDashboard(enabled=True, page_workers=4, space_key="TEST")
+        d.start(total_nodes=20)
+        self.assertEqual(d.main_task, "Pass 1 開始準備中...")
+
+        d.set_main_task("Pass 2: データベース最新ビュー再取得中 (1/2: 無題)")
+        self.assertEqual(d.main_task, "Pass 2: データベース最新ビュー再取得中 (1/2: 無題)")
+
+        renderable = d._build_renderable()
+        c = Console(record=True, width=100)
+        c.print(renderable)
+        text = c.export_text()
+
+        self.assertIn("Main Thread:", text)
+        self.assertIn("Pass 2: データベース最新ビュー再取得中", text)
+        self.assertIn("スレッド並行稼働状況 (Main + 4 workers)", text)
+
+        d.finish()
+        self.assertEqual(d.main_task, "完了 (Completed)")
+
+    def test_main_thread_set_worker_busy_delegates_safely(self):
+        """メインスレッドから set_worker_busy が呼ばれた場合、ワーカー枠を消費せずメインスレッドタスクとして記録されること"""
+        d = MigrationDashboard(enabled=False, page_workers=4, space_key="TEST")
+        d.start(total_nodes=10)
+
+        # メインスレッドから set_worker_busy を呼び出し
+        d.set_worker_busy("相互リンク・ビュー更新準備中...", node_type="準備")
+        self.assertEqual(d.main_task, "[準備] 相互リンク・ビュー更新準備中...")
+        # ワーカースロットはすべて待機中 (Idle) のままであること
+        for slot in range(1, 5):
+            self.assertEqual(d.worker_slots[slot], "待機中 (Idle)")
+
+        d.set_worker_idle()
+        for slot in range(1, 5):
+            self.assertEqual(d.worker_slots[slot], "待機中 (Idle)")
+        d.finish()
+
+    def test_main_thread_task_in_single_worker_mode(self):
+        """page_workers=1 の場合でもメインスレッド稼働状況が正しく描画されること"""
+        from rich.console import Console
+
+        d = MigrationDashboard(enabled=True, page_workers=1, space_key="TEST")
+        d.start(total_nodes=5)
+        d.set_main_task("Pass 1: ルートノード移行中")
+
+        renderable = d._build_renderable()
+        c = Console(record=True, width=100)
+        c.print(renderable)
+        text = c.export_text()
+
+        self.assertIn("Main Thread:", text)
+        self.assertIn("Pass 1: ルートノード移行中", text)
+        self.assertIn("スレッド稼働状況 (Main)", text)
+        d.finish()
+
 
 if __name__ == "__main__":
     unittest.main()
