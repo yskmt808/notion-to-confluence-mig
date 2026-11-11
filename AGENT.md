@@ -69,10 +69,15 @@
    - Confluence Cloud標準ではLaTeXマクロが無効（エラー表示）となるため、ローカルPCで生成した300dpiの高解像度PNG画像を添付ファイル化し `<ac:image>` で配置。
 2. **トグル見出し（Toggle Heading）**:
    - Expandマクロのtitle属性では見出し装飾が無効化されるため、見出しタグ（`<h1>`〜`<h3>`）を先行出力し、直下に折りたたみブロック（Expandマクロ）を配置する。
-3. **子ページリンク / データベースリンク**:
-   - `<ac:link ac:card-appearance="inline"><ri:page ri:content-title="..." /><ac:link-body>...</ac:link-body></ac:link>` によるスマートリンク（プレビュー対応）形式で出力。
+3. **子ページリンク / データベースリンク / ページ内リンク**:
+   - 通常のページ参照・メンションは `<ac:link ac:card-appearance="inline"><ri:page ri:content-title="..." /><ac:link-body>...</ac:link-body></ac:link>` によるスマートリンク（プレビュー対応）形式で出力。
+   - **カスタム表示テキスト・アンカーリンクの保持**: 表示テキストがターゲットページのタイトルと異なる場合（例: 「熊本城」「見出し１」等のエイリアス名やアンカー指定）、Confluence Cloudのスマートカード（`ac:card-appearance="inline"`）が付与されるとWeb UI上で表示テキストがターゲットページ名に動的上書きされてしまう。そのため、カスタム名やアンカーを持つリンクでは `ac:card-appearance` を意図的に省略し、通常のハイパーリンクとして表示テキストを確実に保持する。
 4. **ページアイコン（Emoji）**:
    - ConfluenceのContent Properties（`emoji-title-published`, `emoji-title-draft`）にhexコードを設定して完全同期する。
+5. **PDF・添付ファイルビューア**:
+   - PDFブロックはConfluenceのネイティブプレビューマクロ `<ac:structured-macro ac:name="view-file">` の単一出力とし、直下に重複するダウンロード用 `<ac:link>` リンクを重複生成しない。
+6. **空のデータベースレコード（無題・本文なし）の自動スキップ**:
+   - Notion側でタイトルが未設定（Untitled）かつ本文ブロック・独自プロパティを持たない空レコード行について、Confluence側で無意味な「Untitled Page」子ページが量産されるのを防ぐため、子ページ作成を自動スキップする。
 
 ---
 
