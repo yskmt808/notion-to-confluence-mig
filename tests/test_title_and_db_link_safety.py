@@ -269,7 +269,7 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
         self.assertIn('<ac:link ac:card-appearance="inline">', html_out)
         self.assertIn('<ri:page ri:content-title="Block A: プロジェクト管理・基盤" />', html_out)
 
-        # 1-2. カスタムリンク名の場合はページ名への上書きを防ぐため card-appearance を付与しない
+        # 1-2. ページ間リンク（別ページへのリンク）はカスタム表示名であっても Confluence インラインリンクオブジェクト形式となること
         rich_text_custom = [{
             "type": "text",
             "text": {
@@ -279,8 +279,16 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
             "plain_text": "Block A へのリンク",
         }]
         html_custom = conv.convert_rich_text(rich_text_custom)
-        self.assertNotIn('<ac:link ac:card-appearance="inline">', html_custom)
+        self.assertIn('<ac:link ac:card-appearance="inline">', html_custom)
+        self.assertIn('<ri:page ri:content-title="Block A: プロジェクト管理・基盤" />', html_custom)
         self.assertIn('<ac:link-body>Block A へのリンク</ac:link-body>', html_custom)
+
+        # 1-3. タイトルプレフィックスが付与されている別ページへのリンクでも card-appearance="inline" が維持されること
+        conv.migration_map["4117be77-284d-8159-abc8-fa6cce1ccf00"]["title"] = "[20261112-TEST] Block A: プロジェクト管理・基盤"
+        html_prefixed = conv.convert_rich_text(rich_text_custom)
+        self.assertIn('<ac:link ac:card-appearance="inline">', html_prefixed)
+        self.assertIn('<ri:page ri:content-title="[20261112-TEST] Block A: プロジェクト管理・基盤" />', html_prefixed)
+        conv.migration_map["4117be77-284d-8159-abc8-fa6cce1ccf00"]["title"] = "Block A: プロジェクト管理・基盤"
 
         # 2. child_page ブロックのインラインリンクオブジェクト
         blocks = [{

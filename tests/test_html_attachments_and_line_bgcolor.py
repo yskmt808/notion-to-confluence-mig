@@ -283,8 +283,9 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         self.assertNotIn('<ac:link>', html)
 
     def test_converter_custom_link_text_no_card_appearance(self):
-        """カスタム表示名（例: 熊本城）を持つページリンクで ac:card-appearance="inline" が付与されないこと。"""
+        """自ページへのリンクやアンカー指定リンクで ac:card-appearance="inline" が付与されずカスタム名（例: 熊本城）が維持されること。"""
         self.converter.id_to_title_map = {"p123": "エラーパターン"}
+        self.converter.current_node_id = "p123"
         rich_texts = [
             {
                 "type": "text",
@@ -297,6 +298,20 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         self.assertIn('ri:content-title="エラーパターン"', html)
         self.assertIn('<ac:link-body>熊本城</ac:link-body>', html)
         self.assertNotIn('ac:card-appearance="inline"', html)
+
+        # アンカー指定リンクの場合も card-appearance が付与されないこと
+        self.converter.id_to_title_map["4117be77-284d-8159-abc8-fa6cce1ccf00"] = "別ページ"
+        self.converter.current_node_id = "other-page"
+        rich_anchor = [
+            {
+                "type": "text",
+                "text": {"content": "セクションA", "link": {"url": "https://app.notion.com/p/Block-A-4117be77284d8159abc8fa6cce1ccf00#sec-a"}},
+                "plain_text": "セクションA",
+            }
+        ]
+        html_anchor = self.converter.convert_rich_text(rich_anchor)
+        self.assertIn('ac:anchor="sec-a"', html_anchor)
+        self.assertNotIn('ac:card-appearance="inline"', html_anchor)
 
     def test_html_extractor_unwraps_synced_block_div(self):
         """同期ブロック（ネストされたdiv）内のコールアウトが正常に抽出されること。"""

@@ -1367,24 +1367,33 @@ class ConfluenceImporter:
                 self._process_attachments(b["children_blocks"], page_id, uploaded_filenames=uploaded_filenames)
 
     def _resolve_unique_page_title(
-        self, base_title: str, notion_node_id: str, allow_existing_overwrite: bool = True
+        self, base_title: str, notion_node_id: str, allow_existing_overwrite: bool = True, is_database: bool = False
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """NotionノードのタイトルがConfluenceスペース内で重複している場合、安全にユニークなタイトルを採番する。"""
+        """Notionノード（ページまたはデータベース）のタイトルがConfluenceスペース内で重複している場合、安全にユニークなタイトルを採番する。"""
         with self._lock:
             if notion_node_id in self._node_to_title:
                 assigned = self._node_to_title[notion_node_id]
-                existing = self.client.get_page_by_title(space_key=self.space_key, title=assigned)
+                existing = (
+                    self.client.get_database_by_title(space_key=self.space_key, title=assigned)
+                    if is_database
+                    else self.client.get_page_by_title(space_key=self.space_key, title=assigned)
+                )
                 return assigned, existing
 
-            # Confluenceのページタイトル最大文字数は255文字。サフィックス付与（例: " (2)"）を考慮し240文字に安全に切り詰め
-            cleaned_title = (base_title or "Untitled").strip().replace("\n", " ").replace("\r", "")
+            # Confluenceのページ/データベースタイトル最大文字数は255文字。サフィックス付与（例: " (2)"）を考慮し240文字に安全に切り詰め
+            default_t = "Untitled Database" if is_database else "Untitled"
+            cleaned_title = (base_title or default_t).strip().replace("\n", " ").replace("\r", "")
             if len(cleaned_title) > 240:
                 cleaned_title = cleaned_title[:237] + "..."
 
             target_title = cleaned_title
-            existing_page = self.client.get_page_by_title(space_key=self.space_key, title=target_title)
+            existing_page = (
+                self.client.get_database_by_title(space_key=self.space_key, title=target_title)
+                if is_database
+                else self.client.get_page_by_title(space_key=self.space_key, title=target_title)
+            )
 
-            # 既存ページの ID が migration_map で既に別の notion_node_id にマッピングされている場合は上書き禁止
+            # 既存ページ/DB の ID が migration_map で既に別の notion_node_id にマッピングされている場合は上書き禁止
             existing_page_claimed_by_other = False
             if existing_page:
                 eid = str(existing_page.get("id"))
@@ -1393,7 +1402,7 @@ class ConfluenceImporter:
                         existing_page_claimed_by_other = True
                         break
 
-            # 既存ページが存在し、かつ同一実行内でまだどのノードにも予約されていない場合に限り上書きを許可
+            # 既存ページ/DBが存在し、かつ同一実行内でまだどのノードにも予約されていない場合に限り上書きを許可
             can_overwrite = (
                 existing_page is not None
                 and allow_existing_overwrite
@@ -1409,7 +1418,11 @@ class ConfluenceImporter:
                     if len(candidate) > 255:
                         candidate = candidate[:255]
                     if candidate not in self._reserved_titles:
-                        cand_existing = self.client.get_page_by_title(space_key=self.space_key, title=candidate)
+                        cand_existing = (
+                            self.client.get_database_by_title(space_key=self.space_key, title=candidate)
+                            if is_database
+                            else self.client.get_page_by_title(space_key=self.space_key, title=candidate)
+                        )
                         if cand_existing is None:
                             target_title = candidate
                             existing_page = None
@@ -1425,7 +1438,7 @@ class ConfluenceImporter:
                                 existing_page = cand_existing
                                 break
                     suffix += 1
-                logger.info(f"Resolved duplicate page title conflict in Confluence: [{base_title}] -> [{target_title}] (Node ID: {notion_node_id})")
+                logger.info(f"Resolved duplicate {'database' if is_database else 'page'} title conflict in Confluence: [{base_title}] -> [{target_title}] (Node ID: {notion_node_id})")
 
             self._reserved_titles.add(target_title)
             self._node_to_title[notion_node_id] = target_title
@@ -1509,6 +1522,15 @@ class ConfluenceImporter:
             self.dashboard.set_worker_busy(node.title, node_type=node.node_type)
 
         if node.node_type == "database":
+            # 重複タイトル解決（同名DBが存在する場合に安全にユニークタイトルを採番）
+            target_title, existing_db = self._resolve_unique_page_title(
+                base_title=node.title,
+                notion_node_id=node.id,
+                allow_existing_overwrite=overwrite,
+                is_database=True,
+            )
+            node.title = target_title
+
             # Confluence Databases (type: database) をネイティブ作成
             legacy_page = self.client.get_page_by_title(
                 space_key=self.space_key,
@@ -1518,10 +1540,6 @@ class ConfluenceImporter:
                 logger.info(f"Removing legacy page for database overwrite: [{node.title}] (ID: {legacy_page['id']})")
                 self.client.delete_page(legacy_page["id"])
 
-            existing_db = self.client.get_database_by_title(
-                space_key=self.space_key,
-                title=node.title,
-            )
             if existing_db and overwrite:
                 logger.info(f"Removing existing Confluence Database for fresh recreation: [{node.title}] (ID: {existing_db['id']})")
                 self.client.delete_database(existing_db["id"])

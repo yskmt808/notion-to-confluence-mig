@@ -1339,7 +1339,8 @@ class HtmlZipExtractor:
                     "id": el_id,
                     "type": "child_database",
                     "is_linked_database": True,
-                    "data_sources": [{"name": db_title}],
+                    "data_sources": [{"name": db_title, "id": el_id}],
+                    "database_id": el_id,
                     "views": [view_info],
                 })
 

@@ -229,17 +229,33 @@ class MigrationVerifier:
             else:
                 issues.append(f"Unsupported Notion blocks detected ({', '.join(u_names)}), but fallback note was not found in Confluence body.")
 
-        # 5-c. カスタムリンク名がページタイトルで上書きされる不正なインラインスマートカードの検知
+        # 5-c. ページ内リンク（アンカー指定または自ページへのリンク）において、カスタムリンク名がページタイトルで上書きされる不正なインラインスマートカードの検知
+        def _is_self_page_title(target_t: str, ref_t: str) -> bool:
+            if not target_t or not ref_t:
+                return False
+            if target_t == ref_t:
+                return True
+            # タイトル重複解決サフィックス " (2)" や切り詰め "..." のみを自ページと判定
+            clean_ref = re.sub(r"\s*\(\d+\)$", "", ref_t).rstrip(".")
+            if target_t.startswith(clean_ref):
+                remainder = target_t[len(clean_ref):]
+                if not remainder or remainder.startswith("...") or re.match(r"^\s*\(\d+\)$", remainder):
+                    return True
+            return False
+
         soup_storage = BeautifulSoup(storage_body, "html.parser")
         for a_link in soup_storage.find_all(lambda t: t.name in ("ac:link", "link")):
             if a_link.get("ac:card-appearance") == "inline":
                 ri_page = a_link.find(lambda t: t.name in ("ri:page", "page"))
                 page_title = ri_page.get("ri:content-title", "") if ri_page else ""
-                link_body = a_link.find(lambda t: t.name in ("ac:link-body", "link-body", "ac:plain-text-link-body"))
-                if link_body:
-                    body_txt = link_body.get_text(strip=True)
-                    if body_txt and page_title and body_txt != page_title and not body_txt.startswith(("http://", "https://")):
-                        issues.append(f"Inline smart card link overwriting custom link text '{body_txt}' with target page title '{page_title}'.")
+                has_anchor = bool(a_link.get("ac:anchor"))
+                is_self_page = _is_self_page_title(page_title, conf_title) or _is_self_page_title(page_title, expected_title)
+                if has_anchor or is_self_page:
+                    link_body = a_link.find(lambda t: t.name in ("ac:link-body", "link-body", "ac:plain-text-link-body"))
+                    if link_body:
+                        body_txt = link_body.get_text(strip=True)
+                        if body_txt and page_title and body_txt != page_title and not body_txt.startswith(("http://", "https://")):
+                            issues.append(f"Inline smart card link overwriting custom link text '{body_txt}' with target page title '{page_title}'.")
 
         # 6. 主要テキストの含有チェック（Notionブロック内のプレーンテキストが欠落していないか）
         missing_snippets = []
@@ -309,18 +325,22 @@ class MigrationVerifier:
             }
 
         conf_title = db_data.get("title", "")
-        # 1-a. タイトル検証 (240文字制限による切り詰めを考慮)
+        # 1-a. タイトル検証 (240文字制限による切り詰めや重複解決サフィックスを考慮)
         expected_title = node.title
         expected_truncated = expected_title[:237] + "..." if len(expected_title) > 240 else expected_title
         is_untitled_match = (
             (not expected_title.strip() or expected_title in ("Untitled Database", "無題のデータベース", "Untitled"))
             and conf_title in ("Untitled Database", "無題のデータベース", "Untitled", "")
         )
+        is_dedup_suffix_match = bool(
+            re.sub(r"\s*\(\d+\)$", "", conf_title).strip() == re.sub(r"\s*\(\d+\)$", "", expected_title).strip()
+        )
         if (
             conf_title == expected_title
             or conf_title == expected_truncated
             or (len(conf_title) >= 237 and expected_title.startswith(conf_title.rstrip(".")))
             or is_untitled_match
+            or is_dedup_suffix_match
         ):
             checks_passed.append(f"Database title match: '{conf_title}'")
         else:

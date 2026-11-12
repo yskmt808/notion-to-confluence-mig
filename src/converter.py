@@ -148,6 +148,8 @@ class NotionToConfluenceConverter:
         self.confluence_base_url: str = ""
         self.space_key: str = ""
         self.user_mapper = user_mapper
+        self.current_node_id: Optional[str] = None
+        self.current_page_title: Optional[str] = None
         from src.timezone_util import resolve_timezone
         self.timezone = resolve_timezone(timezone)
 
@@ -523,16 +525,30 @@ class NotionToConfluenceConverter:
                     disp_title = (target_info.get("title") if target_info else None) or target_title or escaped
                     escaped_title = html.escape(disp_title)
                     anchor_attr = f' ac:anchor="{html.escape(anchor_name)}"' if anchor_name else ""
-                    # 表示テキストがターゲットページのタイトルと異なる場合（カスタムリンク名）、
-                    # またはアンカー指定がある場合は、Confluenceがインラインカード化して表示テキストをページ名に置き換えるのを防ぐため card-appearance を付与しない
-                    raw_plain = item.get("plain_text") or (item.get("text") or {}).get("content", "")
-                    has_custom_label = bool(
-                        raw_plain
-                        and raw_plain.strip()
-                        and raw_plain.strip() != disp_title.strip()
-                        and not raw_plain.strip().startswith(("http://", "https://"))
-                    )
-                    card_attr = "" if (anchor_name or has_custom_label) else ' ac:card-appearance="inline"'
+
+                    # 自ページ（現在変換中のページ）へのリンクかどうか判定
+                    is_self_page = False
+                    if target_uuid and getattr(self, "current_node_id", None):
+                        norm_target = target_uuid.replace("-", "").lower()
+                        norm_current = self.current_node_id.replace("-", "").lower()
+                        if norm_target == norm_current:
+                            is_self_page = True
+                    elif disp_title and getattr(self, "current_page_title", None):
+                        curr_t = self.current_page_title.strip()
+                        disp_t = disp_title.strip()
+                        if curr_t == disp_t:
+                            is_self_page = True
+                        else:
+                            clean_curr = re.sub(r"\s*\(\d+\)$", "", curr_t).rstrip(".")
+                            clean_disp = re.sub(r"\s*\(\d+\)$", "", disp_t).rstrip(".")
+                            if clean_curr == clean_disp:
+                                is_self_page = True
+
+                    # ページ内リンク（アンカー指定あり、または同一自ページへのリンク）は、Confluenceがインラインカード化して
+                    # アンカーや表示テキスト（例:「熊本城」）をページ名に置き換えるのを防ぐため card-appearance を付与しない。
+                    # 一方、別ページへのリンク（ページ間リンク）は、常にConfluenceのインラインリンクオブジェクト（ac:card-appearance="inline"）とする。
+                    is_in_page_link = bool(anchor_name or is_self_page)
+                    card_attr = "" if is_in_page_link else ' ac:card-appearance="inline"'
                     escaped = (
                         f'<ac:link{card_attr}{anchor_attr}>'
                         f'<ri:page ri:content-title="{escaped_title}" />'
@@ -883,12 +899,33 @@ class NotionToConfluenceConverter:
 
                     db_info = None
                     if hasattr(self, "migration_map") and self.migration_map:
-                        for mid, minfo in self.migration_map.items():
-                            if minfo.get("node_type") == "database":
-                                m_title = minfo.get("title", "")
-                                if m_title == source_name or m_title.endswith(source_name):
+                        # 1. UUIDによる直接探索を最優先 (ブロックID, database_id, data_sourcesのID)
+                        candidate_ids = []
+                        if b.get("database_id"):
+                            candidate_ids.append(b.get("database_id"))
+                        if b.get("id"):
+                            candidate_ids.append(b.get("id"))
+                        for ds in data_sources:
+                            if isinstance(ds, dict) and ds.get("id"):
+                                candidate_ids.append(ds.get("id"))
+
+                        for cid in candidate_ids:
+                            norm_cid = cid.replace("-", "").lower()
+                            for mid, minfo in self.migration_map.items():
+                                if mid.replace("-", "").lower() == norm_cid and minfo.get("node_type") == "database":
                                     db_info = minfo
                                     break
+                            if db_info:
+                                break
+
+                        # 2. 見つからない場合はタイトルによるフォールバック
+                        if not db_info and source_name:
+                            for mid, minfo in self.migration_map.items():
+                                if minfo.get("node_type") == "database":
+                                    m_title = minfo.get("title", "")
+                                    if m_title == source_name or m_title.endswith(source_name):
+                                        db_info = minfo
+                                        break
 
                     if db_info:
                         db_url = db_info.get("url")
@@ -967,6 +1004,10 @@ class NotionToConfluenceConverter:
                             target_view_id = next((vid for name, vid in conf_views.items() if "完了" in name), None)
                         else:
                             target_view_id = next((vid for name, vid in conf_views.items() if "すべてのデータ" in name or "default" in name.lower()), None)
+                            if not target_view_id and v_name in conf_views:
+                                target_view_id = conf_views[v_name]
+                            if not target_view_id and conf_views:
+                                target_view_id = next(iter(conf_views.values()), None)
 
                         embed_html = self.generate_database_view_embed(db_url, target_view_id)
 
@@ -1658,6 +1699,8 @@ class NotionToConfluenceConverter:
         incoming_links: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """PageNodeのデータからConfluenceページ用の本文 (Storage Format) を生成する。"""
+        self.current_node_id = getattr(node, "id", None)
+        self.current_page_title = getattr(node, "title", None)
         cover_html = ""
         cover_file = getattr(node, "_cover_filename", None) or (
             f"cover_{node.id.replace('-', '')[:8]}.jpg" if getattr(node, "cover", None) else None
