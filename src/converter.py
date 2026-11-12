@@ -153,6 +153,9 @@ class NotionToConfluenceConverter:
         self.current_page_headings: Set[str] = set()
         self.current_page_block_anchors: Dict[str, str] = {}
         self.referenced_anchors: Set[str] = set()
+        self.inpage_repair_candidates: List[Dict[str, Any]] = []
+        self.current_block_id: Optional[str] = None
+        self.explicit_link_anchors: Dict[Tuple[str, str], str] = {}
         from src.timezone_util import resolve_timezone
         self.timezone = resolve_timezone(timezone)
 
@@ -584,13 +587,42 @@ class NotionToConfluenceConverter:
                             if clean_curr == clean_disp:
                                 is_self_page = True
 
+                    raw_plain = (item.get("plain_text") or (item.get("text") or {}).get("content", "")).strip()
+                    clean_plain = re.sub(r"<[^>]+>", "", raw_plain).strip()
+
+                    # 明示的なアンカー修復マッピングの適用 (InPageLinkRepairer / Notion API修復連携)
+                    if is_self_page and not anchor_name and hasattr(self, "explicit_link_anchors"):
+                        key = (getattr(self, "current_node_id", ""), clean_plain)
+                        if key in self.explicit_link_anchors:
+                            anchor_name = self.explicit_link_anchors[key]
+                            if hasattr(self, "referenced_anchors"):
+                                self.referenced_anchors.add(anchor_name)
+
                     # 自ページ内リンクでアンカーが未設定の場合（Notion HTMLエクスポートで#フラグメントが欠落した場合の救済）:
                     # リンクテキストが現在のページの見出しと一致すれば、見出しアンカーを自動補完
                     if is_self_page and not anchor_name and hasattr(self, "current_page_headings") and self.current_page_headings:
-                        raw_plain = (item.get("plain_text") or (item.get("text") or {}).get("content", "")).strip()
-                        clean_plain = re.sub(r"<[^>]+>", "", raw_plain).strip()
                         if clean_plain in self.current_page_headings:
                             anchor_name = clean_plain
+
+                    # 自ページ内リンクで依然としてアンカーが未解決の場合、修復候補リストに記録
+                    if is_self_page and not anchor_name:
+                        cand = {
+                            "page_id": getattr(self, "current_node_id", ""),
+                            "page_title": getattr(self, "current_page_title", ""),
+                            "block_id": getattr(self, "current_block_id", None),
+                            "link_text": clean_plain or raw_plain,
+                            "href": href,
+                            "status": "unresolved_in_page_link",
+                        }
+                        if not hasattr(self, "inpage_repair_candidates"):
+                            self.inpage_repair_candidates = []
+                        if not any(
+                            c.get("page_id") == cand["page_id"]
+                            and c.get("link_text") == cand["link_text"]
+                            and c.get("block_id") == cand["block_id"]
+                            for c in self.inpage_repair_candidates
+                        ):
+                            self.inpage_repair_candidates.append(cand)
 
                     # ページ内リンク（アンカー指定あり、または同一自ページへのリンク）は、Confluenceがインラインカード化して
                     # アンカーや表示テキスト（例:「熊本城」）をページ名に置き換えるのを防ぐため card-appearance を付与しない。
@@ -701,6 +733,8 @@ class NotionToConfluenceConverter:
             list_buffer = []
 
         for b in blocks:
+            if isinstance(b, dict):
+                self.current_block_id = b.get("id")
             b_type = b.get("type")
 
             # リスト系の処理

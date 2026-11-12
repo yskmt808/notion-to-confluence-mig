@@ -862,11 +862,41 @@ class ConfluenceImporter:
 
         self._resolve_and_update_page_links(root_node)
 
+        # ページ内アンカー欠落リンクの検知レポートを出力
+        self.save_inpage_repair_candidates()
+
         if self.dashboard:
             self.dashboard.set_main_task("全ノードの移行完了")
             self.dashboard.finish()
 
         return self.migration_map
+
+    def save_inpage_repair_candidates(self, output_path: str = "reports/inpage_link_repair_candidates.json") -> Optional[str]:
+        """移行中に検出されたアンカー欠落の可能性のある自ページリンク一覧をJSONレポートとして出力する。"""
+        candidates = getattr(self.converter, "inpage_repair_candidates", [])
+        if not candidates:
+            return None
+
+        with self._lock:
+            for c in candidates:
+                p_id = c.get("page_id")
+                if p_id and p_id in self.migration_map:
+                    c["confluence_page_id"] = self.migration_map[p_id].get("confluence_id")
+                    if not c.get("page_title"):
+                        c["page_title"] = self.migration_map[p_id].get("title", "")
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(candidates, f, ensure_ascii=False, indent=2)
+            logger.info(f"📋 アンカー欠落の可能性のある自ページリンク修復候補リスト ({len(candidates)}件) を出力しました: {output_path}")
+            print(f"\n💡 [In-Page Links] アンカー欠落の可能性のある自ページリンクを {len(candidates)} 件検出しました。")
+            print(f"   修復候補リスト: {output_path}")
+            print(f"   Notion API による自動修復を実行する場合: python migrate.py --repair-inpage-links --notion-token <YOUR_NOTION_TOKEN>\n")
+            return output_path
+        except Exception as e:
+            logger.warning(f"修復候補リスト保存失敗 ({output_path}): {e}")
+            return None
 
     def _extract_referenced_node_ids(self, blocks: List[Dict[str, Any]]) -> Set[str]:
         """ブロックリストから参照されている他のNotionノードID（UUID正規化形式）を抽出する。"""

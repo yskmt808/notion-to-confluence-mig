@@ -401,6 +401,17 @@ def main():
         help="移行先ページの公開範囲 ('space' または 'private', デフォルト: 'space')",
     )
     parser.add_argument(
+        "--repair-inpage-links",
+        action="store_true",
+        help="Notion API を呼び出して、エクスポート時にアンカー (#) が欠落した自ページリンクを正確に特定・修復する追加PASSを実行する",
+    )
+    parser.add_argument(
+        "--notion-token",
+        type=str,
+        default=os.environ.get("NOTION_TOKEN") or os.environ.get("NOTION_API_KEY") or "",
+        help="ページ内リンク修復用の Notion インテグレーション・トークン (環境変数 NOTION_TOKEN または NOTION_API_KEY も利用可能)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="詳細ログを出力する",
@@ -726,6 +737,18 @@ def main():
     step2_end = datetime.now(timezone.utc)
     step2_elapsed = (step2_end - step2_start).total_seconds()
     print(f"✓ Step 2 完了: 所要時間 {step2_elapsed:.2f} 秒\n")
+
+    # 追加修復PASS: Notion API によるページ内アンカー欠落リンク修復
+    if args.repair_inpage_links:
+        if not args.notion_token:
+            print("⚠️ 警告: --repair-inpage-links が指定されましたが、--notion-token または環境変数 NOTION_TOKEN が未設定です。修復処理をスキップします。")
+        else:
+            from src.inpage_link_repairer import InPageLinkRepairer
+            repairer = InPageLinkRepairer(
+                confluence_client=importer.client,
+                notion_token=args.notion_token,
+            )
+            repairer.repair_pages(root_node=tree, converter=importer.converter)
 
     # Step 3: テキストベース整合性検証
     step3_elapsed = 0.0
