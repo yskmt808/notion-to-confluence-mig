@@ -22,10 +22,30 @@ class CancellationManager:
 
     def __init__(self, on_cancel_callback: Optional[Callable[[], None]] = None):
         self._cancel_requested = False
+        self.is_error_halt = False
+        self.halt_reason = ""
         self._on_cancel_callback = on_cancel_callback
         self._original_sigint = None
         self._original_sigterm = None
         self._installed = False
+
+    def trigger_error_halt(self, error_message: str):
+        """致命的エラー（ERRORレベル事象・リトライ上限超過等）発生時に後続処理および並行キューを即座に安全停止する。"""
+        if not self._cancel_requested:
+            self._cancel_requested = True
+            self.is_error_halt = True
+            self.halt_reason = error_message
+            logger.error(f"🛑 [FATAL ERROR HALT] 後続処理・並行キューの安全停止を要求しました: {error_message}")
+            print("\n" + "=" * 60)
+            print(f"🛑 [ERROR] 致命的エラーを検知したため、後続処理を安全停止（Fail-Fast）します。")
+            print(f"理由: {error_message}")
+            print("進行中の単一APIリクエスト完了後、チェックポイントを安全に保存してプロセスを終了します。")
+            print("=" * 60 + "\n")
+            if self._on_cancel_callback:
+                try:
+                    self._on_cancel_callback()
+                except Exception as e:
+                    logger.error(f"Error in cancel callback during error halt: {e}")
 
     def install(self):
         """シグナルハンドラーを登録する。"""
@@ -77,5 +97,7 @@ class CancellationManager:
     def check_cancelled(self):
         """中断が要求されている場合、MigrationCancelledException を送出する。"""
         if self._cancel_requested:
+            if self.is_error_halt:
+                raise MigrationCancelledException(f"移行処理が致命的エラーにより安全停止しました: {self.halt_reason}")
             raise MigrationCancelledException("移行処理がユーザーによって安全に中断されました。")
 

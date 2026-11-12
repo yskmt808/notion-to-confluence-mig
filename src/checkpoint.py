@@ -10,6 +10,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
+import src.logger_util
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,12 @@ class MigrationCheckpoint:
 
     def save(self):
         """現在のチェックポイント状態を一時ファイル経由で安全（アトミック）に保存する。"""
-        with self._lock:
+        acquired_immediately = self._lock.acquire(blocking=False)
+        if not acquired_immediately:
+            logger.notice(f"Checkpoint lock contention detected: thread {threading.get_ident()} waiting for lock on {self.checkpoint_path}...")
+            self._lock.acquire()
+
+        try:
             self.last_updated_at = datetime.now(timezone.utc).isoformat()
             data = {
                 "version": "1.0",
@@ -85,12 +91,31 @@ class MigrationCheckpoint:
                     pass
                 os.replace(tmp_path, self.checkpoint_path)
             except Exception as e:
-                logger.warning(f"Failed to write checkpoint atomically: {e}")
+                logger.error(f"Failed to write checkpoint atomically to [{self.checkpoint_path}]: {e}")
                 if os.path.exists(tmp_path):
                     try:
                         os.remove(tmp_path)
                     except Exception:
                         pass
+        finally:
+            self._lock.release()
+
+    def unmark_pass1(self, node_id: str):
+        """ノードのPass 1完了状態を取り消し、未完了状態に戻す（エラーロールバック用）。"""
+        with self._lock:
+            if node_id in self.nodes:
+                self.nodes[node_id]["pass1_done"] = False
+                self.nodes[node_id].pop("confluence_id", None)
+                self.save()
+                logger.notice(f"Unmarked Pass 1 for node [{node_id}] in checkpoint.")
+
+    def remove_node(self, node_id: str):
+        """ノードをチェックポイント記録から完全に削除する。"""
+        with self._lock:
+            if node_id in self.nodes:
+                self.nodes.pop(node_id, None)
+                self.save()
+                logger.notice(f"Removed node [{node_id}] from checkpoint.")
 
     def is_pass1_done(self, node_id: str) -> bool:
         """指定ノードがPass 1（Confluenceページ/DB作成）を完了しているか判定。"""

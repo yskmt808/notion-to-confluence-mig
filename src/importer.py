@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import time
 import urllib.parse
@@ -133,6 +134,22 @@ class ConfluenceClient:
             return res.json()
         return None
 
+    def get_database_by_id(self, database_id: str) -> Optional[Dict[str, Any]]:
+        """Confluence Databases (v2) を ID から取得する。存在しない場合は None を返す。"""
+        url = f"{self.base_url}/api/v2/databases/{database_id}"
+        try:
+            res = requests.get(url, auth=self.auth, timeout=30)
+            if res.status_code == 200:
+                return res.json()
+            # v1 content API でもフォールバック確認
+            url_v1 = f"{self.base_url}/rest/api/content/{database_id}"
+            res_v1 = requests.get(url_v1, auth=self.auth, timeout=30)
+            if res_v1.status_code == 200:
+                return res_v1.json()
+        except Exception as e:
+            logger.warning(f"Error checking database {database_id} existence: {e}")
+        return None
+
     def get_page_attachments(self, page_id: str) -> List[Dict[str, Any]]:
         """指定されたConfluenceページの添付ファイル一覧を取得する。"""
         url = f"{self.base_url}/rest/api/content/{page_id}/child/attachment"
@@ -178,10 +195,24 @@ class ConfluenceClient:
         if parent_id:
             payload["ancestors"] = [{"id": str(parent_id)}]
 
-        res = requests.post(url, json=payload, auth=self.auth, headers=self.headers, timeout=30)
-        if res.status_code not in (200, 201):
-            raise RuntimeError(f"Failed to create page [{title}]: {res.status_code} - {res.text}")
-        return res.json()
+        max_retries = 3
+        for attempt in range(max_retries):
+            res = requests.post(url, json=payload, auth=self.auth, headers=self.headers, timeout=30)
+            if res.status_code in (200, 201):
+                return res.json()
+            elif res.status_code == 409 and attempt < max_retries - 1:
+                # 409 Conflict: 親コンテナのロック競合・同時作成衝突時はジッター付き指数バックオフで再試行 (WARNING)
+                backoff = (2 ** attempt) + random.uniform(0.5, 1.5)
+                logger.warning(
+                    f"[409 Conflict] Retrying create_page for [{title}] under parent {parent_id} "
+                    f"(attempt {attempt + 1}/{max_retries}) after {backoff:.2f}s..."
+                )
+                time.sleep(backoff)
+                continue
+            else:
+                err_msg = f"Failed to create page [{title}] under parent {parent_id}: {res.status_code} - {res.text}"
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
 
     def create_comment(self, page_id: str, body_html: str) -> Dict[str, Any]:
         """ページに対して最上位コメントを追加する。"""
@@ -230,10 +261,32 @@ class ConfluenceClient:
         if parent_id:
             payload["ancestors"] = [{"id": str(parent_id)}]
 
-        res = requests.put(url, json=payload, auth=self.auth, headers=self.headers, timeout=30)
-        if res.status_code != 200:
-            raise RuntimeError(f"Failed to update page [{title}] ({page_id}): {res.status_code} - {res.text}")
-        return res.json()
+        max_retries = 3
+        for attempt in range(max_retries):
+            if attempt > 0:
+                try:
+                    latest = self.get_page_by_id(page_id, expand="version")
+                    if latest and "version" in latest:
+                        current_version = latest["version"]["number"]
+                        payload["version"]["number"] = current_version + 1
+                except Exception as ve:
+                    logger.warning(f"Could not fetch latest page version for [{title}] ({page_id}): {ve}")
+
+            res = requests.put(url, json=payload, auth=self.auth, headers=self.headers, timeout=30)
+            if res.status_code == 200:
+                return res.json()
+            elif res.status_code == 409 and attempt < max_retries - 1:
+                backoff = (2 ** attempt) + random.uniform(0.5, 1.5)
+                logger.warning(
+                    f"[409 Conflict] Retrying update_page for [{title}] ({page_id}) "
+                    f"(attempt {attempt + 1}/{max_retries}) after {backoff:.2f}s..."
+                )
+                time.sleep(backoff)
+                continue
+            else:
+                err_msg = f"Failed to update page [{title}] ({page_id}): {res.status_code} - {res.text}"
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
 
     def upload_attachment(self, page_id: str, filename: str, file_bytes: bytes, mime_type: Optional[str] = None):
         """Confluenceページにファイルを添付アップロードする。"""
@@ -724,6 +777,7 @@ class ConfluenceImporter:
         from src.timezone_util import resolve_timezone, format_iso_datetime
         self.timezone = resolve_timezone(timezone)
         self._lock = threading.RLock()
+        self._parent_locks: Dict[str, threading.Lock] = {}
         self._reserved_titles: Set[str] = set()
         self._node_to_title: Dict[str, str] = {}
         self.client = ConfluenceClient(url, username, token)
@@ -779,7 +833,7 @@ class ConfluenceImporter:
 
         if self.dashboard:
             self.dashboard.set_main_task(f"Pass 1: ルートノード移行中 [{root_node.title}]")
-        self._import_node_recursive(root_node, parent_id=parent_id, overwrite=overwrite)
+        self._import_node_recursive(root_node, parent_id=parent_id, overwrite=overwrite, allow_sub_parallel=True)
 
         # Pass 2: 全ページのリンク解決と更新 (データベースビュー・相互リンクの完全同期)
         logger.info("Executing Pass 2: Resolving embedded database views, pending row views and cross-page links...")
@@ -1474,6 +1528,7 @@ class ConfluenceImporter:
         node: PageNode,
         parent_id: Optional[str],
         overwrite: bool,
+        allow_sub_parallel: bool = True,
     ) -> str:
         """単一ノードをConfluenceに作成・更新し、子ノードも再帰処理する。"""
         if self.cancel_manager:
@@ -1489,34 +1544,49 @@ class ConfluenceImporter:
             cached = self.checkpoint.get_node_info(node.id)
             confluence_page_id = cached["confluence_id"]
             saved_title = cached.get("title") or node.title
-            node.title = saved_title
-            with self._lock:
-                self._reserved_titles.add(saved_title)
-                self._node_to_title[node.id] = saved_title
-            confluence_url = cached.get("url", f"{self.client.base_url}/spaces/{self.space_key}/pages/{confluence_page_id}")
-            logger.info(f"[RESUME] Skipping creation for [{node.title}] (already migrated to ID {confluence_page_id})")
-            if self.dashboard:
-                self.dashboard.record_pass1_skip(node.title)
 
-            self.migration_map[node.id] = {
-                "confluence_id": confluence_page_id,
-                "title": saved_title,
-                "url": confluence_url,
-                "node_type": node.node_type,
-            }
-            if "views" in cached:
-                self.migration_map[node.id]["views"] = cached["views"]
-            if "views_info" in cached:
-                self.migration_map[node.id]["views_info"] = cached["views_info"]
-
-            if node.children:
-                self._import_children_concurrently(
-                    parent_node=node,
-                    children=node.children,
-                    parent_id=confluence_page_id,
-                    overwrite=overwrite,
+            # Confluenceサーバー上に実在するか確認 (存在しない場合はチェックポイントを解除して再作成)
+            remote_item = (
+                self.client.get_database_by_id(confluence_page_id)
+                if node.node_type == "database"
+                else self.client.get_page_by_id(confluence_page_id)
+            )
+            if not remote_item:
+                logger.warning(
+                    f"[RESUME] Cached Confluence ID {confluence_page_id} for [{node.title}] (Node ID: {node.id}) "
+                    f"does not exist on Confluence server. Unmarking checkpoint and re-creating..."
                 )
-            return confluence_page_id
+                self.checkpoint.unmark_pass1(node.id)
+            else:
+                node.title = saved_title
+                with self._lock:
+                    self._reserved_titles.add(saved_title)
+                    self._node_to_title[node.id] = saved_title
+                confluence_url = cached.get("url", f"{self.client.base_url}/spaces/{self.space_key}/pages/{confluence_page_id}")
+                logger.info(f"[RESUME] Skipping creation for [{node.title}] (already migrated to ID {confluence_page_id})")
+                if self.dashboard:
+                    self.dashboard.record_pass1_skip(node.title)
+
+                self.migration_map[node.id] = {
+                    "confluence_id": confluence_page_id,
+                    "title": saved_title,
+                    "url": confluence_url,
+                    "node_type": node.node_type,
+                }
+                if "views" in cached:
+                    self.migration_map[node.id]["views"] = cached["views"]
+                if "views_info" in cached:
+                    self.migration_map[node.id]["views_info"] = cached["views_info"]
+
+                if node.children:
+                    self._import_children_concurrently(
+                        parent_node=node,
+                        children=node.children,
+                        parent_id=confluence_page_id,
+                        overwrite=overwrite,
+                        allow_sub_parallel=allow_sub_parallel,
+                    )
+                return confluence_page_id
 
         if self.dashboard:
             self.dashboard.set_worker_busy(node.title, node_type=node.node_type)
@@ -1586,37 +1656,27 @@ class ConfluenceImporter:
                             child_node,
                             parent_id=parent_id,
                             overwrite=overwrite,
+                            allow_sub_parallel=False,
                         )
                         return child_node.id, cid
+                    except Exception as e:
+                        err_msg = f"Failed to create database row page [{child_node.title}] for database [{node.title}]: {e}"
+                        logger.error(err_msg)
+                        if self.telemetry:
+                            self.telemetry.record_warning(err_msg)
+                        if self.cancel_manager:
+                            self.cancel_manager.trigger_error_halt(err_msg)
+                        raise
                     finally:
                         if self.dashboard:
                             self.dashboard.set_worker_idle()
 
-                workers = min(self.page_workers, len(unmigrated_children))
-                if workers > 1:
-                    logger.info(f"Concurrently creating {len(unmigrated_children)} child pages for [{node.title}] with {workers} worker threads...")
-                    if self.dashboard:
-                        self.dashboard.set_main_task(f"Pass 1: DB子レコード並行作成中 (DB: [{node.title}], {len(unmigrated_children)} 件)")
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                        future_to_child = {executor.submit(_migrate_child_task, c): c for c in unmigrated_children}
-                        for future in concurrent.futures.as_completed(future_to_child):
-                            c = future_to_child[future]
-                            try:
-                                chid, cid = future.result()
-                                child_link_map[chid] = f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"
-                            except Exception as e:
-                                logger.warning(f"Failed to create child page [{c.title}] in worker (skipping link in DB): {e}")
-                                if self.telemetry:
-                                    self.telemetry.record_warning(f"Worker failure creating page [{c.title}]: {e}")
-                else:
-                    for c in unmigrated_children:
-                        try:
-                            chid, cid = _migrate_child_task(c)
-                            child_link_map[chid] = f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"
-                        except Exception as e:
-                            logger.warning(f"Failed to create child page [{c.title}] (skipping link in DB): {e}")
-                            if self.telemetry:
-                                self.telemetry.record_warning(f"Failure creating child page [{c.title}]: {e}")
+                # DB行レコードは同一の parent_id を共有するため、親ロック競合 (409 Conflict) を防止するため逐次作成する
+                if self.dashboard:
+                    self.dashboard.set_main_task(f"Pass 1: DB子レコード作成中 (DB: [{node.title}], {len(unmigrated_children)} 件)")
+                for c in unmigrated_children:
+                    chid, cid = _migrate_child_task(c)
+                    child_link_map[chid] = f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"
 
             if existing_db:
                 logger.info(f"Reusing existing Confluence Database: [{node.title}] (ID: {existing_db['id']})")
@@ -1633,12 +1693,13 @@ class ConfluenceImporter:
                     raise RuntimeError(f"Could not resolve Confluence Space ID for space key '{self.space_key}'.")
                 logger.info(f"Creating native Confluence Database: [{node.title}] under parent {parent_id}")
                 try:
-                    db_res = self.client.create_database(
-                        space_id=space_id,
-                        title=node.title,
-                        parent_id=parent_id,
-                        csv_body=csv_body,
-                    )
+                    with self._get_parent_lock(parent_id):
+                        db_res = self.client.create_database(
+                            space_id=space_id,
+                            title=node.title,
+                            parent_id=parent_id,
+                            csv_body=csv_body,
+                        )
                     confluence_page_id = db_res["id"]
                     webui = db_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/database/{confluence_page_id}")
                     confluence_url = f"{self.client.base_url}{webui}"
@@ -1988,13 +2049,14 @@ class ConfluenceImporter:
                     except Exception as ce:
                         logger.warning(f"Could not migrate comment to page {confluence_page_id}: {ce}")
 
-        # 6. 子ノードのインポート（今回作成したページを親として兄弟並行実行）
+        # 6. 子ノードのインポート（今回作成したページを親として深さ優先・ブランチ並行実行）
         if node.children:
             self._import_children_concurrently(
                 parent_node=node,
                 children=node.children,
                 parent_id=confluence_page_id,
                 overwrite=overwrite,
+                allow_sub_parallel=allow_sub_parallel,
             )
 
         return confluence_page_id
@@ -2005,12 +2067,16 @@ class ConfluenceImporter:
         children: List[PageNode],
         parent_id: Optional[str],
         overwrite: bool,
+        allow_sub_parallel: bool = True,
     ):
-        """親ノード直下の兄弟ノード群（ページおよびデータベース）を並行してインポートする。"""
+        """親ノード直下の兄弟ノード群（ページおよびデータベース）をインポートする。
+        同一親に対する同時作成による 409 Conflict を防ぐため、ブランチ単位で並行化し、
+        ブランチ内部は完全な深さ優先（DFS）で逐次処理する。
+        """
         if not children:
             return
 
-        def _child_task(child_node: PageNode):
+        def _child_task(child_node: PageNode, sub_parallel: bool):
             if self.cancel_manager:
                 self.cancel_manager.check_cancelled()
             if self.dashboard:
@@ -2022,33 +2088,47 @@ class ConfluenceImporter:
                     child_node,
                     parent_id=parent_id,
                     overwrite=overwrite,
+                    allow_sub_parallel=sub_parallel,
                 )
+            except Exception as e:
+                err_msg = f"Failed to import child node [{child_node.title}]: {e}"
+                logger.error(err_msg)
+                if self.telemetry:
+                    self.telemetry.record_warning(err_msg)
+                if self.cancel_manager:
+                    self.cancel_manager.trigger_error_halt(err_msg)
+                raise
             finally:
                 if self.dashboard:
                     self.dashboard.set_worker_idle()
 
         workers = min(self.page_workers, len(children))
-        if workers > 1:
+        if allow_sub_parallel and workers > 1:
             logger.info(
-                f"Concurrently importing {len(children)} sibling nodes under [{parent_node.title}] "
-                f"(Parent ID: {parent_id}) with {workers} worker threads..."
+                f"Concurrently importing {len(children)} branch subtrees under [{parent_node.title}] "
+                f"(Parent ID: {parent_id}) with {workers} worker threads (DFS per branch)..."
             )
             if self.dashboard:
-                self.dashboard.set_main_task(f"Pass 1: 子ノード並行作成中 (親: [{parent_node.title}], {len(children)} 件)")
+                self.dashboard.set_main_task(f"Pass 1: ブランチ並行作成中 (親: [{parent_node.title}], {len(children)} 本)")
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_child = {executor.submit(_child_task, c): c for c in children}
+                future_to_child = {executor.submit(_child_task, c, False): c for c in children}
                 for future in concurrent.futures.as_completed(future_to_child):
                     c = future_to_child[future]
                     try:
                         future.result()
                     except Exception as e:
-                        logger.error(f"Failed to import child node [{c.title}]: {e}")
+                        err_msg = f"Worker failed importing branch [{c.title}]: {e}"
+                        logger.error(err_msg)
                         if self.telemetry:
-                            self.telemetry.record_warning(f"Failure importing child [{c.title}]: {e}")
+                            self.telemetry.record_warning(err_msg)
+                        if self.cancel_manager:
+                            self.cancel_manager.trigger_error_halt(err_msg)
                         raise
         else:
+            # 深さ優先（DFS）逐次実行
+            sub_par = (len(children) == 1 and allow_sub_parallel)
             for child in children:
-                _child_task(child)
+                _child_task(child, sub_par)
 
         # 並行作成完了後、Notion元の定義順序に合わせてConfluence左ペインの並び順を整列
         if len(children) > 1:
@@ -2071,6 +2151,14 @@ class ConfluenceImporter:
             except Exception as e:
                 logger.warning(f"Could not reorder sibling pages under [{parent_node.title}]: {e}")
 
+    def _get_parent_lock(self, parent_id: Optional[str]) -> threading.Lock:
+        """同一親コンテナに対する並行作成による Confluence 409 Conflict を防ぐための親単位ロックを取得する。"""
+        key = str(parent_id) if parent_id else "__ROOT__"
+        with self._lock:
+            if key not in self._parent_locks:
+                self._parent_locks[key] = threading.Lock()
+            return self._parent_locks[key]
+
     def _create_or_update_page(
         self,
         title: str,
@@ -2080,12 +2168,14 @@ class ConfluenceImporter:
     ) -> Tuple[str, str]:
         """Confluence上にページを作成する。タイトルはすでに _resolve_unique_page_title で予約・一元化されている。"""
         logger.info(f"Creating new Confluence page: [{title}] (Parent: {parent_id})")
-        res = self.client.create_page(
-            space_key=self.space_key,
-            title=title,
-            body=body,
-            parent_id=parent_id,
-        )
+        parent_lock = self._get_parent_lock(parent_id)
+        with parent_lock:
+            res = self.client.create_page(
+                space_key=self.space_key,
+                title=title,
+                body=body,
+                parent_id=parent_id,
+            )
         page_id = res["id"]
         webui = res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{page_id}")
         page_url = f"{self.client.base_url}{webui}"

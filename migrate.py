@@ -29,6 +29,10 @@ from src.api_enricher import NotionApiEnricher
 from src.worksheet import WorksheetManager
 from src.dashboard import MigrationDashboard
 from src.user_mapper import UserMappingManager
+from src.logger_util import setup_notice_log_level, setup_uncaught_exception_handler
+
+setup_notice_log_level()
+setup_uncaught_exception_handler()
 
 load_dotenv()
 
@@ -682,19 +686,30 @@ def main():
             overwrite=not args.no_overwrite,
         )
     except MigrationCancelledException:
-        print("\n" + "=" * 50)
-        print("⏸️ 移行処理を安全に中断しました。")
-        print(f"現在の進捗状況はチェックポイント '{args.checkpoint}' に保存されています。")
-        print("次回再開するには、以下のコマンドを実行してください:")
-        print(f"  python migrate.py --resume" + (f" --checkpoint {args.checkpoint}" if args.checkpoint != "migration_checkpoint.json" else ""))
-        print("=" * 50)
-        checkpoint.mark_interrupted()
-        if args.generate_debug_report:
-            json_p = os.path.join(args.debug_report_dir, "debug_report.json")
-            md_p = os.path.join(args.debug_report_dir, "debug_report.md")
-            telemetry.save_reports(json_path=json_p, md_path=md_p)
-            print(f"📋 サニタイズド診断レポートを出力しました: {json_p}, {md_p}")
-        sys.exit(0)
+        if cancel_manager.is_error_halt:
+            logging.error(f"Migration aborted due to fatal error: {cancel_manager.halt_reason}")
+            checkpoint.mark_interrupted()
+            telemetry.record_error(Exception(cancel_manager.halt_reason or "Error halt"), context="Step 2 Import Tree")
+            if args.generate_debug_report:
+                json_p = os.path.join(args.debug_report_dir, "debug_report.json")
+                md_p = os.path.join(args.debug_report_dir, "debug_report.md")
+                telemetry.save_reports(json_path=json_p, md_path=md_p)
+                print(f"🚨 開発者報告用のサニタイズド診断レポートを出力しました: {json_p}, {md_p}")
+            sys.exit(1)
+        else:
+            print("\n" + "=" * 50)
+            print("⏸️ 移行処理を安全に中断しました。")
+            print(f"現在の進捗状況はチェックポイント '{args.checkpoint}' に保存されています。")
+            print("次回再開するには、以下のコマンドを実行してください:")
+            print(f"  python migrate.py --resume" + (f" --checkpoint {args.checkpoint}" if args.checkpoint != "migration_checkpoint.json" else ""))
+            print("=" * 50)
+            checkpoint.mark_interrupted()
+            if args.generate_debug_report:
+                json_p = os.path.join(args.debug_report_dir, "debug_report.json")
+                md_p = os.path.join(args.debug_report_dir, "debug_report.md")
+                telemetry.save_reports(json_path=json_p, md_path=md_p)
+                print(f"📋 サニタイズド診断レポートを出力しました: {json_p}, {md_p}")
+            sys.exit(0)
     except Exception as e:
         logging.error(f"Confluence移行エラー: {e}", exc_info=args.verbose)
         checkpoint.mark_interrupted()
