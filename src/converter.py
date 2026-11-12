@@ -379,7 +379,12 @@ class NotionToConfluenceConverter:
                     target_page_id = mention_data.get("page", {}).get("id", "")
                     norm_id = target_page_id.replace("-", "").lower()
                     target_title = None
-                    if self.id_to_title_map:
+                    target_info = None
+                    if hasattr(self, "migration_map") and self.migration_map:
+                        target_info = self.migration_map.get(target_page_id) or self.migration_map.get(norm_id)
+                    if target_info and target_info.get("title"):
+                        target_title = target_info.get("title")
+                    elif self.id_to_title_map:
                         target_title = self.id_to_title_map.get(target_page_id) or self.id_to_title_map.get(norm_id)
                     if not target_title:
                         target_title = item.get("plain_text", "").replace("@", "").strip() or "Page"
@@ -399,18 +404,28 @@ class NotionToConfluenceConverter:
                     target_db_id = mention_data.get("database", {}).get("id", "")
                     norm_id = target_db_id.replace("-", "").lower()
                     target_title = None
-                    if self.id_to_title_map:
-                        target_title = self.id_to_title_map.get(target_db_id) or self.id_to_title_map.get(norm_id)
-                    if not target_title:
-                        target_title = item.get("plain_text", "").replace("@", "").strip() or "Database"
+                    target_info = None
+                    if hasattr(self, "migration_map") and self.migration_map:
+                        target_info = self.migration_map.get(target_db_id) or self.migration_map.get(norm_id)
+                    if target_info and target_info.get("url"):
+                        db_url = target_info.get("url")
+                        escaped_url = html.escape(db_url)
+                        link_html = f'<a href="{escaped_url}" data-card-appearance="inline">{escaped_url}</a>'
+                    else:
+                        if target_info and target_info.get("title"):
+                            target_title = target_info.get("title")
+                        elif self.id_to_title_map:
+                            target_title = self.id_to_title_map.get(target_db_id) or self.id_to_title_map.get(norm_id)
+                        if not target_title:
+                            target_title = item.get("plain_text", "").replace("@", "").strip() or "Database"
 
-                    escaped_title = html.escape(target_title)
-                    link_html = (
-                        f'<ac:link ac:card-appearance="inline">'
-                        f'<ri:page ri:content-title="{escaped_title}" />'
-                        f'<ac:link-body>{escaped_title}</ac:link-body>'
-                        f'</ac:link>'
-                    )
+                        escaped_title = html.escape(target_title)
+                        link_html = (
+                            f'<ac:link ac:card-appearance="inline">'
+                            f'<ri:page ri:content-title="{escaped_title}" />'
+                            f'<ac:link-body>{escaped_title}</ac:link-body>'
+                            f'</ac:link>'
+                        )
                     result.append(link_html)
                     continue
 

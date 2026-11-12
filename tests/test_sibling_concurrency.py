@@ -78,6 +78,7 @@ class TestSiblingConcurrency(unittest.TestCase):
             }
 
         importer.client.get_page_by_title = MagicMock(return_value=None)
+        importer.client.get_database_by_title = MagicMock(return_value=None)
         importer.client.create_page = MagicMock(side_effect=mock_create_page)
         importer.client.update_page = MagicMock(side_effect=mock_update_page)
         importer.client.get_page_by_id = MagicMock(side_effect=lambda pid, expand=None: {
@@ -147,6 +148,7 @@ class TestSiblingConcurrency(unittest.TestCase):
             }
 
         importer.client.get_page_by_title = MagicMock(return_value=None)
+        importer.client.get_database_by_title = MagicMock(return_value=None)
         importer.client.create_page = MagicMock(side_effect=mock_create_page)
         importer.client.update_page = MagicMock(side_effect=lambda **kwargs: {
             "id": kwargs["page_id"],

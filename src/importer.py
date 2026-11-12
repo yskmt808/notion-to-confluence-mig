@@ -1423,7 +1423,10 @@ class ConfluenceImporter:
     def _resolve_unique_page_title(
         self, base_title: str, notion_node_id: str, allow_existing_overwrite: bool = True, is_database: bool = False
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """Notionノード（ページまたはデータベース）のタイトルがConfluenceスペース内で重複している場合、安全にユニークなタイトルを採番する。"""
+        """Notionノード（ページまたはデータベース）のタイトルがConfluenceスペース内で重複している場合、安全にユニークなタイトルを採番する。
+        - ページとデータベースの間、および同種ノード間のいずれのコンフリクトも検出してユニーク化する。
+        - 異種ノード（DBが既存Pageを上書き、またはPageが既存DBを上書き）の上書き・削除は絶対に禁止する。
+        """
         with self._lock:
             if notion_node_id in self._node_to_title:
                 assigned = self._node_to_title[notion_node_id]
@@ -1440,63 +1443,105 @@ class ConfluenceImporter:
             if len(cleaned_title) > 240:
                 cleaned_title = cleaned_title[:237] + "..."
 
-            target_title = cleaned_title
-            existing_page = (
-                self.client.get_database_by_title(space_key=self.space_key, title=target_title)
-                if is_database
-                else self.client.get_page_by_title(space_key=self.space_key, title=target_title)
-            )
+            def _is_valid_item(item: Any) -> bool:
+                if item is None:
+                    return False
+                if isinstance(item, dict):
+                    return bool(item.get("id"))
+                return False
 
-            # 既存ページ/DB の ID が migration_map で既に別の notion_node_id にマッピングされている場合は上書き禁止
-            existing_page_claimed_by_other = False
-            if existing_page:
-                eid = str(existing_page.get("id"))
+            def _inspect_existing(title_to_check: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+                """指定タイトルについて、Confluence上の既存Pageおよび既存Databaseの両方を検索する。"""
+                p = self.client.get_page_by_title(space_key=self.space_key, title=title_to_check)
+                d = self.client.get_database_by_title(space_key=self.space_key, title=title_to_check)
+                valid_p = p if _is_valid_item(p) else None
+                valid_d = d if _is_valid_item(d) else None
+                return valid_p, valid_d
+
+            target_title = cleaned_title
+            existing_page, existing_db = _inspect_existing(target_title)
+
+            # 同種コンテンツの既存オブジェクトを取得
+            target_same_type_existing = existing_db if is_database else existing_page
+            # 異種コンテンツの既存オブジェクト（コンフリクト対象: DBならPage、PageならDB）
+            target_diff_type_existing = existing_page if is_database else existing_db
+
+            # 既存同種オブジェクトが migration_map で既に別の notion_node_id にマッピングされているか判定
+            claimed_by_other = False
+            if target_same_type_existing:
+                eid = str(target_same_type_existing.get("id"))
                 for mid, minfo in self.migration_map.items():
                     if mid != notion_node_id and str(minfo.get("confluence_id")) == eid:
-                        existing_page_claimed_by_other = True
+                        claimed_by_other = True
                         break
 
-            # 既存ページ/DBが存在し、かつ同一実行内でまだどのノードにも予約されていない場合に限り上書きを許可
+            # 上書き可能かの判定:
+            # 1. 異種コンテンツが同名で存在しないこと（PageがあるのにDBで上書き、またはその逆は不可）
+            # 2. 同種コンテンツが存在し、上書きが許可されており、同一実行内でまだ予約されておらず、他ノードに専有されていないこと
             can_overwrite = (
-                existing_page is not None
+                target_diff_type_existing is None
+                and target_same_type_existing is not None
                 and allow_existing_overwrite
                 and target_title not in self._reserved_titles
-                and not existing_page_claimed_by_other
+                and not claimed_by_other
             )
 
-            if not can_overwrite and (existing_page is not None or target_title in self._reserved_titles):
-                # 同一スペース内または同一ツリー内でのタイトル重複！サフィックスを付与してユニーク化
+            # コンフリクト判定:
+            # - 異種コンテンツが同名で存在する場合（Page vs Database 衝突）
+            # - 同種コンテンツが存在するが上書き不可の場合（同一スペース内の既存コンテンツ）
+            # - 同一実行内で既に他のノードによって予約されている場合
+            has_conflict = (
+                target_diff_type_existing is not None
+                or target_title in self._reserved_titles
+                or (target_same_type_existing is not None and not can_overwrite)
+            )
+
+            existing_item = target_same_type_existing if can_overwrite else None
+
+            if has_conflict:
                 suffix = 2
-                while True:
+                while suffix < 500:
                     candidate = f"{cleaned_title} ({suffix})"
                     if len(candidate) > 255:
                         candidate = candidate[:255]
                     if candidate not in self._reserved_titles:
-                        cand_existing = (
-                            self.client.get_database_by_title(space_key=self.space_key, title=candidate)
-                            if is_database
-                            else self.client.get_page_by_title(space_key=self.space_key, title=candidate)
-                        )
-                        if cand_existing is None:
-                            target_title = candidate
-                            existing_page = None
-                            break
-                        elif allow_existing_overwrite:
-                            cand_eid = str(cand_existing.get("id"))
-                            cand_claimed_by_other = any(
-                                mid != notion_node_id and str(minfo.get("confluence_id")) == cand_eid
-                                for mid, minfo in self.migration_map.items()
-                            )
-                            if not cand_claimed_by_other:
+                        cand_p, cand_d = _inspect_existing(candidate)
+                        cand_same = cand_d if is_database else cand_p
+                        cand_diff = cand_p if is_database else cand_d
+
+                        # 異種コンテンツが存在しない場合のみ候補とする
+                        if cand_diff is None:
+                            if cand_same is None:
                                 target_title = candidate
-                                existing_page = cand_existing
+                                existing_item = None
                                 break
+                            elif allow_existing_overwrite:
+                                cand_eid = str(cand_same.get("id"))
+                                cand_claimed = any(
+                                    mid != notion_node_id and str(minfo.get("confluence_id")) == cand_eid
+                                    for mid, minfo in self.migration_map.items()
+                                )
+                                if not cand_claimed:
+                                    target_title = candidate
+                                    existing_item = cand_same
+                                    break
                     suffix += 1
-                logger.info(f"Resolved duplicate {'database' if is_database else 'page'} title conflict in Confluence: [{base_title}] -> [{target_title}] (Node ID: {notion_node_id})")
+
+                conflict_reason = (
+                    f"conflict with existing {'page' if is_database else 'database'}"
+                    if target_diff_type_existing is not None
+                    else f"duplicate {'database' if is_database else 'page'} title"
+                )
+                logger.info(
+                    f"Resolved title conflict in Confluence ({conflict_reason}): "
+                    f"[{base_title}] -> [{target_title}] (Node ID: {notion_node_id})"
+                )
 
             self._reserved_titles.add(target_title)
             self._node_to_title[notion_node_id] = target_title
-            return target_title, existing_page
+            if hasattr(self, "converter") and hasattr(self.converter, "id_to_title_map"):
+                self.converter.id_to_title_map[notion_node_id] = target_title
+            return target_title, existing_item
 
     @staticmethod
     def is_empty_database_row(row_node: PageNode) -> bool:
@@ -1607,8 +1652,16 @@ class ConfluenceImporter:
                 title=node.title,
             )
             if legacy_page and overwrite:
-                logger.info(f"Removing legacy page for database overwrite: [{node.title}] (ID: {legacy_page['id']})")
-                self.client.delete_page(legacy_page["id"])
+                # 既存ページが今回のマイグレーションツリーのアクティブノードに割り当てられている場合は絶対に削除しない
+                is_active_page = any(
+                    str(minfo.get("confluence_id")) == str(legacy_page.get("id"))
+                    for minfo in self.migration_map.values()
+                )
+                if not is_active_page:
+                    logger.info(f"Removing unmapped legacy page for database overwrite: [{node.title}] (ID: {legacy_page['id']})")
+                    self.client.delete_page(legacy_page["id"])
+                else:
+                    logger.warning(f"Protected active migrated page [{node.title}] (ID: {legacy_page['id']}) from database deletion.")
 
             if existing_db and overwrite:
                 logger.info(f"Removing existing Confluence Database for fresh recreation: [{node.title}] (ID: {existing_db['id']})")
