@@ -150,6 +150,9 @@ class NotionToConfluenceConverter:
         self.user_mapper = user_mapper
         self.current_node_id: Optional[str] = None
         self.current_page_title: Optional[str] = None
+        self.current_page_headings: Set[str] = set()
+        self.current_page_block_anchors: Dict[str, str] = {}
+        self.referenced_anchors: Set[str] = set()
         from src.timezone_util import resolve_timezone
         self.timezone = resolve_timezone(timezone)
 
@@ -507,9 +510,16 @@ class NotionToConfluenceConverter:
                 anchor_name = None
 
                 if href and "#" in href:
-                    anchor_part = href.split("#", 1)[1].strip()
+                    anchor_part = urllib.parse.unquote(href.split("#", 1)[1].strip())
                     if anchor_part:
-                        anchor_name = anchor_part
+                        norm_anchor = anchor_part.replace("-", "").lower()
+                        if hasattr(self, "current_page_block_anchors") and (
+                            anchor_part in self.current_page_block_anchors
+                            or norm_anchor in self.current_page_block_anchors
+                        ):
+                            anchor_name = self.current_page_block_anchors.get(anchor_part) or self.current_page_block_anchors.get(norm_anchor)
+                        else:
+                            anchor_name = anchor_part
 
                 candidate_uuids = []
                 if item_page_id:
@@ -533,17 +543,32 @@ class NotionToConfluenceConverter:
                     if target_title or target_info:
                         break
 
+                # 自ページIDとの直接一致判定 (id_to_title_map未登録時や同一ページ内リンクの確実な解決)
+                if not target_title and not target_info and getattr(self, "current_node_id", None):
+                    curr_norm = self.current_node_id.replace("-", "").lower()
+                    if curr_norm in candidate_uuids:
+                        target_uuid = curr_norm
+                        target_title = getattr(self, "current_page_title", None)
+
+                # href にアンカー (#) が含まれる場合の自ページ判定
+                if not target_title and not target_info and href and "#" in href:
+                    base_href = href.split("#", 1)[0].strip()
+                    if not base_href or getattr(self, "current_page_title", None):
+                        target_uuid = getattr(self, "current_node_id", "").replace("-", "").lower()
+                        target_title = getattr(self, "current_page_title", None)
+
                 if target_info and target_info.get("node_type") == "database":
                     db_url = target_info.get("web_url") or target_info.get("url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
                     escaped = f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(db_url)}</a>'
-                elif target_info or target_title:
-                    disp_title = (target_info.get("title") if target_info else None) or target_title or escaped
+                elif target_info or target_title or (href and href.startswith("#")):
+                    disp_title = (target_info.get("title") if target_info else None) or target_title or getattr(self, "current_page_title", "") or escaped
                     escaped_title = html.escape(disp_title)
-                    anchor_attr = f' ac:anchor="{html.escape(anchor_name)}"' if anchor_name else ""
 
                     # 自ページ（現在変換中のページ）へのリンクかどうか判定
                     is_self_page = False
-                    if target_uuid and getattr(self, "current_node_id", None):
+                    if href and href.startswith("#"):
+                        is_self_page = True
+                    elif target_uuid and getattr(self, "current_node_id", None):
                         norm_target = target_uuid.replace("-", "").lower()
                         norm_current = self.current_node_id.replace("-", "").lower()
                         if norm_target == norm_current:
@@ -559,11 +584,20 @@ class NotionToConfluenceConverter:
                             if clean_curr == clean_disp:
                                 is_self_page = True
 
+                    # 自ページ内リンクでアンカーが未設定の場合（Notion HTMLエクスポートで#フラグメントが欠落した場合の救済）:
+                    # リンクテキストが現在のページの見出しと一致すれば、見出しアンカーを自動補完
+                    if is_self_page and not anchor_name and hasattr(self, "current_page_headings") and self.current_page_headings:
+                        raw_plain = (item.get("plain_text") or (item.get("text") or {}).get("content", "")).strip()
+                        clean_plain = re.sub(r"<[^>]+>", "", raw_plain).strip()
+                        if clean_plain in self.current_page_headings:
+                            anchor_name = clean_plain
+
                     # ページ内リンク（アンカー指定あり、または同一自ページへのリンク）は、Confluenceがインラインカード化して
                     # アンカーや表示テキスト（例:「熊本城」）をページ名に置き換えるのを防ぐため card-appearance を付与しない。
                     # 一方、別ページへのリンク（ページ間リンク）は、常にConfluenceのインラインリンクオブジェクト（ac:card-appearance="inline"）とする。
                     is_in_page_link = bool(anchor_name or is_self_page)
                     card_attr = "" if is_in_page_link else ' ac:card-appearance="inline"'
+                    anchor_attr = f' ac:anchor="{html.escape(anchor_name)}"' if anchor_name else ""
                     escaped = (
                         f'<ac:link{card_attr}{anchor_attr}>'
                         f'<ri:page ri:content-title="{escaped_title}" />'
@@ -599,9 +633,53 @@ class NotionToConfluenceConverter:
             return style_attr, color
         return "", "default"
 
+    def _collect_page_anchors(self, blocks: List[Dict[str, Any]]) -> None:
+        """ページ内の見出しやブロックからアンカー名およびブロックIDマッピングを事前抽出する。"""
+        if not blocks:
+            return
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            b_type = b.get("type")
+            b_id = b.get("id")
+
+            # ブロック内のリンクから参照されているアンカーを抽出
+            data_dict = b.get(b_type, {}) if isinstance(b.get(b_type), dict) else {}
+            for rt in data_dict.get("rich_text", []):
+                link_obj = (rt.get("text") or {}).get("link") or {}
+                url = link_obj.get("url") if isinstance(link_obj, dict) else None
+                if not url and rt.get("href"):
+                    url = rt.get("href")
+                if url and "#" in url:
+                    anchor = urllib.parse.unquote(url.split("#", 1)[1].strip())
+                    if anchor:
+                        self.referenced_anchors.add(anchor)
+                        self.referenced_anchors.add(anchor.replace("-", "").lower())
+
+            if b_type in ("heading_1", "heading_2", "heading_3"):
+                rich_texts = data_dict.get("rich_text", [])
+                raw_text = "".join(t.get("plain_text", "") for t in rich_texts).strip()
+                clean_text = re.sub(r"<[^>]+>", "", raw_text).strip()
+                if clean_text:
+                    self.current_page_headings.add(clean_text)
+                    if b_id:
+                        self.current_page_block_anchors[b_id] = clean_text
+                        norm_id = b_id.replace("-", "").lower()
+                        self.current_page_block_anchors[norm_id] = clean_text
+            elif b_id:
+                norm_id = b_id.replace("-", "").lower()
+                self.current_page_block_anchors[b_id] = norm_id
+                self.current_page_block_anchors[norm_id] = norm_id
+
+            if b.get("children_blocks"):
+                self._collect_page_anchors(b["children_blocks"])
+
     def blocks_to_storage_format(self, blocks: List[Dict[str, Any]], context_heading: str = "") -> str:
         """NotionブロックのリストをConfluence Storage Format (XHTML) に変換する。
         連続する箇条書き、番号付きリスト、ToDoリストを適切にタグでラップする。"""
+        if not context_heading and not self.current_page_headings:
+            self._collect_page_anchors(blocks)
+
         output = []
         current_list_type = None  # "bulleted", "numbered", "to_do"
         list_buffer = []
@@ -688,17 +766,36 @@ class NotionToConfluenceConverter:
                 style_attr, inline_color = self._get_block_style_attr(h_color, base_padding="6px 10px")
                 text = self.convert_rich_text(h_data.get("rich_text", []), default_color=inline_color)
                 current_heading = text
+                raw_h_text = "".join(t.get("plain_text", "") for t in h_data.get("rich_text", [])).strip()
+                clean_h_text = re.sub(r"<[^>]+>", "", raw_h_text).strip()
+                b_id = b.get("id")
+                anchor_macro = ""
+                if clean_h_text:
+                    anchor_macro += (
+                        f'<ac:structured-macro ac:name="anchor">'
+                        f'<ac:parameter ac:name="">{html.escape(clean_h_text)}</ac:parameter>'
+                        f'</ac:structured-macro>'
+                    )
+                if b_id:
+                    norm_id = b_id.replace("-", "").lower()
+                    if norm_id and norm_id != clean_h_text:
+                        anchor_macro += (
+                            f'<ac:structured-macro ac:name="anchor">'
+                            f'<ac:parameter ac:name="">{norm_id}</ac:parameter>'
+                            f'</ac:structured-macro>'
+                        )
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
                     param_title = clean_parameter_text(text) or "詳細"
                     output.append(
+                        f'{anchor_macro}'
                         f'<ac:structured-macro ac:name="expand">'
                         f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
                         f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
                 else:
-                    output.append(f"<h1{style_attr}>{text}</h1>")
+                    output.append(f"<h1{style_attr}>{anchor_macro}{text}</h1>")
 
             elif b_type == "heading_2":
                 h_data = b.get("heading_2", {})
@@ -706,17 +803,36 @@ class NotionToConfluenceConverter:
                 style_attr, inline_color = self._get_block_style_attr(h_color, base_padding="6px 10px")
                 text = self.convert_rich_text(h_data.get("rich_text", []), default_color=inline_color)
                 current_heading = text
+                raw_h_text = "".join(t.get("plain_text", "") for t in h_data.get("rich_text", [])).strip()
+                clean_h_text = re.sub(r"<[^>]+>", "", raw_h_text).strip()
+                b_id = b.get("id")
+                anchor_macro = ""
+                if clean_h_text:
+                    anchor_macro += (
+                        f'<ac:structured-macro ac:name="anchor">'
+                        f'<ac:parameter ac:name="">{html.escape(clean_h_text)}</ac:parameter>'
+                        f'</ac:structured-macro>'
+                    )
+                if b_id:
+                    norm_id = b_id.replace("-", "").lower()
+                    if norm_id and norm_id != clean_h_text:
+                        anchor_macro += (
+                            f'<ac:structured-macro ac:name="anchor">'
+                            f'<ac:parameter ac:name="">{norm_id}</ac:parameter>'
+                            f'</ac:structured-macro>'
+                        )
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
                     param_title = clean_parameter_text(text) or "詳細"
                     output.append(
+                        f'{anchor_macro}'
                         f'<ac:structured-macro ac:name="expand">'
                         f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
                         f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
                 else:
-                    output.append(f"<h2{style_attr}>{text}</h2>")
+                    output.append(f"<h2{style_attr}>{anchor_macro}{text}</h2>")
 
             elif b_type == "heading_3":
                 h_data = b.get("heading_3", {})
@@ -724,17 +840,36 @@ class NotionToConfluenceConverter:
                 style_attr, inline_color = self._get_block_style_attr(h_color, base_padding="6px 10px")
                 text = self.convert_rich_text(h_data.get("rich_text", []), default_color=inline_color)
                 current_heading = text
+                raw_h_text = "".join(t.get("plain_text", "") for t in h_data.get("rich_text", [])).strip()
+                clean_h_text = re.sub(r"<[^>]+>", "", raw_h_text).strip()
+                b_id = b.get("id")
+                anchor_macro = ""
+                if clean_h_text:
+                    anchor_macro += (
+                        f'<ac:structured-macro ac:name="anchor">'
+                        f'<ac:parameter ac:name="">{html.escape(clean_h_text)}</ac:parameter>'
+                        f'</ac:structured-macro>'
+                    )
+                if b_id:
+                    norm_id = b_id.replace("-", "").lower()
+                    if norm_id and norm_id != clean_h_text:
+                        anchor_macro += (
+                            f'<ac:structured-macro ac:name="anchor">'
+                            f'<ac:parameter ac:name="">{norm_id}</ac:parameter>'
+                            f'</ac:structured-macro>'
+                        )
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
                     param_title = clean_parameter_text(text) or "詳細"
                     output.append(
+                        f'{anchor_macro}'
                         f'<ac:structured-macro ac:name="expand">'
                         f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
                         f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
                 else:
-                    output.append(f"<h3{style_attr}>{text}</h3>")
+                    output.append(f"<h3{style_attr}>{anchor_macro}{text}</h3>")
 
             elif b_type == "table_of_contents":
                 # Confluence 目次マクロ (TOC Macro)
@@ -1217,9 +1352,21 @@ class NotionToConfluenceConverter:
                 filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
                 caption = self.convert_rich_text(img_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
+                b_id = b.get("id")
+                img_anchor = ""
+                if b_id:
+                    norm_id = b_id.replace("-", "").lower()
+                    if hasattr(self, "referenced_anchors") and (
+                        b_id in self.referenced_anchors or norm_id in self.referenced_anchors
+                    ):
+                        img_anchor = (
+                            f'<ac:structured-macro ac:name="anchor">'
+                            f'<ac:parameter ac:name="">{norm_id}</ac:parameter>'
+                            f'</ac:structured-macro>'
+                        )
                 if img_url or filename:
                     output.append(
-                        f'<p><ac:image>'
+                        f'<p>{img_anchor}<ac:image>'
                         f'<ri:attachment ri:filename="{html.escape(filename)}" />'
                         f'</ac:image></p>{caption_html}'
                     )
@@ -1716,6 +1863,10 @@ class NotionToConfluenceConverter:
         """PageNodeのデータからConfluenceページ用の本文 (Storage Format) を生成する。"""
         self.current_node_id = getattr(node, "id", None)
         self.current_page_title = getattr(node, "title", None)
+        self.current_page_headings = set()
+        self.current_page_block_anchors = {}
+        self.referenced_anchors = set()
+        self._collect_page_anchors(getattr(node, "blocks", []))
         cover_html = ""
         cover_file = getattr(node, "_cover_filename", None) or (
             f"cover_{node.id.replace('-', '')[:8]}.jpg" if getattr(node, "cover", None) else None
