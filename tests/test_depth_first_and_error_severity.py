@@ -5,6 +5,7 @@ import requests
 import json
 import os
 import shutil
+import tempfile
 
 import src.logger_util as logger_util
 from src.cancellation import CancellationManager, MigrationCancelledException
@@ -146,40 +147,36 @@ class TestDepthFirstAndErrorSeverity(unittest.TestCase):
 
     def test_resume_missing_confluence_page_recreation(self):
         """チェックポイントに記録済みでもConfluenceサーバー上に実在しない場合、チェックポイントを解除して再作成されることを検証"""
-        test_cp_file = "test_cp_missing.json"
-        if os.path.exists(test_cp_file):
-            os.remove(test_cp_file)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_cp_file = os.path.join(tmpdir, "test_cp_missing.json")
 
-        cp = MigrationCheckpoint(test_cp_file)
-        cp.record_pass1(node_id="node_p1", confluence_id="99999", title="Ghost Page", url="https://...", node_type="page")
+            cp = MigrationCheckpoint(test_cp_file)
+            cp.record_pass1(node_id="node_p1", confluence_id="99999", title="Ghost Page", url="https://...", node_type="page")
 
-        importer = ConfluenceImporter(
-            url="https://example.atlassian.net/wiki",
-            username="u",
-            token="t",
-            space_key="TEST",
-            checkpoint=cp,
-        )
+            importer = ConfluenceImporter(
+                url="https://example.atlassian.net/wiki",
+                username="u",
+                token="t",
+                space_key="TEST",
+                checkpoint=cp,
+            )
 
-        # サーバー上に実在しない (None を返す)
-        importer.client.get_page_by_id = MagicMock(return_value=None)
-        recreated = []
-        def mock_create(title, body, parent_id, overwrite):
-            recreated.append(title)
-            return "new_123", "https://new_url"
+            # サーバー上に実在しない (None を返す)
+            importer.client.get_page_by_id = MagicMock(return_value=None)
+            recreated = []
+            def mock_create(title, body, parent_id, overwrite):
+                recreated.append(title)
+                return "new_123", "https://new_url"
 
-        importer._create_or_update_page = mock_create
-        importer.client.update_page = MagicMock(return_value={"id": "new_123"})
+            importer._create_or_update_page = mock_create
+            importer.client.update_page = MagicMock(return_value={"id": "new_123"})
 
-        node = PageNode(id="node_p1", title="Ghost Page", node_type="page")
-        cid = importer._import_node_recursive(node, parent_id=None, overwrite=False)
+            node = PageNode(id="node_p1", title="Ghost Page", node_type="page")
+            cid = importer._import_node_recursive(node, parent_id=None, overwrite=False)
 
-        self.assertEqual(cid, "new_123")
-        self.assertIn("Ghost Page", recreated)
-        self.assertEqual(cp.get_node_info("node_p1")["confluence_id"], "new_123")
-
-        if os.path.exists(test_cp_file):
-            os.remove(test_cp_file)
+            self.assertEqual(cid, "new_123")
+            self.assertIn("Ghost Page", recreated)
+            self.assertEqual(cp.get_node_info("node_p1")["confluence_id"], "new_123")
 
 
 if __name__ == "__main__":

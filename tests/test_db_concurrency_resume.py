@@ -7,6 +7,7 @@ Task B.2: 大規模DBパイプライン、子ページ並行作成、および�
 
 import os
 import sys
+import tempfile
 import unittest
 import threading
 from unittest.mock import MagicMock, patch
@@ -20,14 +21,10 @@ from src.importer import ConfluenceImporter, ConfluenceClient
 
 class TestDatabaseConcurrencyAndResume(unittest.TestCase):
     def setUp(self):
-        self.checkpoint_file = "test_db_checkpoint.json"
-        if os.path.exists(self.checkpoint_file):
-            os.remove(self.checkpoint_file)
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.checkpoint_file = os.path.join(self._tmpdir.name, "test_db_checkpoint.json")
         self.checkpoint = MigrationCheckpoint(self.checkpoint_file)
-
-    def tearDown(self):
-        if os.path.exists(self.checkpoint_file):
-            os.remove(self.checkpoint_file)
 
     def test_checkpoint_thread_safety(self):
         """マルチスレッド環境で同時にチェックポイントに書き込んでも破損しないことを検証"""

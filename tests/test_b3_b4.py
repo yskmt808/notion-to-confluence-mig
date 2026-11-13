@@ -5,6 +5,7 @@ Task B.3 (API Enrichment Mode) および Task B.4 (Worksheet Mode) のテスト�
 import os
 import sys
 import json
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -111,8 +112,10 @@ class TestTaskB4WorksheetManager(unittest.TestCase):
 
     def setUp(self):
         self.ws_mgr = WorksheetManager()
-        self.test_csv = "test_worksheet.csv"
-        self.test_json = "test_worksheet.json"
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.test_csv = os.path.join(self._tmpdir.name, "test_worksheet.csv")
+        self.test_json = os.path.join(self._tmpdir.name, "test_worksheet.json")
 
         # テスト用DBツリー構築
         self.db_node = PageNode(
@@ -133,11 +136,6 @@ class TestTaskB4WorksheetManager(unittest.TestCase):
             ],
         )
         self.tree = PageNode(id="root", title="Root", node_type="page", children=[self.db_node])
-
-    def tearDown(self):
-        for f in [self.test_csv, self.test_json]:
-            if os.path.exists(f):
-                os.remove(f)
 
     def test_export_and_import_csv_worksheet(self):
         # 1. チェックシート出力 (CSV)

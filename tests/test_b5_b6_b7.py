@@ -8,6 +8,7 @@ Task B.5, B.6, B.7 の機能検証テストスイート。
 import os
 import sys
 import json
+import tempfile
 import unittest
 from unittest.mock import MagicMock
 
@@ -74,9 +75,9 @@ class TestTaskB5SanitizedTelemetry(unittest.TestCase):
         self.assertIn("breadcrumb", report["diagnostics"]["unsupported_elements_detected"])
 
     def test_save_debug_reports(self):
-        json_path = "test_debug_report.json"
-        md_path = "test_debug_report.md"
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, "test_debug_report.json")
+            md_path = os.path.join(tmpdir, "test_debug_report.md")
             self.telemetry.record_timing("step1_extract_seconds", 1.23)
             self.telemetry.record_macro("toc")
             self.telemetry.record_macro("section")
@@ -96,25 +97,16 @@ class TestTaskB5SanitizedTelemetry(unittest.TestCase):
             self.assertIn("Notion to Confluence 移行診断レポート", md_text)
             self.assertIn("[REDACTED_EMAIL]", md_text)
             self.assertNotIn("user@corp.com", md_text)
-        finally:
-            if os.path.exists(json_path):
-                os.remove(json_path)
-            if os.path.exists(md_path):
-                os.remove(md_path)
 
 
 class TestTaskB6CheckpointResume(unittest.TestCase):
     """Task B.6: チェックポイント保存と再開（レジューム）のテスト"""
 
     def setUp(self):
-        self.checkpoint_file = "test_checkpoint.json"
-        if os.path.exists(self.checkpoint_file):
-            os.remove(self.checkpoint_file)
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.checkpoint_file = os.path.join(self._tmpdir.name, "test_checkpoint.json")
         self.checkpoint = MigrationCheckpoint(self.checkpoint_file)
-
-    def tearDown(self):
-        if os.path.exists(self.checkpoint_file):
-            os.remove(self.checkpoint_file)
 
     def test_atomic_save_and_load(self):
         self.checkpoint.record_pass1(
