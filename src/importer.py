@@ -782,6 +782,7 @@ class ConfluenceImporter:
         self._parent_locks: Dict[str, threading.Lock] = {}
         self._reserved_titles: Set[str] = set()
         self._node_to_title: Dict[str, str] = {}
+        self._db_view_requirements: Dict[str, Dict[str, Any]] = {}
         self.client = ConfluenceClient(url, username, token)
         if self.private_mode:
             current_user = self.client.get_current_user()
@@ -807,6 +808,153 @@ class ConfluenceImporter:
                         self._node_to_title[n_id] = c_title
                 logger.info(f"Initialized migration map with {len(existing_map)} nodes from checkpoint ({len(self._reserved_titles)} titles reserved).")
 
+    @staticmethod
+    def _extract_db_field_values(db_node: PageNode, field_name: str) -> List[str]:
+        """データベースノードの子行から指定フィールドのユニーク値一覧をソート済みで抽出する。"""
+        field_vals: Set[str] = set()
+        for child in getattr(db_node, "children", []) or []:
+            p_val = getattr(child, "properties", {}).get(field_name)
+            if isinstance(p_val, dict):
+                val = p_val.get("value")
+                if isinstance(val, list):
+                    for item in val:
+                        lbl = (item.get("label") or item.get("name")) if isinstance(item, dict) else str(item)
+                        if lbl:
+                            field_vals.add(str(lbl).strip())
+                elif val is not None and str(val).strip():
+                    field_vals.add(str(val).strip())
+            elif p_val is not None and str(p_val).strip():
+                field_vals.add(str(p_val).strip())
+        return sorted(v for v in field_vals if v)
+
+    def _analyze_database_view_requirements(self, root_node: PageNode) -> Dict[str, Dict[str, Any]]:
+        """ツリー全体を事前スキャンし、各データベースに対して他ページから参照されているビュー要件を収集する。"""
+        db_by_norm_id: Dict[str, str] = {}
+        db_by_title: Dict[str, str] = {}
+
+        def _collect_dbs(n: PageNode):
+            if n.node_type == "database":
+                norm_id = n.id.replace("-", "").lower()
+                db_by_norm_id[norm_id] = norm_id
+                if n.title:
+                    db_by_title[n.title] = norm_id
+            for c in n.children:
+                _collect_dbs(c)
+
+        _collect_dbs(root_node)
+        if not db_by_norm_id:
+            return {}
+
+        reqs: Dict[str, Dict[str, Any]] = {}
+
+        def _ensure_req(db_norm_id: str) -> Dict[str, Any]:
+            if db_norm_id not in reqs:
+                reqs[db_norm_id] = {
+                    "needs_board": False,
+                    "board_fields": set(),
+                    "needs_gallery": False,
+                    "group_by_fields": set(),
+                    "requested_contexts": set(),
+                }
+            return reqs[db_norm_id]
+
+        def _resolve_db_norm_id(candidate_ids: List[str], candidate_title: str = "") -> Optional[str]:
+            for cid in candidate_ids:
+                if cid:
+                    nid = str(cid).replace("-", "").lower()
+                    if nid in db_by_norm_id:
+                        return nid
+            if candidate_title:
+                if candidate_title in db_by_title:
+                    return db_by_title[candidate_title]
+                for m_title, nid in db_by_title.items():
+                    if m_title.endswith(candidate_title):
+                        return nid
+            return None
+
+        def _extract_plain(rt_list: List[Dict[str, Any]]) -> str:
+            return "".join(t.get("plain_text", "") or t.get("text", {}).get("content", "") for t in (rt_list or [])).strip()
+
+        def _scan_blocks(blocks: List[Dict[str, Any]], page_title: str, inherited_heading: str = ""):
+            current_heading = inherited_heading
+            for b in blocks or []:
+                b_type = b.get("type", "")
+                if b_type in ("heading_1", "heading_2", "heading_3"):
+                    h_txt = _extract_plain(b.get(b_type, {}).get("rich_text", []))
+                    if h_txt:
+                        current_heading = h_txt
+                elif b_type == "toggle":
+                    t_txt = _extract_plain(b.get("toggle", {}).get("rich_text", []))
+                    if b.get("children_blocks"):
+                        _scan_blocks(b["children_blocks"], page_title, inherited_heading=(t_txt or current_heading))
+                    continue
+
+                if b_type == "child_database" and b.get("is_linked_database"):
+                    c_ids = []
+                    if b.get("database_id"):
+                        c_ids.append(b["database_id"])
+                    if b.get("id"):
+                        c_ids.append(b["id"])
+                    data_sources = b.get("data_sources", [])
+                    src_name = ""
+                    for ds in data_sources:
+                        if isinstance(ds, dict):
+                            if ds.get("id"):
+                                c_ids.append(ds["id"])
+                            if not src_name and ds.get("name"):
+                                src_name = ds["name"]
+                    target_db = _resolve_db_norm_id(c_ids, src_name)
+                    if target_db:
+                        r = _ensure_req(target_db)
+                        if page_title:
+                            r["requested_contexts"].add(page_title)
+                        if current_heading:
+                            r["requested_contexts"].add(current_heading)
+                        for v in b.get("views", []) or []:
+                            v_name = v.get("name", "") or ""
+                            v_type = (v.get("type") or "").lower()
+                            v_cfg = v.get("configuration", {}) or {}
+                            gb = v_cfg.get("group_by")
+                            gb_prop = gb.get("property_name") if isinstance(gb, dict) else None
+                            if v_name:
+                                r["requested_contexts"].add(v_name)
+                            if v_type == "board" or "ボード" in v_name or "board" in v_name.lower() or "カンバン" in v_name:
+                                r["needs_board"] = True
+                                if gb_prop:
+                                    r["board_fields"].add(gb_prop)
+                            elif v_type == "gallery" or "ギャラリー" in v_name or "gallery" in v_name.lower():
+                                r["needs_gallery"] = True
+                            if gb_prop and v_type != "board":
+                                r["group_by_fields"].add(gb_prop)
+
+                elif b_type == "link_to_page":
+                    lp = b.get("link_to_page", {}) or {}
+                    target_id = lp.get("page_id") or lp.get("database_id")
+                    target_db = _resolve_db_norm_id([target_id] if target_id else [])
+                    if target_db:
+                        r = _ensure_req(target_db)
+                        if page_title:
+                            r["requested_contexts"].add(page_title)
+                        if current_heading:
+                            r["requested_contexts"].add(current_heading)
+                        ctx_lower = f"{current_heading} {page_title}".lower()
+                        if any(kw in ctx_lower for kw in ("ボード", "カンバン", "board")):
+                            r["needs_board"] = True
+                        if any(kw in ctx_lower for kw in ("ギャラリー", "カード", "gallery")):
+                            r["needs_gallery"] = True
+
+                if b.get("children_blocks"):
+                    _scan_blocks(b["children_blocks"], page_title, inherited_heading=current_heading)
+
+        def _traverse_pages(n: PageNode):
+            if n.blocks:
+                _scan_blocks(n.blocks, n.title or "")
+            for c in n.children:
+                _traverse_pages(c)
+
+        _traverse_pages(root_node)
+        return reqs
+
     def import_tree(
         self,
         root_node: PageNode,
@@ -824,6 +972,9 @@ class ConfluenceImporter:
         collect_titles(root_node)
         self.converter.id_to_title_map = id_title_map
         self.converter.migration_map = self.migration_map
+
+        # ツリー全体を事前スキャンし、他ページから参照されているDBビュー要件（ボード/ギャラリー/カテゴリ等）を収集
+        self._db_view_requirements = self._analyze_database_view_requirements(root_node)
 
         # ダッシュボードの開始 (Task B.10)
         def _count_tree_nodes(n: PageNode) -> int:
@@ -1858,51 +2009,82 @@ class ConfluenceImporter:
                             if not has_gallery_view:
                                 self.client.create_database_view(confluence_page_id, view_name=v_name, layout="gallery")
                 else:
-                    # 3.6-a. ボードビュー (Board): single-select フィールド（ステータス、優先度等）に対して自動生成（重複作成防止）
-                    if single_props:
-                        for s_field in single_props:
-                            board_view_name = f"{s_field}別ボード"
-                            if board_view_name in existing_board_names:
-                                logger.info(f"Board view [{board_view_name}] already exists on database [{node.title}], reusing it.")
-                                continue
+                    norm_db_id = node.id.replace("-", "").lower()
+                    db_req = getattr(self, "_db_view_requirements", {}).get(norm_db_id, {})
+                    STATUS_FIELD_NAMES = ("ステータス", "Status", "進捗", "状態", "優先度", "Priority")
+                    primary_status_field = next((f for f in single_props if f in STATUS_FIELD_NAMES), None)
+                    primary_status_vals = (
+                        self._extract_db_field_values(node, primary_status_field)
+                        if primary_status_field
+                        else []
+                    )
+                    is_smart_status = 2 <= len(primary_status_vals) <= 7
 
-                            url_get = f"{self.client.base_url}/api/v2/databases/{confluence_page_id}"
-                            r_get = requests.get(url_get, auth=self.client.auth, timeout=15)
-                            if r_get.ok:
-                                cur_v = r_get.json().get("version", {}).get("number", 1)
-                                b_csv = f"<metadata>\nadd_view,{board_view_name},board,{s_field}\n</metadata>\n<data>\noperation_type,entry_index\n</data>"
-                                requests.put(
-                                    url_get,
-                                    json={"id": str(confluence_page_id), "version": {"number": cur_v + 1}, "body": {"representation": "csv", "value": b_csv}},
-                                    auth=self.client.auth,
-                                    timeout=30,
-                                )
-                                logger.info(f"Created board view [{board_view_name}] on database [{node.title}]")
+                    # 3.6-a. ボードビュー (Board): 他ページから参照されている軸、または厳選ステータス列(値2〜7件)のみ生成
+                    board_fields_to_create: List[str] = []
+                    for bf in sorted(db_req.get("board_fields", set())):
+                        if bf in single_props and bf not in board_fields_to_create:
+                            board_fields_to_create.append(bf)
+                    if db_req.get("needs_board") and not board_fields_to_create:
+                        fallback_bf = primary_status_field or (single_props[0] if single_props else None)
+                        if fallback_bf:
+                            board_fields_to_create.append(fallback_bf)
+                    if is_smart_status and primary_status_field and primary_status_field not in board_fields_to_create:
+                        board_fields_to_create.append(primary_status_field)
 
-                    # 3.6-b. ギャラリービュー (Gallery)
-                    if not has_gallery_view:
-                        self.client.create_database_view(confluence_page_id, view_name="ギャラリービュー", layout="gallery")
-                    else:
-                        logger.info(f"Gallery view already exists on database [{node.title}], reusing it.")
+                    for s_field in board_fields_to_create:
+                        board_view_name = f"{s_field}別ボード"
+                        if board_view_name in existing_board_names:
+                            logger.info(f"Board view [{board_view_name}] already exists on database [{node.title}], reusing it.")
+                            continue
 
-                    # 3.6-c. Group by フィルタービュー: single-select フィールドの各ユニーク値に対してフィルタービューを生成
-                    if single_props:
-                        primary_field = next((f for f in single_props if f in ("ステータス", "Status", "進捗", "状態")), single_props[0])
-                        field_vals = set()
-                        for child in node.children:
-                            p_val = child.properties.get(primary_field, {})
-                            if isinstance(p_val, dict):
-                                val = p_val.get("value")
-                                if isinstance(val, list):
-                                    for item in val:
-                                        lbl = item.get("label") or item.get("name") if isinstance(item, dict) else str(item)
-                                        if lbl:
-                                            field_vals.add(lbl)
-                                elif val:
-                                    field_vals.add(str(val))
-                        if field_vals:
-                            logger.info(f"Setting up group-by filtered views for [{node.title}] on field [{primary_field}]: {field_vals}")
-                            self.client.setup_grouped_database_views(confluence_page_id, primary_field, sorted(list(field_vals)))
+                        url_get = f"{self.client.base_url}/api/v2/databases/{confluence_page_id}"
+                        r_get = requests.get(url_get, auth=self.client.auth, timeout=15)
+                        if r_get.ok:
+                            cur_v = r_get.json().get("version", {}).get("number", 1)
+                            b_csv = f"<metadata>\nadd_view,{board_view_name},board,{s_field}\n</metadata>\n<data>\noperation_type,entry_index\n</data>"
+                            requests.put(
+                                url_get,
+                                json={"id": str(confluence_page_id), "version": {"number": cur_v + 1}, "body": {"representation": "csv", "value": b_csv}},
+                                auth=self.client.auth,
+                                timeout=30,
+                            )
+                            logger.info(f"Created board view [{board_view_name}] on database [{node.title}]")
+
+                    # 3.6-b. ギャラリービュー (Gallery): 他ページから明示的に参照されている場合のみ生成
+                    if db_req.get("needs_gallery"):
+                        if not has_gallery_view:
+                            self.client.create_database_view(confluence_page_id, view_name="ギャラリービュー", layout="gallery")
+                        else:
+                            logger.info(f"Gallery view already exists on database [{node.title}], reusing it.")
+
+                    # 3.6-c. フィルタービュー:
+                    #   1) 参照元で Group by 指定された列の全ユニーク値
+                    #   2) 参照元のページタイトル・見出し・ビュー名に一致するカテゴリ値等のピンポイント生成（件数上限なし）
+                    #   3) 代表ステータス列かつユニーク値 2〜7件のスマート厳選自動生成
+                    filter_views_to_create: Dict[str, Set[str]] = {}
+                    for gb_field in sorted(db_req.get("group_by_fields", set())):
+                        vals = self._extract_db_field_values(node, gb_field)
+                        if vals:
+                            filter_views_to_create.setdefault(gb_field, set()).update(vals)
+
+                    requested_contexts = db_req.get("requested_contexts", set())
+                    if requested_contexts:
+                        all_candidate_props = list(dict.fromkeys(single_props + multi_props))
+                        for prop_name in all_candidate_props:
+                            vals = self._extract_db_field_values(node, prop_name)
+                            for v in vals:
+                                if any((v == ctx or (len(v) >= 2 and v in ctx)) for ctx in requested_contexts):
+                                    filter_views_to_create.setdefault(prop_name, set()).add(v)
+
+                    if is_smart_status and primary_status_field:
+                        filter_views_to_create.setdefault(primary_status_field, set()).update(primary_status_vals)
+
+                    for f_field, f_vals_set in filter_views_to_create.items():
+                        if f_vals_set:
+                            sorted_vals = sorted(list(f_vals_set))
+                            logger.info(f"Setting up filtered views for [{node.title}] on field [{f_field}]: {sorted_vals}")
+                            self.client.setup_grouped_database_views(confluence_page_id, f_field, sorted_vals)
 
                 # 最新のビュー一覧を取得してマッピング
                 # 重複ビューがある場合、適切な type (board/gallery/table) を最優先でマッピングする

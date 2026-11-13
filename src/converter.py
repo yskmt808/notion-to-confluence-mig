@@ -1263,10 +1263,12 @@ class NotionToConfluenceConverter:
                     db_url = db_info.get("url")
                     views = db_info.get("views", {})
                     active_context = (context_heading or current_heading).strip()
+                    page_title_ctx = (getattr(self, "current_page_title", "") or "").strip()
+                    combined_ctx = f"{active_context} {page_title_ctx}".strip()
 
-                    # 見出し・トグルの文脈に応じた最適なConfluence DatabasesビューIDの自動選択
+                    # 見出し・トグル・ページタイトルの文脈に応じた最適なConfluence DatabasesビューIDの自動選択
                     if not saved_view_id and views:
-                        act_lower = active_context.lower()
+                        act_lower = combined_ctx.lower()
                         if any(kw in act_lower for kw in ("ボード", "カンバン", "board")):
                             saved_view_id = next((vid for name, vid in views.items() if "ボード" in name or "board" in name.lower()), None)
                         elif any(kw in act_lower for kw in ("ギャラリー", "カード", "gallery")):
@@ -1274,10 +1276,13 @@ class NotionToConfluenceConverter:
                         elif any(kw in act_lower for kw in ("リスト", "list", "テーブル", "table")):
                             saved_view_id = next((vid for name, vid in views.items() if "すべてのデータ" in name or "default" in name.lower()), None)
                         else:
-                            # Group by フィルタービューの自動マッピング (未着手, 進行中, 完了 etc.)
+                            # Group by / カテゴリフィルタービューの自動マッピング (見出し優先、なければページタイトルで一致判定)
                             for vname, vid in views.items():
                                 clean_vname = vname.split(": ")[-1] if ": " in vname else vname
-                                if clean_vname in active_context:
+                                if clean_vname and (
+                                    (active_context and clean_vname in active_context)
+                                    or (page_title_ctx and len(clean_vname) >= 2 and clean_vname in page_title_ctx)
+                                ):
                                     saved_view_id = vid
                                     break
 
