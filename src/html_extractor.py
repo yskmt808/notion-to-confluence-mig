@@ -148,14 +148,65 @@ def _parse_date_string(val: str) -> Optional[str]:
     return None
 
 
+class AttachmentBlockDict(dict):
+    """添付ファイルの実体バイナリをオンメモリに常駐させず、
+    アクセス時にZIPから遅延読み込み（Lazy Loading）する辞書クラス。
+    メモリ削減のため、通常時はZIPファイルパスとエントリ名のみを保持し、
+    アップロード時等の要求時にのみオンデマンドでバイナリを読み込む。
+    """
+
+    def __getitem__(self, key):
+        if key == "_attachment_bytes" and super().get("_attachment_bytes") is None:
+            zip_p = super().get("_attachment_zip_path")
+            zip_e = super().get("_attachment_zip_entry")
+            if zip_p and zip_e:
+                try:
+                    with zipfile.ZipFile(zip_p, "r") as zf:
+                        return zf.read(zip_e)
+                except Exception as e:
+                    logger.warning(f"Lazy loading attachment failed from {zip_p} ({zip_e}): {e}")
+                    return None
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key == "_attachment_bytes" and super().get("_attachment_bytes") is None:
+            zip_p = super().get("_attachment_zip_path")
+            zip_e = super().get("_attachment_zip_entry")
+            if zip_p and zip_e:
+                try:
+                    with zipfile.ZipFile(zip_p, "r") as zf:
+                        data = zf.read(zip_e)
+                        return data if data is not None else default
+                except Exception as e:
+                    logger.warning(f"Lazy loading attachment failed from {zip_p} ({zip_e}): {e}")
+                    return default
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        if key == "_attachment_bytes":
+            if super().__contains__("_attachment_bytes") and super().get("_attachment_bytes") is not None:
+                return True
+            return bool(super().get("_attachment_zip_path") and super().get("_attachment_zip_entry"))
+        return super().__contains__(key)
+
+    def pop(self, key, *args):
+        if key == "_attachment_bytes":
+            val = self.get("_attachment_bytes", *args) if args else self.get("_attachment_bytes")
+            super().pop("_attachment_bytes", None)
+            super().pop("_attachment_zip_path", None)
+            super().pop("_attachment_zip_entry", None)
+            return val
+        return super().pop(key, *args)
+
+
 class HtmlZipExtractor:
     """NotionのHTMLエクスポートZIPファイルを解析してPageNodeツリーを構築するクラス。"""
 
     def __init__(self, zip_path: str, global_db_csv_map: Optional[Dict[str, str]] = None):
-        self.zip_path = zip_path
+        self.zip_path = os.path.abspath(zip_path)
         self.global_db_csv_map = global_db_csv_map or {}
-        if not os.path.exists(zip_path):
-            raise FileNotFoundError(f"Export zip file not found: {zip_path}")
+        if not os.path.exists(self.zip_path):
+            raise FileNotFoundError(f"Export zip file not found: {self.zip_path}")
 
     def extract_tree(self) -> PageNode:
         """ZIPファイル全体を解析し、ルートPageNodeを返す。"""
@@ -365,6 +416,9 @@ class HtmlZipExtractor:
             comments=comments,
         )
 
+        # BeautifulSoup DOMツリーを明示的に破棄して循環参照を切り離す
+        soup.decompose()
+
         # データベースの場合、CSVから各行レコードを抽出して子ノードとして追加
         if is_database:
             csv_path = db_csv_map[node_id]
@@ -473,13 +527,17 @@ class HtmlZipExtractor:
                 stem_no_id = re.sub(r"\s+[0-9a-fA-F]{32}$", "", stem).strip()
                 row_html_by_stem[_norm_title_key(stem_no_id)] = (r_id, f)
 
-                # HTML内のタイトルを事前読み込み
+                # HTML内のタイトルを事前読み込み（BeautifulSoup DOM生成を回避し正規表現で高速・省メモリ抽出）
                 try:
-                    f_soup = BeautifulSoup(zf.read(f).decode("utf-8"), "html.parser")
-                    f_title_el = f_soup.find("title") or f_soup.find(class_="page-title")
-                    if f_title_el:
-                        f_title = f_title_el.get_text(strip=True)
-                        row_html_by_title[_norm_title_key(f_title)] = (r_id, f)
+                    raw_html_bytes = zf.read(f)
+                    title_match = re.search(rb"<title>(.*?)</title>", raw_html_bytes, re.IGNORECASE | re.DOTALL)
+                    if not title_match:
+                        title_match = re.search(rb'class="page-title"[^>]*>(.*?)</h1>', raw_html_bytes, re.IGNORECASE | re.DOTALL)
+                    if title_match:
+                        title_raw = title_match.group(1).decode("utf-8", errors="ignore")
+                        f_title = re.sub(r"<[^>]+>", "", title_raw).strip()
+                        if f_title:
+                            row_html_by_title[_norm_title_key(f_title)] = (r_id, f)
                 except Exception:
                     pass
 
@@ -502,13 +560,15 @@ class HtmlZipExtractor:
                                 a_target_id = normalize_id(a_uids[-1])
                         if a_target_id and a_txt:
                             html_title_to_uuid[_norm_title_key(a_txt)] = a_target_id
+                db_soup.decompose()
             except Exception as e:
                 logger.debug(f"Failed parsing db_html_path for row mapping: {e}")
 
         logger.info(f"Extracting {len(rows)} records from database CSV: [{db_node.title}]")
         used_row_ids = set()
 
-        for row in rows:
+        import gc
+        for idx, row in enumerate(rows, 1):
             clean_row = {k.lstrip("\ufeff"): v for k, v in row.items()}
             # タスク名またはタイトル列
             raw_title = (
@@ -594,6 +654,7 @@ class HtmlZipExtractor:
                 if row_body:
                     row_blocks = self._parse_elements_to_blocks(row_body, zf, os.path.dirname(row_html_file))
                 row_comments = self._extract_page_comments(row_soup)
+                row_soup.decompose()
 
             # プロパティ辞書の整形
             row_properties = {}
@@ -682,6 +743,10 @@ class HtmlZipExtractor:
                 comments=row_comments,
             )
             db_node.children.append(row_node)
+            if idx % 500 == 0:
+                gc.collect()
+
+        gc.collect()
 
     @staticmethod
     def _parse_date_string(val: str) -> Optional[str]:
@@ -936,12 +1001,12 @@ class HtmlZipExtractor:
         filename = f"embedded_image_{content_hash}{ext}"
         return data_bytes, filename, mime_type
 
-    def _read_zip_attachment_bytes(
+    def _resolve_zip_attachment_path(
         self, zf: zipfile.ZipFile, current_dir: str, src: str
-    ) -> Tuple[Optional[bytes], Optional[str]]:
-        """ZIP内から相対パス指定されたファイルの実体バイナリを安全に探索・取得する。"""
+    ) -> Optional[str]:
+        """ZIP内から相対パス指定されたファイルの実体エントリパスを安全に探索・特定する（実体読込は行わない）。"""
         if not src or src.startswith(("http://", "https://", "data:")):
-            return None, None
+            return None
 
         clean_src = urllib.parse.unquote(src).replace("\\", "/").lstrip("/")
         cand1 = os.path.normpath(os.path.join(current_dir, clean_src)).replace("\\", "/")
@@ -950,18 +1015,23 @@ class HtmlZipExtractor:
 
         name_map = {f.replace("\\", "/"): f for f in zf.namelist()}
 
-        target = None
         if cand1 in name_map:
-            target = name_map[cand1]
+            return name_map[cand1]
         elif cand2 in name_map:
-            target = name_map[cand2]
+            return name_map[cand2]
         else:
             # 末尾一致のフォールバック探索
             for norm_f, orig_f in name_map.items():
                 if norm_f.endswith("/" + basename) or norm_f == basename:
-                    target = orig_f
-                    break
+                    return orig_f
 
+        return None
+
+    def _read_zip_attachment_bytes(
+        self, zf: zipfile.ZipFile, current_dir: str, src: str
+    ) -> Tuple[Optional[bytes], Optional[str]]:
+        """ZIP内から相対パス指定されたファイルの実体バイナリを安全に探索・取得する。"""
+        target = self._resolve_zip_attachment_path(zf, current_dir, src)
         if target:
             try:
                 data = zf.read(target)
@@ -970,6 +1040,8 @@ class HtmlZipExtractor:
                 logger.warning(f"Error reading attachment from ZIP ({target}): {e}")
                 return None, target
 
+        clean_src = urllib.parse.unquote(src).replace("\\", "/").lstrip("/")
+        cand1 = os.path.normpath(os.path.join(current_dir, clean_src)).replace("\\", "/")
         return None, cand1
 
     def _extract_page_comments(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
@@ -1394,7 +1466,7 @@ class HtmlZipExtractor:
                         data_uri_info = self._parse_data_uri(src)
                         if data_uri_info:
                             data_bytes, filename, mime = data_uri_info
-                            block_obj = {
+                            block_obj = AttachmentBlockDict({
                                 "id": el_id,
                                 "type": "image",
                                 "image": {
@@ -1405,39 +1477,41 @@ class HtmlZipExtractor:
                                 },
                                 "_attachment_filename": filename,
                                 "_attachment_bytes": data_bytes,
-                            }
+                            })
                             logger.info(f"Loaded inline base64/data URI image: {filename} ({len(data_bytes)} bytes)")
                             blocks.append(block_obj)
                         else:
                             is_external = src.startswith(("http://", "https://"))
                             img_filename = os.path.basename(urllib.parse.unquote(src))
-                            block_obj = {
+                            resolved_path = None
+                            if not is_external:
+                                resolved_path = self._resolve_zip_attachment_path(zf, current_dir, src)
+
+                            block_obj = AttachmentBlockDict({
                                 "id": el_id,
                                 "type": "image",
                                 "image": {
-                                    "type": "external" if is_external else "file",
+                                    "type": "external" if is_external or not resolved_path else "file",
                                     "caption": caption_rich,
-                                    "external": {"url": src} if is_external else None,
-                                    "file": {"url": src} if not is_external else None,
+                                    "external": {"url": src} if is_external or not resolved_path else None,
+                                    "file": {"url": src} if resolved_path else None,
                                 },
                                 "_attachment_filename": img_filename,
-                            }
-                            if not is_external:
-                                # ZIP内相対パスから画像実体バイナリを取得
-                                data, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, src)
-                                if data:
-                                    block_obj["_attachment_bytes"] = data
-                                    logger.info(f"Loaded inline image attachment from ZIP: {resolved_path} ({len(data)} bytes)")
-                                else:
-                                    logger.warning(f"Image attachment not found in ZIP: src='{src}', resolved='{resolved_path}'")
+                            })
+                            if resolved_path:
+                                block_obj["_attachment_zip_path"] = self.zip_path
+                                block_obj["_attachment_zip_entry"] = resolved_path
+                                logger.info(f"Resolved inline image attachment in ZIP: {resolved_path}")
+                            elif not is_external:
+                                logger.warning(f"Image attachment not found in ZIP: src='{src}'")
                             blocks.append(block_obj)
                 elif href:
                     lower_href = href.lower()
                     is_external = href.startswith(("http://", "https://"))
                     att_filename = os.path.basename(urllib.parse.unquote(href))
-                    zip_bytes = None
+                    resolved_path = None
                     if not is_external:
-                        zip_bytes, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, href)
+                        resolved_path = self._resolve_zip_attachment_path(zf, current_dir, href)
 
                     if "bookmark" in classes or el.find(class_="bookmark"):
                         blocks.append({
@@ -1452,68 +1526,72 @@ class HtmlZipExtractor:
                             "embed": {"url": href},
                         })
                     elif lower_href.endswith(".pdf"):
-                        pdf_obj = {
+                        pdf_obj = AttachmentBlockDict({
                             "id": el_id,
                             "type": "pdf",
                             "pdf": {
-                                "type": "file" if zip_bytes else "external",
+                                "type": "file" if resolved_path else "external",
                                 "caption": caption_rich,
-                                "external": {"url": href} if is_external or not zip_bytes else None,
-                                "file": {"url": att_filename} if zip_bytes else None,
+                                "external": {"url": href} if is_external or not resolved_path else None,
+                                "file": {"url": att_filename} if resolved_path else None,
                             },
                             "_attachment_filename": att_filename,
-                        }
-                        if zip_bytes:
-                            pdf_obj["_attachment_bytes"] = zip_bytes
-                            logger.info(f"Loaded inline PDF attachment from ZIP: {resolved_path} ({len(zip_bytes)} bytes)")
+                        })
+                        if resolved_path:
+                            pdf_obj["_attachment_zip_path"] = self.zip_path
+                            pdf_obj["_attachment_zip_entry"] = resolved_path
+                            logger.info(f"Resolved inline PDF attachment in ZIP: {resolved_path}")
                         blocks.append(pdf_obj)
                     elif lower_href.endswith((".mp3", ".wav", ".m4a", ".aac")):
-                        audio_obj = {
+                        audio_obj = AttachmentBlockDict({
                             "id": el_id,
                             "type": "audio",
                             "audio": {
-                                "type": "file" if zip_bytes else "external",
+                                "type": "file" if resolved_path else "external",
                                 "caption": caption_rich,
-                                "external": {"url": href} if is_external or not zip_bytes else None,
-                                "file": {"url": att_filename} if zip_bytes else None,
+                                "external": {"url": href} if is_external or not resolved_path else None,
+                                "file": {"url": att_filename} if resolved_path else None,
                             },
                             "_attachment_filename": att_filename,
-                        }
-                        if zip_bytes:
-                            audio_obj["_attachment_bytes"] = zip_bytes
-                            logger.info(f"Loaded inline audio attachment from ZIP: {resolved_path} ({len(zip_bytes)} bytes)")
+                        })
+                        if resolved_path:
+                            audio_obj["_attachment_zip_path"] = self.zip_path
+                            audio_obj["_attachment_zip_entry"] = resolved_path
+                            logger.info(f"Resolved inline audio attachment in ZIP: {resolved_path}")
                         blocks.append(audio_obj)
                     elif lower_href.endswith((".mp4", ".mov", ".webm")) or "youtube.com" in lower_href or "youtu.be" in lower_href:
-                        video_obj = {
+                        video_obj = AttachmentBlockDict({
                             "id": el_id,
                             "type": "video",
                             "video": {
-                                "type": "file" if zip_bytes else "external",
+                                "type": "file" if resolved_path else "external",
                                 "caption": caption_rich,
-                                "external": {"url": href} if is_external or not zip_bytes else None,
-                                "file": {"url": att_filename} if zip_bytes else None,
+                                "external": {"url": href} if is_external or not resolved_path else None,
+                                "file": {"url": att_filename} if resolved_path else None,
                             },
                             "_attachment_filename": att_filename,
-                        }
-                        if zip_bytes:
-                            video_obj["_attachment_bytes"] = zip_bytes
-                            logger.info(f"Loaded inline video attachment from ZIP: {resolved_path} ({len(zip_bytes)} bytes)")
+                        })
+                        if resolved_path:
+                            video_obj["_attachment_zip_path"] = self.zip_path
+                            video_obj["_attachment_zip_entry"] = resolved_path
+                            logger.info(f"Resolved inline video attachment in ZIP: {resolved_path}")
                         blocks.append(video_obj)
                     else:
-                        file_obj = {
+                        file_obj = AttachmentBlockDict({
                             "id": el_id,
                             "type": "file",
                             "file": {
-                                "type": "file" if zip_bytes else "external",
+                                "type": "file" if resolved_path else "external",
                                 "caption": caption_rich,
-                                "external": {"url": href} if is_external or not zip_bytes else None,
-                                "file": {"url": att_filename} if zip_bytes else None,
+                                "external": {"url": href} if is_external or not resolved_path else None,
+                                "file": {"url": att_filename} if resolved_path else None,
                             },
                             "_attachment_filename": att_filename,
-                        }
-                        if zip_bytes:
-                            file_obj["_attachment_bytes"] = zip_bytes
-                            logger.info(f"Loaded inline file attachment from ZIP: {resolved_path} ({len(zip_bytes)} bytes)")
+                        })
+                        if resolved_path:
+                            file_obj["_attachment_zip_path"] = self.zip_path
+                            file_obj["_attachment_zip_entry"] = resolved_path
+                            logger.info(f"Resolved inline file attachment in ZIP: {resolved_path}")
                         blocks.append(file_obj)
 
             # 15. 単独のimgタグ
@@ -1523,7 +1601,7 @@ class HtmlZipExtractor:
                     data_uri_info = self._parse_data_uri(src)
                     if data_uri_info:
                         data_bytes, filename, mime = data_uri_info
-                        block_obj = {
+                        block_obj = AttachmentBlockDict({
                             "id": el_id,
                             "type": "image",
                             "image": {
@@ -1534,30 +1612,32 @@ class HtmlZipExtractor:
                             },
                             "_attachment_filename": filename,
                             "_attachment_bytes": data_bytes,
-                        }
+                        })
                         logger.info(f"Loaded inline base64/data URI image: {filename} ({len(data_bytes)} bytes)")
                         blocks.append(block_obj)
                     else:
                         is_external = src.startswith(("http://", "https://"))
                         img_filename = os.path.basename(urllib.parse.unquote(src))
-                        block_obj = {
+                        resolved_path = None
+                        if not is_external:
+                            resolved_path = self._resolve_zip_attachment_path(zf, current_dir, src)
+                        block_obj = AttachmentBlockDict({
                             "id": el_id,
                             "type": "image",
                             "image": {
-                                "type": "external" if is_external else "file",
+                                "type": "external" if is_external or not resolved_path else "file",
                                 "caption": [],
-                                "external": {"url": src} if is_external else None,
-                                "file": {"url": src} if not is_external else None,
+                                "external": {"url": src} if is_external or not resolved_path else None,
+                                "file": {"url": src} if resolved_path else None,
                             },
                             "_attachment_filename": img_filename,
-                        }
-                        if not is_external:
-                            data, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, src)
-                            if data:
-                                block_obj["_attachment_bytes"] = data
-                                logger.info(f"Loaded inline image attachment from ZIP: {resolved_path} ({len(data)} bytes)")
-                            else:
-                                logger.warning(f"Image attachment not found in ZIP: src='{src}', resolved='{resolved_path}'")
+                        })
+                        if resolved_path:
+                            block_obj["_attachment_zip_path"] = self.zip_path
+                            block_obj["_attachment_zip_entry"] = resolved_path
+                            logger.info(f"Resolved inline image attachment in ZIP: {resolved_path}")
+                        elif not is_external:
+                            logger.warning(f"Image attachment not found in ZIP: src='{src}'")
                         blocks.append(block_obj)
 
             # 16. 同期ブロックやネストされたラッパー (div / section または内部にブロック要素を内包する要素)

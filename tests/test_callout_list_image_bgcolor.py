@@ -187,21 +187,21 @@ class TestCalloutListImageBgColor(unittest.TestCase):
 
             extractor = HtmlZipExtractor(zip_path=tmp_zip)
             node = extractor.extract_tree()
+
+            self.assertEqual(len(node.blocks), 1)
+            co_block = node.blocks[0]
+            self.assertEqual(co_block["type"], "callout")
+            co_text = "".join(t["plain_text"] for t in co_block["callout"]["rich_text"])
+            self.assertEqual(co_text.strip(), "コールアウト上部テキスト")
+
+            self.assertEqual(len(co_block["children_blocks"]), 1)
+            img_block = co_block["children_blocks"][0]
+            self.assertEqual(img_block["type"], "image")
+            self.assertEqual(img_block["_attachment_filename"], "sample.png")
+            self.assertEqual(img_block["_attachment_bytes"], b"fake_png_data")
         finally:
             if os.path.exists(tmp_zip):
                 os.remove(tmp_zip)
-
-        self.assertEqual(len(node.blocks), 1)
-        co_block = node.blocks[0]
-        self.assertEqual(co_block["type"], "callout")
-        co_text = "".join(t["plain_text"] for t in co_block["callout"]["rich_text"])
-        self.assertEqual(co_text.strip(), "コールアウト上部テキスト")
-
-        self.assertEqual(len(co_block["children_blocks"]), 1)
-        img_block = co_block["children_blocks"][0]
-        self.assertEqual(img_block["type"], "image")
-        self.assertEqual(img_block["_attachment_filename"], "sample.png")
-        self.assertEqual(img_block["_attachment_bytes"], b"fake_png_data")
 
 
 if __name__ == "__main__":

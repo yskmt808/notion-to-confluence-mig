@@ -1397,8 +1397,11 @@ class ConfluenceImporter:
                 b["_attachment_filename"] = filename
                 if filename in uploaded_filenames:
                     b["_attachment_uploaded"] = True
+                    b.pop("_attachment_bytes", None)
+                    b.pop("_attachment_zip_entry", None)
+                    b.pop("_attachment_zip_path", None)
                 else:
-                    logger.info(f"Uploading pre-loaded attachment bytes for page {page_id}: {filename}")
+                    logger.info(f"Uploading attachment for page {page_id}: {filename}")
                     try:
                         mime_type = detect_attachment_mime_type(filename)
                         self.client.upload_attachment(
@@ -1409,10 +1412,14 @@ class ConfluenceImporter:
                         )
                         uploaded_filenames.add(filename)
                         b["_attachment_uploaded"] = True
-                        logger.info(f"Successfully uploaded pre-loaded attachment: {filename}")
+                        logger.info(f"Successfully uploaded attachment: {filename}")
                     except Exception as e:
                         b["_attachment_uploaded"] = False
-                        logger.warning(f"Failed to upload pre-loaded attachment {filename}: {e}")
+                        logger.warning(f"Failed to upload attachment {filename}: {e}")
+                    finally:
+                        b.pop("_attachment_bytes", None)
+                        b.pop("_attachment_zip_entry", None)
+                        b.pop("_attachment_zip_path", None)
             elif file_url and not is_embed:
                 filename = b.get("_attachment_filename") or self.converter._get_attachment_filename(b)
                 b["_attachment_filename"] = filename
