@@ -368,6 +368,8 @@ python migrate.py --zip export.zip --show-all-pages
 | `--user-mapping` | `<path>` | `None` | NotionユーザーとConfluenceアカウントIDの対応表 (CSV/JSON)。 |
 | `--export-user-mapping` | `[path]` | `None` | 移行ツリー内のNotionユーザーを抽出し自動検索候補付きマッピングCSVを出力。 |
 | `--show-all-pages` | なし | `False` | ノード数が25件超でも省略せず、全ページリストを端末に全件出力。 |
+| `--private` | なし | `False` | 移行先ページの権限を実行者本人のみのプライベート設定（閲覧・編集制限）にする。 |
+| `--visibility` | `<mode>` | `space` | 移行先ページの公開範囲を指定 (`space` または `private`)。 |
 | `--verbose` | なし | `False` | デバッグログおよび全ページ詳細情報を出力。 |
 
 ---
@@ -415,9 +417,9 @@ python migrate.py --zip export.zip --show-all-pages
   3. **移行元ZIPを再指定することなく**、解決可能となった過去ページ（`confluence_id`）のStorage Format（XHTML）をConfluence API経由で取得し、ページ内の未解決マーク部分を確定したConfluence Databaseスマートリンク（必要なビュー作成を含む）または `<ac:link>` に直接置換してページを更新する。
   4. 解決が完了したエントリはレジストリの `unresolved_references` から除去し、`resolved_references` として履歴を更新する。
 
-### 7.3 移行先ページの公開範囲・プライベート権限設定仕様（未実装）
+### 7.3 移行先ページの公開範囲・プライベート権限設定仕様（実装済）
 
-個人のプライベートページ群を他メンバーに公開せずConfluenceへ移行できるよう、移行実行者本人のみに閲覧・編集権限を制限するシンプルな権限設定仕様です。
+個人のプライベートページ群を他メンバーに公開せずConfluenceへ移行できるよう、移行実行者本人のみに閲覧・編集権限を制限する権限設定仕様です。
 
 #### 1. 公開モードの切り替え (`--visibility` または `--private`)
 * **`space`（デフォルト）**:
@@ -425,13 +427,22 @@ python migrate.py --zip export.zip --show-all-pages
 * **`private`（`--private` または `--visibility private`）**:
   - 移行スクリプトを実行しているAPI認証ユーザー（移行実行者本人）のみが閲覧・編集可能なプライベートページとして移行する。
 
-#### 2. 認証ユーザー取得と制限適用フロー
+#### 2. 認証ユーザー取得と即時制限適用フロー
 1. **移行実行者のAccount ID取得**:
-   - 移行開始時に Confluence REST API `GET /wiki/rest/api/user/current` を呼び出し、実行者本人の `accountId` を自動取得する（追加のユーザーID指定は不要）。
-2. **Pass 1 ルートページ作成直後の即時ロック**:
-   - 移行処理中に一時的にもページがスペース内に公開されることを防ぐため、**Pass 1 で移行ツリーの最上位ページ（ルートノード）を作成した直後に**、Confluence Content Restrictions API (`PUT /wiki/rest/api/content/{id}/restriction`) を呼び出し、実行者本人の `accountId` のみに対する `read`（閲覧制限）および `update`（編集制限）を設定する。
+   - `private_mode=True` での `ConfluenceImporter` 初期化時に Confluence REST API `GET /wiki/rest/api/user/current` を呼び出し、実行者本人の `accountId` を自動取得してキャッシュする（取得に失敗した場合は警告を記録し、ルートノード制限適用時に `set_page_private()` 内で再取得を試みる）。
+2. **Pass 1 ルートノード作成直後の即時ロック**:
+   - 移行処理中に一時的にもページがスペース内に公開されるウィンドウを排除するため、**Pass 1 で移行ツリーの最上位ノード（`_is_root=True`）を作成・取得した直後**に、Confluence Content Restrictions API (`PUT /wiki/rest/api/content/{id}/restriction`) を呼び出し、実行者本人の `accountId` のみに対する `read`（閲覧制限）および `update`（編集制限）を設定する。
+   - **通常ルートページの場合**: ダミー本文（`<p>読み込み中...</p>`）による初回 `create_page` 完了直後（既存ページ上書き時はページID確定直後）に即座にロックを実行し、その後にカバー画像・添付ファイルアップロードや本文 `update_page` を実行する。
+   - **データベースルートの場合**: `create_database`（またはフォールバック `create_page` / 既存DB再利用）によるID確定直後に即座にロックを実行し、その後に単一/複数選択オプション設定やビュー追加・子行リペアレントを実行する。
 3. **配下ページ・データベースへの自動継承**:
    - Confluence Cloudの仕様により、親ページに設定された `read`（閲覧制限）は配下の全子ページ・孫ページ・Confluence Database・DBレコード子ページへ自動的に継承されるため、ツリー全体が移行実行者専用の非公開状態となる。
-   - また、移行実行者本人は許可リストに含まれているため、後続の子ページ並行作成、Pass 2 の相互リンク・行ビュー更新、`--resume` 再開、および Step 3 の自動整合性検証はすべてそのまま正常に動作する。
+   - また、移行実行者本人は許可リストに含まれているため、後続の子ページ並行作成、Pass 2 の相互リンク・行ビュー更新、および Step 3 の自動整合性検証はすべてそのまま正常に動作する。
+
+#### 3. `--resume` 再開時の状態復元と失敗時ハンドリング
+* **チェックポイント保存・自動復元**:
+  - `migrate.py` は `checkpoint.source_info["private_mode"]` に公開モード状態を永続化する。
+  - `--resume` 指定時、`--private` および `--visibility` が明示されていない場合は `checkpoint.source_info["private_mode"]` の設定を自動復元する（`--resume --visibility space` を明示指定した場合は `space` モードで上書き可能）。
+* **権限設定失敗時の非致命的警告ハンドリング**:
+  - API権限不足・HTTPエラー・ネットワーク例外・`accountId` 取得不可等により `set_page_private()` が失敗（`False` 返却）した場合でも移行プロセス自体は中断せず、警告ログ（`logger.warning`）およびテレメトリ／ダッシュボード警告（`record_warning`）へ記録した上で移行処理を継続する。
 
 
