@@ -45,6 +45,42 @@ class PageNode:
     last_edited_time: Optional[str] = None
     last_edited_by: Optional[Dict[str, Any]] = None
     _cover_filename: Optional[str] = None
+    external_synced_blocks: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def collect_external_synced_blocks_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """ブロックツリーから本文未展開の外部同期ブロック情報を再帰的に収集する。"""
+    found: List[Dict[str, Any]] = []
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        b_type = b.get("type")
+        children = b.get("children_blocks") or []
+        if b_type == "synced_block":
+            synced_from = (b.get("synced_block") or {}).get("synced_from")
+            sync_ref = synced_from.get("block_id") if isinstance(synced_from, dict) else None
+            is_ext = bool(b.get("_is_external_synced_block"))
+            if (is_ext and not children) or (not children and sync_ref):
+                found.append({
+                    "block_id": b.get("id", ""),
+                    "synced_from": sync_ref,
+                    "message": b.get(
+                        "_external_synced_warning",
+                        "外部同期ブロックの本文が未展開です"
+                        + (f" (同期元: {sync_ref})" if sync_ref else ""),
+                    ),
+                })
+        if children:
+            found.extend(collect_external_synced_blocks_from_blocks(children))
+    return found
+
+
+def get_node_external_synced_blocks(node: Any) -> List[Dict[str, Any]]:
+    """PageNodeに記録された未展開の外部同期ブロック一覧を取得する。"""
+    recorded = getattr(node, "external_synced_blocks", None)
+    if recorded:
+        return list(recorded)
+    return collect_external_synced_blocks_from_blocks(getattr(node, "blocks", None) or [])
 
 
 class NotionExtractor:

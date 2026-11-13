@@ -1332,6 +1332,10 @@ class NotionToConfluenceConverter:
                     output.append(
                         f'<p>🔄 <em>同期ブロック（同期元: {html.escape(sync_orig_id)}）</em></p>'
                     )
+                elif b.get("_is_external_synced_block"):
+                    output.append(
+                        '<p>⚠️ <em>外部同期ブロック（同期元がHTMLエクスポートに含まれていないため本文未展開）</em></p>'
+                    )
 
             elif b_type in ("embed", "figma", "miro", "trello", "maps", "google_drive", "twitter", "gist", "codepen"):
                 embed_data = b.get(b_type, {})
