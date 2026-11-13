@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from src.extractor import PageNode
 from src.converter import NotionToConfluenceConverter
 from src.importer import ConfluenceImporter, ConfluenceClient
+from storage_xml_helper import assert_valid_storage_xml
 
 
 class TestTitleAndDbLinkSafety(unittest.TestCase):
@@ -266,6 +267,7 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
             "plain_text": "Block A: プロジェクト管理・基盤",
         }]
         html_out = conv.convert_rich_text(rich_text_page_title)
+        assert_valid_storage_xml(self, html_out)
         self.assertIn('<ac:link ac:card-appearance="inline">', html_out)
         self.assertIn('<ri:page ri:content-title="Block A: プロジェクト管理・基盤" />', html_out)
 
@@ -279,6 +281,7 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
             "plain_text": "Block A へのリンク",
         }]
         html_custom = conv.convert_rich_text(rich_text_custom)
+        assert_valid_storage_xml(self, html_custom)
         self.assertIn('<ac:link ac:card-appearance="inline">', html_custom)
         self.assertIn('<ri:page ri:content-title="Block A: プロジェクト管理・基盤" />', html_custom)
         self.assertIn('<ac:link-body>Block A へのリンク</ac:link-body>', html_custom)
@@ -286,6 +289,7 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
         # 1-3. タイトルプレフィックスが付与されている別ページへのリンクでも card-appearance="inline" が維持されること
         conv.migration_map["4117be77-284d-8159-abc8-fa6cce1ccf00"]["title"] = "[20261112-TEST] Block A: プロジェクト管理・基盤"
         html_prefixed = conv.convert_rich_text(rich_text_custom)
+        assert_valid_storage_xml(self, html_prefixed)
         self.assertIn('<ac:link ac:card-appearance="inline">', html_prefixed)
         self.assertIn('<ri:page ri:content-title="[20261112-TEST] Block A: プロジェクト管理・基盤" />', html_prefixed)
         conv.migration_map["4117be77-284d-8159-abc8-fa6cce1ccf00"]["title"] = "Block A: プロジェクト管理・基盤"
@@ -297,6 +301,7 @@ class TestTitleAndDbLinkSafety(unittest.TestCase):
             "child_page": {"title": "Block A: プロジェクト管理・基盤"},
         }]
         storage_out = conv.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, storage_out)
         self.assertIn('<ac:link ac:card-appearance="inline">', storage_out)
         self.assertIn('<ri:page ri:content-title="Block A: プロジェクト管理・基盤" />', storage_out)
 

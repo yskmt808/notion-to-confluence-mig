@@ -8,6 +8,7 @@ import io
 import os
 from src.converter import NotionToConfluenceConverter, NOTION_BG_COLOR_MAP
 from src.html_extractor import HtmlZipExtractor
+from storage_xml_helper import assert_valid_storage_xml
 
 
 class TestCalloutListImageBgColor(unittest.TestCase):
@@ -38,6 +39,7 @@ class TestCalloutListImageBgColor(unittest.TestCase):
             }
         ]
         storage = self.conv.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, storage)
         self.assertIn("<ul><li>親リスト項目", storage)
         self.assertIn('<ac:structured-macro ac:name="panel">', storage)
         self.assertIn('<ac:parameter ac:name="bgColor">#fbf3db</ac:parameter>', storage)
@@ -70,6 +72,7 @@ class TestCalloutListImageBgColor(unittest.TestCase):
             }
         ]
         storage = self.conv.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, storage)
         self.assertIn('<ac:structured-macro ac:name="panel">', storage)
         self.assertIn('<ac:parameter ac:name="bgColor">#edf5fb</ac:parameter>', storage)
         self.assertIn("<p>🖼️ 図解解説</p>", storage)
@@ -95,6 +98,7 @@ class TestCalloutListImageBgColor(unittest.TestCase):
                 }
             ]
             html_out = self.conv.convert_rich_text(rt)
+            assert_valid_storage_xml(self, html_out)
             expected_hex = NOTION_BG_COLOR_MAP["green_background" if c == "teal_background" else c]
             self.assertIn(f"background-color: {expected_hex};", html_out)
 
@@ -111,6 +115,7 @@ class TestCalloutListImageBgColor(unittest.TestCase):
             }
         ]
         storage = self.conv.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, storage)
         self.assertIn(f"background-color: {NOTION_BG_COLOR_MAP['yellow_background']};", storage)
 
     def test_html_extractor_nested_callout_in_list(self):

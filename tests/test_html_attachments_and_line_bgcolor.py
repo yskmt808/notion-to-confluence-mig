@@ -10,6 +10,7 @@ from src.converter import NotionToConfluenceConverter
 from src.importer import detect_attachment_mime_type
 from src.verifier import MigrationVerifier
 from src.extractor import PageNode
+from storage_xml_helper import assert_valid_storage_xml
 
 
 class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
@@ -249,6 +250,7 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         ]
 
         html = self.converter.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, html)
 
         # 段落全体に背景色スタイルが適用されていること
         self.assertIn('<p style="background-color: #fbf3db;', html)
@@ -278,6 +280,7 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
             }
         ]
         html = self.converter.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, html)
         self.assertIn('<ac:structured-macro ac:name="view-file"', html)
         self.assertEqual(html.count('<ac:structured-macro ac:name="view-file"'), 1)
         self.assertNotIn('<ac:link>', html)
@@ -295,6 +298,7 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
             }
         ]
         html = self.converter.convert_rich_text(rich_texts)
+        assert_valid_storage_xml(self, html)
         self.assertIn('ri:content-title="エラーパターン"', html)
         self.assertIn('<ac:link-body>熊本城</ac:link-body>', html)
         self.assertNotIn('ac:card-appearance="inline"', html)
@@ -310,6 +314,7 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
             }
         ]
         html_anchor = self.converter.convert_rich_text(rich_anchor)
+        assert_valid_storage_xml(self, html_anchor)
         self.assertIn('ac:anchor="sec-a"', html_anchor)
         self.assertNotIn('ac:card-appearance="inline"', html_anchor)
 

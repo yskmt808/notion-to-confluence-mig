@@ -6,6 +6,7 @@ import unittest
 from src.extractor import PageNode
 from src.converter import NotionToConfluenceConverter
 from src.importer import ConfluenceImporter
+from storage_xml_helper import assert_valid_storage_xml
 
 
 class TestMermaidConverter(unittest.TestCase):
@@ -39,6 +40,7 @@ class TestMermaidConverter(unittest.TestCase):
             },
         }
         res = self.converter.blocks_to_storage_format([block])
+        assert_valid_storage_xml(self, res)
         # 方式②: Confluenceネイティブ codeマクロ (language: mermaid) の生成検証
         self.assertIn('<ac:structured-macro ac:name="code">', res)
         self.assertIn('<ac:parameter ac:name="language">mermaid</ac:parameter>', res)
@@ -147,6 +149,7 @@ class TestIncomingLinksBacklinks(unittest.TestCase):
             {"id": "source-2", "title": "Source Page 2", "url": None},
         ]
         html_out = self.converter.generate_page_content(node, incoming_links=incoming)
+        assert_valid_storage_xml(self, html_out)
 
         # Check body text
         self.assertIn("Page body content.", html_out)
