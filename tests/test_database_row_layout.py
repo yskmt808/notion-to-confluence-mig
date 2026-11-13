@@ -4,6 +4,7 @@ import unittest
 from src.extractor import PageNode
 from src.converter import NotionToConfluenceConverter, DEFAULT_METADATA_TEMPLATE
 from src.user_mapper import UserMappingManager
+from storage_xml_helper import assert_valid_storage_xml
 
 
 class TestDatabaseRowLayoutAndMetadata(unittest.TestCase):
@@ -125,6 +126,7 @@ class TestDatabaseRowLayoutAndMetadata(unittest.TestCase):
         setattr(row_node, "parent_db_title", "テストDB直接リクエスト")
 
         html_out = self.conv.generate_page_content(row_node)
+        assert_valid_storage_xml(self, html_out)
 
         # 1. メタデータヘッダが存在する
         self.assertIn("Notion元情報", html_out)
@@ -164,6 +166,7 @@ class TestDatabaseRowLayoutAndMetadata(unittest.TestCase):
         setattr(row_node, "_entry_embed_url", "https://example.atlassian.net/wiki/database/123?entryId=456")
 
         html_out = self.conv.generate_page_content(row_node)
+        assert_valid_storage_xml(self, html_out)
 
         # 1. Expandマクロ内にネイティブ行ビューURLのみ格納され、静的プロパティテーブルは重複排除されること
         self.assertIn('<ac:structured-macro ac:name="expand">', html_out)
@@ -188,6 +191,7 @@ class TestDatabaseRowLayoutAndMetadata(unittest.TestCase):
         setattr(row_node, "parent_db_url", "https://example.atlassian.net/wiki/database/789")
 
         html_out = self.conv.generate_page_content(row_node)
+        assert_valid_storage_xml(self, html_out)
         self.assertIn('<a href="https://example.atlassian.net/wiki/database/789">親データベース</a>', html_out)
         self.assertNotIn('<ri:page ri:content-title="親データベース"', html_out)
 

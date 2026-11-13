@@ -8,6 +8,7 @@ from src.extractor import NotionExtractor, PageNode
 from src.converter import NotionToConfluenceConverter
 from src.verifier import MigrationVerifier
 from src.importer import ConfluenceClient
+from storage_xml_helper import assert_valid_storage_xml
 
 
 class TestSyncedBlockInPageLinkUntitledDb(unittest.TestCase):
@@ -78,6 +79,7 @@ class TestSyncedBlockInPageLinkUntitledDb(unittest.TestCase):
         }]
 
         html_out = conv.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, html_out)
         # 紫色ボーダーのdivが1つだけ存在すること（多重ネストがアンラップされていること）
         self.assertEqual(html_out.count('border-left: 3px solid #8777D9'), 1)
         # コールアウトの内容が含まれていること
@@ -121,6 +123,7 @@ class TestSyncedBlockInPageLinkUntitledDb(unittest.TestCase):
         ]
 
         html_out = conv.convert_rich_text(rich_text)
+        assert_valid_storage_xml(self, html_out)
         # ac:card-appearance="inline" が付与されていないこと（付与されるとConfluence側でページ名に強制置換される）
         self.assertNotIn('ac:card-appearance="inline"', html_out)
         # 表示テキスト "熊本城" と "見出し１" が保持されていること
@@ -203,6 +206,7 @@ class TestSyncedBlockInPageLinkUntitledDb(unittest.TestCase):
             }
         ]
         html_out = conv.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, html_out)
         self.assertIn('<ac:parameter ac:name="">見出し１</ac:parameter>', html_out)
         self.assertIn('<ac:parameter ac:name="">4157be77284d80e9a11bd66196c4f6e7</ac:parameter>', html_out)
         self.assertIn('<ac:parameter ac:name="">見出し２</ac:parameter>', html_out)
@@ -260,6 +264,7 @@ class TestSyncedBlockInPageLinkUntitledDb(unittest.TestCase):
             ]
         )
         storage = conv.generate_page_content(page_node)
+        assert_valid_storage_xml(self, storage)
         # 「見出し１」リンクには ac:anchor="見出し１" が自動補完されること
         self.assertIn('ac:anchor="見出し１"', storage)
         self.assertIn('<ac:link-body>見出し１</ac:link-body>', storage)
@@ -302,6 +307,7 @@ class TestSyncedBlockInPageLinkUntitledDb(unittest.TestCase):
             ]
         )
         storage = conv.generate_page_content(page_node)
+        assert_valid_storage_xml(self, storage)
         # 画像要素の直前にアンカーマクロが生成されていること
         self.assertIn('<ac:structured-macro ac:name="anchor"><ac:parameter ac:name="">img_block_123</ac:parameter></ac:structured-macro>', storage)
         # リンク側に ac:anchor="img_block_123" が設定されていること
