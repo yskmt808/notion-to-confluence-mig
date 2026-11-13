@@ -13,6 +13,7 @@ import base64
 import hashlib
 import zipfile
 import logging
+import unicodedata
 import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,23 @@ logger = logging.getLogger(__name__)
 UUID_PATTERN = re.compile(
     r"(?<![0-9a-fA-F])([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})(?![0-9a-fA-F])"
 )
+ATTACHMENT_REF_PATTERN = re.compile(
+    r"^attachment:([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}):(.+)$",
+    re.IGNORECASE,
+)
+
+
+def normalize_attachment_display_name(raw_value: str, unquote: bool = False) -> str:
+    """Notion HTML内の `attachment:<uuid>:<filename>` 形式をクリーンなファイル名（NFC正規化）へ変換する。"""
+    if not raw_value:
+        return ""
+    text = str(raw_value).strip()
+    if unquote:
+        text = urllib.parse.unquote(text).strip()
+    m = ATTACHMENT_REF_PATTERN.match(text)
+    if m:
+        text = m.group(2).strip()
+    return unicodedata.normalize("NFC", text)
 
 
 def extract_uuids(text: str) -> List[str]:
@@ -1041,22 +1059,55 @@ class HtmlZipExtractor:
         if not src or src.startswith(("http://", "https://", "data:")):
             return None
 
-        clean_src = urllib.parse.unquote(src).replace("\\", "/").lstrip("/")
+        raw_unquoted = urllib.parse.unquote(str(src)).strip()
+        ref_uuid = None
+        att_match = ATTACHMENT_REF_PATTERN.match(raw_unquoted)
+        if att_match:
+            ref_uuid = att_match.group(1).replace("-", "").lower()
+            raw_path = att_match.group(2).strip()
+        else:
+            raw_path = raw_unquoted.split("#", 1)[0].split("?", 1)[0]
+
+        clean_src = raw_path.replace("\\", "/").lstrip("/")
+        if not clean_src:
+            return None
         cand1 = os.path.normpath(os.path.join(current_dir, clean_src)).replace("\\", "/")
         cand2 = clean_src
         basename = os.path.basename(clean_src)
+        nfc_cand1 = unicodedata.normalize("NFC", cand1)
+        nfc_cand2 = unicodedata.normalize("NFC", cand2)
+        nfc_basename = unicodedata.normalize("NFC", basename)
 
-        name_map = {f.replace("\\", "/"): f for f in zf.namelist()}
+        name_map = getattr(self, "_name_map", None) or {f.replace("\\", "/"): f for f in zf.namelist()}
+        nfc_name_map = {unicodedata.normalize("NFC", k): v for k, v in name_map.items()}
 
         if cand1 in name_map:
             return name_map[cand1]
-        elif cand2 in name_map:
+        if nfc_cand1 in nfc_name_map:
+            return nfc_name_map[nfc_cand1]
+        if cand2 in name_map:
             return name_map[cand2]
-        else:
-            # 末尾一致のフォールバック探索
+        if nfc_cand2 in nfc_name_map:
+            return nfc_name_map[nfc_cand2]
+
+        # attachment:<uuid>:<filename> の場合、UUIDとファイル名が両方一致するエントリを優先探索
+        if ref_uuid:
             for norm_f, orig_f in name_map.items():
-                if norm_f.endswith("/" + basename) or norm_f == basename:
+                nfc_norm_f = unicodedata.normalize("NFC", norm_f)
+                if (
+                    ref_uuid in nfc_norm_f.replace("-", "").lower()
+                    and (nfc_norm_f.endswith("/" + nfc_basename) or nfc_norm_f == nfc_basename)
+                ):
                     return orig_f
+
+        # 末尾一致のフォールバック探索（Unicode NFC/NFD揺れも吸収）
+        for norm_f, orig_f in name_map.items():
+            if norm_f.endswith("/" + basename) or norm_f == basename:
+                return orig_f
+        for norm_f, orig_f in name_map.items():
+            nfc_norm_f = unicodedata.normalize("NFC", norm_f)
+            if nfc_norm_f.endswith("/" + nfc_basename) or nfc_norm_f == nfc_basename:
+                return orig_f
 
         return None
 
@@ -1453,15 +1504,41 @@ class HtmlZipExtractor:
             elif tag == "figure" or "link-to-page" in classes or "file" in classes or "source" in classes or "pdf" in classes:
                 a_tag = el.find("a")
                 href = a_tag.get("href") if a_tag else ""
+                if not href:
+                    media_tag = el.find(["embed", "iframe", "object"])
+                    if media_tag:
+                        href = media_tag.get("src") or media_tag.get("data") or ""
                 img_tag = el.find("img")
                 figcaption = el.find("figcaption")
-                caption_text = figcaption.text.strip() if figcaption else ""
+                caption_text = normalize_attachment_display_name(figcaption.get_text().strip()) if figcaption else ""
                 caption_rich = [{"type": "text", "text": {"content": caption_text}}] if caption_text else []
 
                 # 子ページリンク判定
                 # 注: 子ページアイコンとして <img> (例: airplane_purple.svg) が内包されるため、画像ブロック判定より優先して評価する
                 is_subpage_link = "link-to-page" in classes or (
                     a_tag and (a_tag.get("data-notion-page-id") or (href.endswith(".html") and "image" not in classes))
+                )
+
+                unquoted_href = urllib.parse.unquote(href).strip() if href else ""
+                att_ref_match = ATTACHMENT_REF_PATTERN.match(unquoted_href) if unquoted_href else None
+                href_path_lower = (
+                    att_ref_match.group(2).strip().lower()
+                    if att_ref_match
+                    else urllib.parse.urlparse(unquoted_href.split("#", 1)[0]).path.lower()
+                )
+                is_non_image_attachment = bool(
+                    href_path_lower.endswith(
+                        (".pdf", ".mp3", ".wav", ".m4a", ".aac", ".mp4", ".mov", ".webm", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".csv", ".txt")
+                    )
+                    or "pdf" in classes
+                    or "file" in classes
+                    or "source" in classes
+                )
+                is_icon_only_img = bool(
+                    img_tag and (
+                        any(ic in (img_tag.get("class") or []) for ic in ("icon", "notion-static-icon", "property-icon"))
+                        or is_non_image_attachment
+                    )
                 )
 
                 if is_subpage_link:
@@ -1492,8 +1569,8 @@ class HtmlZipExtractor:
                             "child_page": {"title": p_title},
                         })
 
-                # 画像ブロック (figure.image または内部にimgタグを含む場合)
-                elif "image" in classes or img_tag:
+                # 画像ブロック (figure.image または内部にimgタグを含む場合; 添付ファイルアイコンは除外)
+                elif "image" in classes or (img_tag and not is_icon_only_img):
                     src = img_tag.get("src") if img_tag else href
                     if src:
                         data_uri_info = self._parse_data_uri(src)
@@ -1515,7 +1592,7 @@ class HtmlZipExtractor:
                             blocks.append(block_obj)
                         else:
                             is_external = src.startswith(("http://", "https://"))
-                            img_filename = os.path.basename(urllib.parse.unquote(src))
+                            img_filename = unicodedata.normalize("NFC", os.path.basename(urllib.parse.unquote(src).split("#", 1)[0].split("?", 1)[0]))
                             resolved_path = None
                             if not is_external:
                                 resolved_path = self._resolve_zip_attachment_path(zf, current_dir, src)
@@ -1541,10 +1618,28 @@ class HtmlZipExtractor:
                 elif href:
                     lower_href = href.lower()
                     is_external = href.startswith(("http://", "https://"))
-                    att_filename = os.path.basename(urllib.parse.unquote(href))
+                    raw_link_text = a_tag.get_text(" ", strip=True) if a_tag else ""
+                    display_name = normalize_attachment_display_name(raw_link_text)
+
+                    if att_ref_match:
+                        att_filename = unicodedata.normalize("NFC", os.path.basename(att_ref_match.group(2).strip()))
+                    else:
+                        href_path = urllib.parse.urlparse(unquoted_href).path if is_external else unquoted_href.split("#", 1)[0].split("?", 1)[0]
+                        att_filename = unicodedata.normalize("NFC", os.path.basename(href_path))
+
                     resolved_path = None
                     if not is_external:
                         resolved_path = self._resolve_zip_attachment_path(zf, current_dir, href)
+                        if not resolved_path and display_name and display_name != att_filename:
+                            resolved_path = self._resolve_zip_attachment_path(zf, current_dir, display_name)
+                    if not att_filename and resolved_path:
+                        att_filename = unicodedata.normalize("NFC", os.path.basename(resolved_path))
+                    if not att_filename and display_name:
+                        att_filename = unicodedata.normalize("NFC", os.path.basename(display_name))
+
+                    is_attachment_uri = bool(att_ref_match)
+                    fallback_external = {"url": href} if (is_external or (not resolved_path and not is_attachment_uri)) else None
+                    resolved_type = "file" if (resolved_path or is_attachment_uri) else "external"
 
                     if "bookmark" in classes or el.find(class_="bookmark"):
                         blocks.append({
@@ -1558,32 +1653,41 @@ class HtmlZipExtractor:
                             "type": "embed",
                             "embed": {"url": href},
                         })
-                    elif lower_href.endswith(".pdf"):
+                    elif (
+                        att_filename.lower().endswith(".pdf")
+                        or href_path_lower.endswith(".pdf")
+                        or (resolved_path or "").lower().endswith(".pdf")
+                        or "pdf" in classes
+                    ):
                         pdf_obj = AttachmentBlockDict({
                             "id": el_id,
                             "type": "pdf",
                             "pdf": {
-                                "type": "file" if resolved_path else "external",
+                                "type": resolved_type,
                                 "caption": caption_rich,
-                                "external": {"url": href} if is_external or not resolved_path else None,
-                                "file": {"url": att_filename} if resolved_path else None,
+                                "external": None if resolved_path else fallback_external,
+                                "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
                             },
                             "_attachment_filename": att_filename,
                         })
+                        if display_name:
+                            pdf_obj["_display_name"] = display_name
                         if resolved_path:
                             pdf_obj["_attachment_zip_path"] = self.zip_path
                             pdf_obj["_attachment_zip_entry"] = resolved_path
                             logger.info(f"Resolved inline PDF attachment in ZIP: {resolved_path}")
+                        elif not is_external:
+                            logger.warning(f"PDF attachment not found in ZIP: href='{href}', filename='{att_filename}'")
                         blocks.append(pdf_obj)
-                    elif lower_href.endswith((".mp3", ".wav", ".m4a", ".aac")):
+                    elif href_path_lower.endswith((".mp3", ".wav", ".m4a", ".aac")) or att_filename.lower().endswith((".mp3", ".wav", ".m4a", ".aac")):
                         audio_obj = AttachmentBlockDict({
                             "id": el_id,
                             "type": "audio",
                             "audio": {
-                                "type": "file" if resolved_path else "external",
+                                "type": resolved_type,
                                 "caption": caption_rich,
-                                "external": {"url": href} if is_external or not resolved_path else None,
-                                "file": {"url": att_filename} if resolved_path else None,
+                                "external": None if resolved_path else fallback_external,
+                                "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
                             },
                             "_attachment_filename": att_filename,
                         })
@@ -1592,15 +1696,20 @@ class HtmlZipExtractor:
                             audio_obj["_attachment_zip_entry"] = resolved_path
                             logger.info(f"Resolved inline audio attachment in ZIP: {resolved_path}")
                         blocks.append(audio_obj)
-                    elif lower_href.endswith((".mp4", ".mov", ".webm")) or "youtube.com" in lower_href or "youtu.be" in lower_href:
+                    elif (
+                        href_path_lower.endswith((".mp4", ".mov", ".webm"))
+                        or att_filename.lower().endswith((".mp4", ".mov", ".webm"))
+                        or "youtube.com" in lower_href
+                        or "youtu.be" in lower_href
+                    ):
                         video_obj = AttachmentBlockDict({
                             "id": el_id,
                             "type": "video",
                             "video": {
-                                "type": "file" if resolved_path else "external",
+                                "type": resolved_type,
                                 "caption": caption_rich,
-                                "external": {"url": href} if is_external or not resolved_path else None,
-                                "file": {"url": att_filename} if resolved_path else None,
+                                "external": None if resolved_path else fallback_external,
+                                "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
                             },
                             "_attachment_filename": att_filename,
                         })
@@ -1614,13 +1723,15 @@ class HtmlZipExtractor:
                             "id": el_id,
                             "type": "file",
                             "file": {
-                                "type": "file" if resolved_path else "external",
+                                "type": resolved_type,
                                 "caption": caption_rich,
-                                "external": {"url": href} if is_external or not resolved_path else None,
-                                "file": {"url": att_filename} if resolved_path else None,
+                                "external": None if resolved_path else fallback_external,
+                                "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
                             },
                             "_attachment_filename": att_filename,
                         })
+                        if display_name:
+                            file_obj["_display_name"] = display_name
                         if resolved_path:
                             file_obj["_attachment_zip_path"] = self.zip_path
                             file_obj["_attachment_zip_entry"] = resolved_path
@@ -1935,6 +2046,8 @@ class HtmlZipExtractor:
                     text = str(child)
                     if not text:
                         continue
+                    if ATTACHMENT_REF_PATTERN.match(text.strip()):
+                        text = normalize_attachment_display_name(text)
                     item_dict = {
                         "type": "text",
                         "text": {"content": text, "link": {"url": marks.get("link")} if marks.get("link") else None},
@@ -1971,13 +2084,22 @@ class HtmlZipExtractor:
                     elif c_tag == "code":
                         new_marks["code"] = True
                     elif c_tag == "a":
-                        new_marks["link"] = child.get("href")
+                        href_val = child.get("href") or ""
+                        unquoted_a_href = urllib.parse.unquote(href_val).strip()
+                        if ATTACHMENT_REF_PATTERN.match(unquoted_a_href):
+                            new_marks["link"] = None
+                        else:
+                            new_marks["link"] = href_val or None
                         if child.get("data-notion-page-id"):
                             new_marks["page_id"] = normalize_id(child["data-notion-page-id"])
-                        elif child.get("href"):
-                            h_uids = extract_uuids(child["href"])
-                            if h_uids:
-                                new_marks["page_id"] = normalize_id(h_uids[-1])
+                        elif href_val and not ATTACHMENT_REF_PATTERN.match(unquoted_a_href):
+                            parsed_p = urllib.parse.urlparse(unquoted_a_href.split("#", 1)[0]).path.lower()
+                            if not parsed_p.endswith(
+                                (".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".mp4", ".mp3", ".zip", ".docx", ".xlsx", ".pptx")
+                            ):
+                                h_uids = extract_uuids(href_val)
+                                if h_uids:
+                                    new_marks["page_id"] = normalize_id(h_uids[-1])
 
                     hl_color = _extract_highlight_color(child)
                     if hl_color and (hl_color != "default" or "color" not in new_marks):

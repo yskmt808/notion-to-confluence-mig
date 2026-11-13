@@ -7,6 +7,7 @@ import os
 import re
 import html
 import logging
+import unicodedata
 import urllib.parse
 import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -172,8 +173,16 @@ class NotionToConfluenceConverter:
 
     def _get_attachment_filename(self, block: Dict[str, Any]) -> str:
         """ブロック情報からConfluence用の一意で分かりやすい添付ファイル名を導出する。"""
+        att_ref_re = re.compile(
+            r"^attachment:[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}:(.+)$",
+            re.IGNORECASE,
+        )
         if block.get("_attachment_filename"):
-            return block["_attachment_filename"]
+            raw_fn = str(block["_attachment_filename"]).strip()
+            m = att_ref_re.match(raw_fn)
+            if m:
+                raw_fn = m.group(1).strip()
+            return unicodedata.normalize("NFC", raw_fn)
         b_type = block.get("type", "")
         b_id_short = block.get("id", "").replace("-", "")[:8]
         data = block.get(b_type, {})
@@ -190,6 +199,10 @@ class NotionToConfluenceConverter:
         }
         default_ext = ext_map.get(b_type, "bin")
         if url:
+            unquoted_url = urllib.parse.unquote(str(url)).strip()
+            m_url = att_ref_re.match(unquoted_url)
+            if m_url:
+                return unicodedata.normalize("NFC", os.path.basename(m_url.group(1).strip()))
             parsed_path = urllib.parse.urlparse(url).path
             base = os.path.basename(parsed_path)
             if base and "." in base:
@@ -197,7 +210,7 @@ class NotionToConfluenceConverter:
                 clean_ext = ext.lstrip(".").lower()
                 if len(clean_ext) <= 5 and clean_ext.isalnum():
                     clean_name = re.sub(r"[^\w\-_.]", "_", name)[:30]
-                    return f"{clean_name}_{b_id_short}.{clean_ext}"
+                    return unicodedata.normalize("NFC", f"{clean_name}_{b_id_short}.{clean_ext}")
         return f"{b_type}_{b_id_short}.{default_ext}"
 
     def format_property_for_confluence(self, prop: Any) -> str:
@@ -1415,18 +1428,22 @@ class NotionToConfluenceConverter:
                 pdf_file = pdf_data.get("file") or {}
                 pdf_ext = pdf_data.get("external") or {}
                 pdf_url = pdf_file.get("url") or pdf_ext.get("url", "")
-                filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
+                filename = self._get_attachment_filename(b)
                 caption = self.convert_rich_text(pdf_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
                 if b.get("_attachment_uploaded", True):
                     output.append(
-                        f'<p><ac:structured-macro ac:name="view-file">'
+                        f'<ac:structured-macro ac:name="viewpdf">'
                         f'<ac:parameter ac:name="name"><ri:attachment ri:filename="{html.escape(filename)}" /></ac:parameter>'
-                        f'</ac:structured-macro></p>{caption_html}'
+                        f'</ac:structured-macro>{caption_html}'
                     )
-                elif pdf_url:
+                elif pdf_url and pdf_url.startswith(("http://", "https://")):
                     output.append(
                         f'<p>📄 <a href="{html.escape(pdf_url)}">PDF文書を開く: {html.escape(filename)}</a></p>{caption_html}'
+                    )
+                elif filename:
+                    output.append(
+                        f'<p>📄 {html.escape(filename)}</p>{caption_html}'
                     )
 
             elif b_type == "file":

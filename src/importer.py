@@ -11,6 +11,7 @@ import os
 import random
 import re
 import time
+import unicodedata
 import urllib.parse
 import concurrent.futures
 import threading
@@ -1553,7 +1554,7 @@ class ConfluenceImporter:
                             logger.warning(f"Failed to locally render/upload equation {filename}: {e}")
 
             if b.get("_attachment_bytes"):
-                filename = b.get("_attachment_filename") or self.converter._get_attachment_filename(b)
+                filename = unicodedata.normalize("NFC", self.converter._get_attachment_filename(b))
                 b["_attachment_filename"] = filename
                 if filename in uploaded_filenames:
                     b["_attachment_uploaded"] = True
@@ -1564,15 +1565,19 @@ class ConfluenceImporter:
                     logger.info(f"Uploading attachment for page {page_id}: {filename}")
                     try:
                         mime_type = detect_attachment_mime_type(filename)
-                        self.client.upload_attachment(
+                        upload_res = self.client.upload_attachment(
                             page_id=page_id,
                             filename=filename,
                             file_bytes=b["_attachment_bytes"],
                             mime_type=mime_type,
                         )
-                        uploaded_filenames.add(filename)
-                        b["_attachment_uploaded"] = True
-                        logger.info(f"Successfully uploaded attachment: {filename}")
+                        if upload_res is not None:
+                            uploaded_filenames.add(filename)
+                            b["_attachment_uploaded"] = True
+                            logger.info(f"Successfully uploaded attachment: {filename}")
+                        else:
+                            b["_attachment_uploaded"] = False
+                            logger.warning(f"Attachment upload returned no result for {filename}")
                     except Exception as e:
                         b["_attachment_uploaded"] = False
                         logger.warning(f"Failed to upload attachment {filename}: {e}")
@@ -1581,15 +1586,13 @@ class ConfluenceImporter:
                         b.pop("_attachment_zip_entry", None)
                         b.pop("_attachment_zip_path", None)
             elif file_url and not is_embed:
-                filename = b.get("_attachment_filename") or self.converter._get_attachment_filename(b)
+                filename = unicodedata.normalize("NFC", self.converter._get_attachment_filename(b))
                 b["_attachment_filename"] = filename
 
                 if not _is_safe_external_url(file_url):
                     logger.warning(f"Skipped unsafe or non-HTTP attachment URL for page {page_id}: {file_url}")
                     b["_attachment_uploaded"] = False
-                    continue
-
-                if filename in uploaded_filenames:
+                elif filename in uploaded_filenames:
                     b["_attachment_uploaded"] = True
                 else:
                     logger.info(f"Downloading attachment for page {page_id}: {filename}")
@@ -1598,15 +1601,19 @@ class ConfluenceImporter:
                         resp = requests.get(file_url, headers=headers, timeout=30)
                         if resp.status_code == 200:
                             content_type = resp.headers.get("Content-Type", "application/octet-stream")
-                            self.client.upload_attachment(
+                            upload_res = self.client.upload_attachment(
                                 page_id=page_id,
                                 filename=filename,
                                 file_bytes=resp.content,
                                 mime_type=content_type,
                             )
-                            uploaded_filenames.add(filename)
-                            b["_attachment_uploaded"] = True
-                            logger.info(f"Successfully uploaded attachment: {filename} ({len(resp.content)} bytes)")
+                            if upload_res is not None:
+                                uploaded_filenames.add(filename)
+                                b["_attachment_uploaded"] = True
+                                logger.info(f"Successfully uploaded attachment: {filename} ({len(resp.content)} bytes)")
+                            else:
+                                b["_attachment_uploaded"] = False
+                                logger.warning(f"Attachment upload returned no result for {filename}")
                         else:
                             b["_attachment_uploaded"] = False
                             logger.warning(f"Download failed for {filename}: HTTP {resp.status_code}")
