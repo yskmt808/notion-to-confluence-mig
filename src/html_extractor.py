@@ -414,6 +414,18 @@ class HtmlZipExtractor:
         # プロパティテーブルの抽出（存在する場合）
         prop_table = soup.find("table", class_="properties")
         page_properties = self._extract_properties_from_table(prop_table)
+        page_created_by = None
+        page_last_edited_by = None
+        for p_val in page_properties.values():
+            if isinstance(p_val, dict):
+                if p_val.get("type") == "created_by" and not page_created_by:
+                    users_list = p_val.get("users") or []
+                    if users_list:
+                        page_created_by = users_list[0]
+                elif p_val.get("type") == "last_edited_by" and not page_last_edited_by:
+                    users_list = p_val.get("users") or []
+                    if users_list:
+                        page_last_edited_by = users_list[0]
 
         node = PageNode(
             id=node_id,
@@ -425,6 +437,8 @@ class HtmlZipExtractor:
             blocks=blocks,
             children=[],
             comments=comments,
+            created_by=page_created_by,
+            last_edited_by=page_last_edited_by,
         )
 
         # BeautifulSoup DOMツリーを明示的に破棄して循環参照を切り離す
@@ -677,12 +691,16 @@ class HtmlZipExtractor:
             row_comments = []
             row_icon = None
             row_cover = None
+            row_html_props: Dict[str, Dict[str, Any]] = {}
             if row_html_file and (row_html_file in file_set if file_set is not None else row_html_file in zf.namelist()):
                 row_soup = BeautifulSoup(zf.read(row_html_file).decode("utf-8"), "html.parser")
                 row_icon = self._extract_icon_from_soup(row_soup)
                 cover_img = row_soup.find("img", class_="page-cover-image")
                 if cover_img and cover_img.get("src"):
                     row_cover = {"type": "external", "external": {"url": cover_img["src"]}}
+                row_prop_table = row_soup.find("table", class_="properties")
+                if row_prop_table:
+                    row_html_props = self._extract_properties_from_table(row_prop_table)
                 row_body = row_soup.find(class_="page-body")
                 if row_body:
                     row_blocks = self._parse_elements_to_blocks(row_body, zf, os.path.dirname(row_html_file))
@@ -764,6 +782,21 @@ class HtmlZipExtractor:
                             "value": clean_val,
                         }
 
+            # HTMLプロパティテーブルから取得した people / created_by / last_edited_by を正規化マージ
+            row_created_by = None
+            row_last_edited_by = None
+            for hp_name, hp_val in row_html_props.items():
+                if not isinstance(hp_val, dict):
+                    continue
+                hp_type = hp_val.get("type")
+                if hp_type in ("people", "created_by", "last_edited_by"):
+                    row_properties[hp_name] = hp_val
+                    users_list = hp_val.get("users") or []
+                    if hp_type == "created_by" and users_list and not row_created_by:
+                        row_created_by = users_list[0]
+                    elif hp_type == "last_edited_by" and users_list and not row_last_edited_by:
+                        row_last_edited_by = users_list[0]
+
             row_node = PageNode(
                 id=row_id,
                 title=row_title,
@@ -774,6 +807,8 @@ class HtmlZipExtractor:
                 blocks=row_blocks,
                 children=[],
                 comments=row_comments,
+                created_by=row_created_by,
+                last_edited_by=row_last_edited_by,
             )
             db_node.children.append(row_node)
             if idx % 500 == 0:
@@ -828,6 +863,10 @@ class HtmlZipExtractor:
                         detected_type = "number"
                     elif raw_t in ("relation",):
                         detected_type = "relation"
+                    elif raw_t in ("people", "person"):
+                        detected_type = "people"
+                    elif raw_t in ("created_by", "last_edited_by"):
+                        detected_type = raw_t
                     elif raw_t in ("text", "rich_text", "email", "phone_number"):
                         detected_type = "text"
 
@@ -862,6 +901,47 @@ class HtmlZipExtractor:
                     "relation": relations,
                     "value": relations,
                 }
+                continue
+
+            # 1.5. ユーザー / 作成者 / 最終更新者 (property-row-people / person / created_by / last_edited_by)
+            if detected_type in ("people", "created_by", "last_edited_by"):
+                if col_types_out is not None:
+                    col_types_out.setdefault(p_name, detected_type)
+                users_list: List[Dict[str, Any]] = []
+                user_els = td.find_all(class_="user")
+                if user_els:
+                    for u_el in user_els:
+                        b_tag = u_el.find("b")
+                        raw_uname = (b_tag.get_text(strip=True) if b_tag else u_el.get_text(strip=True)).lstrip("@").strip()
+                        if not raw_uname:
+                            continue
+                        u_obj: Dict[str, Any] = {"name": raw_uname}
+                        u_id = u_el.get("data-notion-user-id") or u_el.get("data-user-id")
+                        u_email = u_el.get("data-email")
+                        if u_id:
+                            u_obj["id"] = normalize_id(u_id)
+                        if u_email:
+                            u_obj["person"] = {"email": u_email}
+                        users_list.append(u_obj)
+                else:
+                    sel_spans_u = td.find_all("span", class_=lambda c: c and "selected-value" in c)
+                    if sel_spans_u:
+                        raw_names = [s.get_text(strip=True).lstrip("@").strip() for s in sel_spans_u if s.get_text(strip=True)]
+                    else:
+                        raw_txt = td.get_text(strip=True)
+                        raw_names = [x.strip().lstrip("@").strip() for x in raw_txt.split(",") if x.strip()] if raw_txt else []
+                    for rn in raw_names:
+                        if rn:
+                            users_list.append({"name": rn})
+                if users_list:
+                    prop_u: Dict[str, Any] = {
+                        "type": detected_type,
+                        "users": users_list,
+                        "value": ", ".join(u["name"] for u in users_list if u.get("name")),
+                    }
+                    if detected_type in ("created_by", "last_edited_by"):
+                        prop_u[detected_type] = users_list[0]
+                    result[p_name] = prop_u
                 continue
 
             # 2. 日付 (property-row-date または <time> タグ)
@@ -1960,6 +2040,50 @@ class HtmlZipExtractor:
 
                     new_marks = dict(marks)
                     c_tag = child.name.lower()
+                    child_classes_list = [child_classes] if isinstance(child_classes, str) else list(child_classes)
+                    if (
+                        "user" in child_classes_list
+                        or child.get("data-notion-user-id")
+                        or child.get("data-user-id")
+                    ):
+                        # 本文中のユーザーメンション (<span class="user">@Name</span> 等)
+                        b_tag = child.find("b")
+                        if b_tag:
+                            raw_uname = b_tag.get_text(strip=True)
+                        else:
+                            # <time> 等の補助子タグを除外したテキストを取得
+                            raw_uname = "".join(
+                                str(t) for t in child.strings
+                                if not (t.parent and isinstance(t.parent, Tag) and t.parent.name.lower() == "time")
+                            ).strip()
+                        u_name = raw_uname.lstrip("@").strip()
+                        u_id = child.get("data-notion-user-id") or child.get("data-user-id") or ""
+                        u_email = child.get("data-email") or ""
+                        if not u_email and isinstance(new_marks.get("link"), str) and new_marks["link"].startswith("mailto:"):
+                            u_email = new_marks["link"][len("mailto:"):].strip()
+                        user_payload: Dict[str, Any] = {"name": u_name}
+                        if u_id:
+                            user_payload["id"] = normalize_id(u_id)
+                        if u_email:
+                            user_payload["person"] = {"email": u_email}
+                        rich_texts.append({
+                            "type": "mention",
+                            "plain_text": f"@{u_name}" if u_name else "@User",
+                            "mention": {
+                                "type": "user",
+                                "user": user_payload,
+                            },
+                            "annotations": {
+                                "bold": new_marks.get("bold", False),
+                                "italic": new_marks.get("italic", False),
+                                "strikethrough": new_marks.get("strikethrough", False),
+                                "underline": new_marks.get("underline", False),
+                                "code": new_marks.get("code", False),
+                                "color": new_marks.get("color", "default"),
+                            },
+                        })
+                        continue
+
                     if c_tag in ("b", "strong"):
                         new_marks["bold"] = True
                     elif c_tag in ("i", "em"):

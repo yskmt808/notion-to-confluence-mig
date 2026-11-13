@@ -22,8 +22,9 @@ class TestTaskB3ApiEnricher(unittest.TestCase):
     def setUp(self):
         self.enricher = NotionApiEnricher(token="fake_token")
 
+    @patch("requests.post")
     @patch("requests.get")
-    def test_enrich_database_schema_and_views(self, mock_get):
+    def test_enrich_database_schema_and_views(self, mock_get, mock_post):
         # モック設定: databases.retrieve
         mock_db_res = MagicMock()
         mock_db_res.status_code = 200
@@ -65,6 +66,7 @@ class TestTaskB3ApiEnricher(unittest.TestCase):
             return MagicMock(status_code=404, ok=False)
 
         mock_get.side_effect = get_side_effect
+        mock_post.return_value = MagicMock(status_code=404, ok=False)
 
         db_node = PageNode(
             id="00000000000000000000000000000001",
@@ -105,6 +107,175 @@ class TestTaskB3ApiEnricher(unittest.TestCase):
         self.assertEqual(len(row.properties["タグ"]["value"]), 2)
         self.assertEqual(row.properties["完了フラグ"]["type"], "checkbox")
         self.assertTrue(row.properties["完了フラグ"]["value"])
+
+    @patch("requests.post")
+    @patch("requests.get")
+    def test_enrich_workspace_users_db_query_and_homonyms(self, mock_get, mock_post):
+        # 1. /v1/users (2ページ分のページネーション + 同姓同名ユーザー)
+        users_page1 = MagicMock(status_code=200, ok=True)
+        users_page1.json.return_value = {
+            "results": [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "type": "person",
+                    "name": "山田花子",
+                    "person": {"email": "hanako@example.com"},
+                },
+                {
+                    "id": "22222222-2222-2222-2222-222222222222",
+                    "type": "person",
+                    "name": "田中太郎",
+                    "person": {"email": "taro.a@example.com"},
+                },
+            ],
+            "has_more": True,
+            "next_cursor": "cursor_2",
+        }
+        users_page2 = MagicMock(status_code=200, ok=True)
+        users_page2.json.return_value = {
+            "results": [
+                {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "type": "person",
+                    "name": "田中太郎",
+                    "person": {"email": "taro.b@example.com"},
+                },
+            ],
+            "has_more": False,
+            "next_cursor": None,
+        }
+
+        # 2. DBスキーマ
+        db_res = MagicMock(status_code=200, ok=True)
+        db_res.json.return_value = {
+            "properties": {
+                "タスク名": {"type": "title"},
+                "担当者": {"type": "people"},
+                "作成者": {"type": "created_by"},
+                "最終更新者": {"type": "last_edited_by"},
+            }
+        }
+
+        def get_side_effect(url, **kwargs):
+            if url.endswith("/v1/users"):
+                params = kwargs.get("params") or {}
+                if params.get("start_cursor") == "cursor_2":
+                    return users_page2
+                return users_page1
+            if "/databases/" in url:
+                return db_res
+            return MagicMock(status_code=404, ok=False)
+
+        mock_get.side_effect = get_side_effect
+
+        # 3. DB query レスポンス (1コールで people / created_by / last_edited_by を一括取得)
+        query_res = MagicMock(status_code=200, ok=True)
+        query_res.json.return_value = {
+            "results": [
+                {
+                    "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "created_time": "2026-11-01T10:00:00.000Z",
+                    "last_edited_time": "2026-11-02T12:00:00.000Z",
+                    "created_by": {"id": "11111111-1111-1111-1111-111111111111"},
+                    "last_edited_by": {"id": "22222222-2222-2222-2222-222222222222"},
+                    "properties": {
+                        "タスク名": {"type": "title", "title": [{"plain_text": "Row A"}]},
+                        "担当者": {
+                            "type": "people",
+                            "people": [{"id": "11111111-1111-1111-1111-111111111111"}],
+                        },
+                        "作成者": {
+                            "type": "created_by",
+                            "created_by": {"id": "11111111-1111-1111-1111-111111111111"},
+                        },
+                        "最終更新者": {
+                            "type": "last_edited_by",
+                            "last_edited_by": {"id": "22222222-2222-2222-2222-222222222222"},
+                        },
+                    },
+                }
+            ],
+            "has_more": False,
+        }
+        mock_post.return_value = query_res
+
+        row_a = PageNode(
+            id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            title="Row A",
+            node_type="database_row",
+            properties={"担当者": "山田花子"},
+        )
+        row_b = PageNode(
+            id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            title="Row B",
+            node_type="database_row",
+            properties={"担当者": {"type": "people", "users": [{"name": "田中太郎"}]}},
+        )
+        db_node = PageNode(
+            id="dddddddddddddddddddddddddddddddd",
+            title="Tasks DB",
+            node_type="database",
+            children=[row_a, row_b],
+        )
+        root = PageNode(
+            id="root_page",
+            title="Root Page",
+            node_type="page",
+            comments=[{"created_by": {"name": "山田花子"}}],
+            blocks=[
+                {
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [
+                            {"type": "mention", "mention": {"type": "user", "user": {"name": "山田花子"}}},
+                            {"type": "mention", "mention": {"type": "user", "user": {"name": "田中太郎"}}},
+                        ]
+                    },
+                }
+            ],
+            children=[db_node],
+        )
+
+        summary = self.enricher.enrich_tree(root)
+
+        self.assertEqual(summary["users_fetched"], 3)
+        self.assertEqual(summary["rows_enriched"], 1)
+
+        # GET は /v1/users x2 + DB schema x1 + views x1 のみ（ブロック再帰GET等は0回）
+        called_urls = [c.args[0] for c in mock_get.call_args_list]
+        self.assertFalse(any("/blocks/" in u or "/pages/" in u for u in called_urls))
+        mock_post.assert_called_once()
+        self.assertEqual(mock_post.call_args.kwargs["json"]["page_size"], 100)
+
+        # row_a の people / created_by / last_edited_by が ID と /v1/users 辞書で補完されていること
+        self.assertEqual(row_a.created_time, "2026-11-01T10:00:00.000Z")
+        self.assertEqual(row_a.created_by["name"], "山田花子")
+        self.assertEqual(row_a.created_by["person"]["email"], "hanako@example.com")
+        self.assertEqual(row_a.last_edited_by["name"], "田中太郎")
+        self.assertEqual(row_a.properties["担当者"]["type"], "people")
+        self.assertEqual(row_a.properties["担当者"]["users"][0]["name"], "山田花子")
+        self.assertEqual(row_a.properties["担当者"]["users"][0]["person"]["email"], "hanako@example.com")
+        self.assertEqual(row_a.properties["作成者"]["type"], "created_by")
+        self.assertEqual(row_a.properties["作成者"]["users"][0]["name"], "山田花子")
+
+        # 一意なユーザー「山田花子」のコメント・本文メンションは追加API 0回で補完される
+        self.assertEqual(root.comments[0]["created_by"]["id"], "11111111-1111-1111-1111-111111111111")
+        self.assertEqual(root.comments[0]["created_by"]["person"]["email"], "hanako@example.com")
+        hanako_mention = root.blocks[0]["paragraph"]["rich_text"][0]["mention"]["user"]
+        self.assertEqual(hanako_mention["id"], "11111111-1111-1111-1111-111111111111")
+        self.assertEqual(hanako_mention["person"]["email"], "hanako@example.com")
+
+        # 同姓同名「田中太郎」は名前のみ参照を自動確定しない + 警告を返す
+        taro_mention = root.blocks[0]["paragraph"]["rich_text"][1]["mention"]["user"]
+        self.assertNotIn("id", taro_mention)
+        self.assertNotIn("id", row_b.properties["担当者"]["users"][0])
+
+        warnings = summary["homonym_warnings"]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["name"], "田中太郎")
+        self.assertEqual(len(warnings[0]["candidates"]), 2)
+        self.assertIn("ページ 'Root Page' の本文メンション", warnings[0]["affected_locations"])
+        self.assertIn("DB行 'Row B' の '担当者' 列", warnings[0]["affected_locations"])
 
 
 class TestTaskB4WorksheetManager(unittest.TestCase):
