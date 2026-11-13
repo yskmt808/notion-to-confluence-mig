@@ -280,6 +280,10 @@ class MigrationVerifier:
             checks_passed.append("All key Notion text snippets present in Confluence body.")
 
         status = "FAIL" if issues else ("WARN" if warnings else "PASS")
+        # 検証完了後に即時メモリ解放（大規模移行検証時の省メモリ化）
+        node.blocks = []
+        node.properties = {}
+        node.comments = []
         return {
             "page_id": confluence_page_id,
             "title": node.title,
@@ -414,6 +418,10 @@ class MigrationVerifier:
             checks_passed.append(f"Database schema properties verified ({len(prop_keys)} properties): {', '.join(sorted(prop_keys))}")
 
         status = "FAIL" if issues else ("WARN" if warnings else "PASS")
+        # 検証完了後に即時メモリ解放
+        node.blocks = []
+        node.properties = {}
+        node.comments = []
         return {
             "page_id": confluence_db_id,
             "title": node.title,

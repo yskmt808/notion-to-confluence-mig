@@ -763,6 +763,7 @@ class ConfluenceImporter:
         user_mapper: Optional[Any] = None,
         metadata_template: Optional[str] = None,
         private_mode: bool = False,
+        prune_blocks_on_pass2: bool = False,
     ):
         self.space_key = space_key
         self.checkpoint = checkpoint
@@ -773,6 +774,7 @@ class ConfluenceImporter:
         self.user_mapper = user_mapper
         self.metadata_template = metadata_template
         self.private_mode = private_mode
+        self.prune_blocks_on_pass2 = prune_blocks_on_pass2
         self._current_user_account_id: Optional[str] = None
         from src.timezone_util import resolve_timezone, format_iso_datetime
         self.timezone = resolve_timezone(timezone)
@@ -989,6 +991,9 @@ class ConfluenceImporter:
             logger.debug(f"[RESUME] Skipping Pass 2 update for [{node.title}] (already completed)")
             if self.dashboard:
                 self.dashboard.record_pass2_skip(node.title)
+            if self.prune_blocks_on_pass2:
+                node.blocks = []
+                node.properties = {}
             return
 
         if node.node_type in ("page", "database_row") and (node.blocks or node.properties):
@@ -1042,6 +1047,10 @@ class ConfluenceImporter:
                 self.checkpoint.record_pass2(node.id)
             if self.dashboard:
                 self.dashboard.record_pass2_skip(node.title)
+
+        if self.prune_blocks_on_pass2:
+            node.blocks = []
+            node.properties = {}
 
     def _resolve_and_update_page_links(self, root_node: PageNode):
         """パス2: 全データベースおよびページの作成完了後、相互リンクおよび埋め込みDBビューを完全に解決して更新する（並行実行）。"""
@@ -2138,6 +2147,8 @@ class ConfluenceImporter:
                         self.client.create_comment(confluence_page_id, c_html)
                     except Exception as ce:
                         logger.warning(f"Could not migrate comment to page {confluence_page_id}: {ce}")
+            # コメントのインポート完了後に即時メモリ解放
+            node.comments = []
 
         # 6. 子ノードのインポート（今回作成したページを親として深さ優先・ブランチ並行実行）
         if node.children:

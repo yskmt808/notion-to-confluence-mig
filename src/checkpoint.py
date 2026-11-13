@@ -6,6 +6,7 @@
 
 import os
 import json
+import time
 import logging
 import threading
 from datetime import datetime, timezone
@@ -20,8 +21,17 @@ DEFAULT_CHECKPOINT_PATH = "migration_checkpoint.json"
 class MigrationCheckpoint:
     """移行進捗のチェックポイント状態を管理するクラス。"""
 
-    def __init__(self, checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
+    def __init__(
+        self,
+        checkpoint_path: str = DEFAULT_CHECKPOINT_PATH,
+        save_interval_sec: float = 0.0,
+        max_pending_changes: int = 50,
+    ):
         self.checkpoint_path = checkpoint_path
+        self.save_interval_sec = max(0.0, float(save_interval_sec))
+        self.max_pending_changes = max(1, int(max_pending_changes))
+        self._last_saved_time: float = 0.0
+        self._pending_changes: int = 0
         self._lock = threading.RLock()
         self.session_id: str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         self.started_at: str = datetime.now(timezone.utc).isoformat()
@@ -54,7 +64,7 @@ class MigrationCheckpoint:
                 logger.warning(f"Could not load checkpoint from [{self.checkpoint_path}]: {e}")
                 return False
 
-    def save(self):
+    def save(self, force: bool = False):
         """現在のチェックポイント状態を一時ファイル経由で安全（アトミック）に保存する。"""
         acquired_immediately = self._lock.acquire(blocking=False)
         if not acquired_immediately:
@@ -62,6 +72,12 @@ class MigrationCheckpoint:
             self._lock.acquire()
 
         try:
+            now = time.time()
+            if not force and self.save_interval_sec > 0.0:
+                if (now - self._last_saved_time < self.save_interval_sec) and (self._pending_changes < self.max_pending_changes):
+                    self._pending_changes += 1
+                    return
+
             self.last_updated_at = datetime.now(timezone.utc).isoformat()
             data = {
                 "version": "1.0",
@@ -90,6 +106,8 @@ class MigrationCheckpoint:
                 except Exception:
                     pass
                 os.replace(tmp_path, self.checkpoint_path)
+                self._last_saved_time = now
+                self._pending_changes = 0
             except Exception as e:
                 logger.error(f"Failed to write checkpoint atomically to [{self.checkpoint_path}]: {e}")
                 if os.path.exists(tmp_path):
@@ -100,13 +118,18 @@ class MigrationCheckpoint:
         finally:
             self._lock.release()
 
+    def flush(self):
+        """保留中のチェックポイント変更を即座にディスクへ書き出す。"""
+        with self._lock:
+            self.save(force=True)
+
     def unmark_pass1(self, node_id: str):
         """ノードのPass 1完了状態を取り消し、未完了状態に戻す（エラーロールバック用）。"""
         with self._lock:
             if node_id in self.nodes:
                 self.nodes[node_id]["pass1_done"] = False
                 self.nodes[node_id].pop("confluence_id", None)
-                self.save()
+                self.save(force=True)
                 logger.notice(f"Unmarked Pass 1 for node [{node_id}] in checkpoint.")
 
     def remove_node(self, node_id: str):
@@ -114,7 +137,7 @@ class MigrationCheckpoint:
         with self._lock:
             if node_id in self.nodes:
                 self.nodes.pop(node_id, None)
-                self.save()
+                self.save(force=True)
                 logger.notice(f"Removed node [{node_id}] from checkpoint.")
 
     def is_pass1_done(self, node_id: str) -> bool:
@@ -230,14 +253,14 @@ class MigrationCheckpoint:
         """中断状態を明示的に保存する。"""
         with self._lock:
             self.status = "INTERRUPTED"
-            self.save()
+            self.save(force=True)
             logger.info(f"Checkpoint status set to INTERRUPTED ({len(self.nodes)} nodes saved).")
 
     def mark_completed(self):
         """完了状態を明示的に保存する。"""
         with self._lock:
             self.status = "COMPLETED"
-            self.save()
+            self.save(force=True)
             logger.info(f"Checkpoint status set to COMPLETED ({len(self.nodes)} nodes saved).")
 
     def remove_checkpoint(self):

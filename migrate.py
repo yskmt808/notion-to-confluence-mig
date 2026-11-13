@@ -422,7 +422,7 @@ def main():
 
     # 診断テレメトリとチェックポイント・シグナルマネージャーの初期化 (Task B.5, B.6, B.7)
     telemetry = SanitizedTelemetry()
-    checkpoint = MigrationCheckpoint(checkpoint_path=args.checkpoint)
+    checkpoint = MigrationCheckpoint(checkpoint_path=args.checkpoint, save_interval_sec=2.0, max_pending_changes=50)
 
     if args.resume:
         loaded = checkpoint.load()
@@ -687,6 +687,7 @@ def main():
         user_mapper=user_mapper,
         metadata_template=meta_tpl,
         private_mode=(args.private or args.visibility == "private"),
+        prune_blocks_on_pass2=(args.no_verify and not args.repair_inpage_links),
     )
 
     setup_logger(args.verbose, dashboard_mode=dashboard.enabled)
@@ -732,6 +733,7 @@ def main():
             print(f"🚨 開発者報告用のサニタイズド診断レポートを出力しました: {json_p}, {md_p}")
         sys.exit(1)
     finally:
+        checkpoint.flush()
         setup_logger(args.verbose, dashboard_mode=False)
 
     step2_end = datetime.now(timezone.utc)

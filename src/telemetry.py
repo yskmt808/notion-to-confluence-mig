@@ -33,9 +33,17 @@ class SanitizedTelemetry:
         self.block_types_counter: Counter = Counter()
         self.html_tags_counter: Counter = Counter()
         self.confluence_macros_counter: Counter = Counter()
+        self.max_http_requests: int = 1000
+        self.total_http_requests: int = 0
+        self._http_duration_sum: float = 0.0
+        self._http_duration_min: float = float("inf")
+        self._http_duration_max: float = 0.0
+        self._http_duration_count: int = 0
         self.http_requests: List[Dict[str, Any]] = []
         self.http_status_counter: Counter = Counter()
         self.step_timings: Dict[str, float] = {}
+        self.max_warnings: int = 1000
+        self.total_warnings_count: int = 0
         self.warnings: List[str] = []
         self.errors: List[Dict[str, Any]] = []
         self.unsupported_elements: List[str] = []
@@ -153,14 +161,25 @@ class SanitizedTelemetry:
         """HTTP通信の統計を記録する（機密URLパラメータやヘッダーは除外）。"""
         sanitized_endpoint = self.sanitize_string(endpoint_pattern)
         with self._lock:
+            self.total_http_requests += 1
+            if duration_ms is not None:
+                self._http_duration_count += 1
+                self._http_duration_sum += duration_ms
+                if duration_ms < self._http_duration_min:
+                    self._http_duration_min = duration_ms
+                if duration_ms > self._http_duration_max:
+                    self._http_duration_max = duration_ms
+
             self.http_status_counter[str(status_code)] += 1
             self.http_requests.append({
                 "method": method,
                 "endpoint": sanitized_endpoint,
                 "status_code": status_code,
-                "duration_ms": round(duration_ms, 2),
+                "duration_ms": round(duration_ms, 2) if duration_ms is not None else 0.0,
                 "error_type": error_type,
             })
+            if len(self.http_requests) > self.max_http_requests:
+                self.http_requests.pop(0)
 
     def record_timing(self, step_name: str, seconds: float):
         """各ステップの所要時間を記録する。"""
@@ -171,7 +190,10 @@ class SanitizedTelemetry:
         """警告メッセージをサニタイズして記録する。"""
         sanitized = self.sanitize_string(message)
         with self._lock:
+            self.total_warnings_count += 1
             self.warnings.append(sanitized)
+            if len(self.warnings) > self.max_warnings:
+                self.warnings.pop(0)
 
     def record_error(self, error: Exception, context: str = ""):
         """例外情報をサニタイズして記録する（スタックトレースからファイル本文や個人パスを消去）。"""
@@ -188,14 +210,13 @@ class SanitizedTelemetry:
     def generate_report(self) -> Dict[str, Any]:
         """サニタイズされた診断レポートオブジェクトを生成する。"""
         self.finished_at = datetime.now(timezone.utc).isoformat()
-        durations = [r["duration_ms"] for r in self.http_requests if "duration_ms" in r]
         http_summary = {
-            "total_requests": len(self.http_requests),
+            "total_requests": self.total_http_requests,
             "status_distribution": dict(self.http_status_counter),
             "latency_ms": {
-                "min": min(durations) if durations else 0,
-                "avg": round(sum(durations) / len(durations), 2) if durations else 0,
-                "max": max(durations) if durations else 0,
+                "min": round(self._http_duration_min, 2) if self._http_duration_count > 0 else 0,
+                "avg": round(self._http_duration_sum / self._http_duration_count, 2) if self._http_duration_count > 0 else 0,
+                "max": round(self._http_duration_max, 2) if self._http_duration_count > 0 else 0,
             },
         }
 
@@ -217,7 +238,7 @@ class SanitizedTelemetry:
                 "unsupported_elements_detected": self.unsupported_elements,
                 "http_summary": http_summary,
             },
-            "warnings_count": len(self.warnings),
+            "warnings_count": self.total_warnings_count,
             "warnings_sample": self.warnings[:20],
             "errors_count": len(self.errors),
             "errors": self.errors,

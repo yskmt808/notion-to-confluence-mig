@@ -213,6 +213,17 @@ class HtmlZipExtractor:
         logger.info(f"Opening and scanning Notion HTML export ZIP: {self.zip_path}")
         with zipfile.ZipFile(self.zip_path, "r") as zf:
             file_list = zf.namelist()
+            self._file_list = file_list
+            self._file_set = set(file_list)
+            self._name_map = {f.replace("\\", "/"): f for f in file_list}
+
+            from collections import defaultdict
+            self._dir_direct_children = defaultdict(list)
+            for f in file_list:
+                norm_f = f.replace("\\", "/")
+                parent = os.path.dirname(norm_f)
+                parent_key = (parent.rstrip("/") + "/") if parent else ""
+                self._dir_direct_children[parent_key].append(f)
 
             # 1. HTMLファイルとCSVファイルをインデックス化
             html_files = [f for f in file_list if f.endswith(".html")]
@@ -432,24 +443,34 @@ class HtmlZipExtractor:
             sub_dir = os.path.splitext(html_file)[0]
         sub_dir = sub_dir + "/"
 
+        dir_children = getattr(self, "_dir_direct_children", {}).get(sub_dir)
+        if not dir_children:
+            alt_sub_dir = os.path.splitext(html_file)[0] + "/"
+            alt_children = getattr(self, "_dir_direct_children", {}).get(alt_sub_dir)
+            if alt_children:
+                sub_dir = alt_sub_dir
+                dir_children = alt_children
+
+        if dir_children is None:
+            dir_children = [
+                f for f in zf.namelist()
+                if f.startswith(sub_dir) and f != html_file and len(f[len(sub_dir):].split("/")) == 1
+            ]
+
         processed_bases = set()
-        for f in zf.namelist():
-            if f.startswith(sub_dir) and f != html_file:
-                # 直下の子ファイルのみ（さらに深い孫フォルダのファイルは除外）
-                relative = f[len(sub_dir) :]
-                parts = relative.split("/")
-                if len(parts) == 1:
-                    base_f = os.path.splitext(f)[0]
-                    if f.endswith(".html"):
-                        child_node = self._build_page_node(zf, f, db_csv_map, parent_dir=sub_dir)
-                        node.children.append(child_node)
+        for f in dir_children:
+            if f != html_file:
+                base_f = os.path.splitext(f)[0]
+                if f.endswith(".html"):
+                    child_node = self._build_page_node(zf, f, db_csv_map, parent_dir=sub_dir)
+                    node.children.append(child_node)
+                    processed_bases.add(base_f)
+                elif f.endswith(".csv"):
+                    # 対応するHTMLが存在しない単独CSVデータベースの場合
+                    if base_f not in processed_bases:
+                        child_db_node = self._build_database_node_from_csv(zf, f)
+                        node.children.append(child_db_node)
                         processed_bases.add(base_f)
-                    elif f.endswith(".csv"):
-                        # 対応するHTMLが存在しない単独CSVデータベースの場合
-                        if base_f not in processed_bases:
-                            child_db_node = self._build_database_node_from_csv(zf, f)
-                            node.children.append(child_db_node)
-                            processed_bases.add(base_f)
 
         return node
 
@@ -516,8 +537,12 @@ class HtmlZipExtractor:
         row_html_by_title: Dict[str, Tuple[str, str]] = {}  # norm_title -> (row_id, html_path)
         row_html_by_stem: Dict[str, Tuple[str, str]] = {}  # norm_stem -> (row_id, html_path)
 
-        for f in zf.namelist():
-            if f.startswith(base_dir) and f.endswith(".html"):
+        row_candidates = getattr(self, "_dir_direct_children", {}).get(base_dir)
+        if row_candidates is None:
+            row_candidates = [f for f in zf.namelist() if f.startswith(base_dir)]
+
+        for f in row_candidates:
+            if f.endswith(".html"):
                 m = extract_uuids(f)
                 r_id = normalize_id(m[-1]) if m else normalize_id(f)
                 row_html_map[r_id] = f
@@ -543,7 +568,15 @@ class HtmlZipExtractor:
 
         # DB HTML（テーブル表示用HTML）が存在する場合、cell-title 内のリンクから行タイトルと行UUIDを抽出
         html_title_to_uuid: Dict[str, str] = {}
-        target_db_html = db_html_path if db_html_path in zf.namelist() else (clean_db_path if clean_db_path in zf.namelist() else None)
+        file_set = getattr(self, "_file_set", None)
+        target_db_html = None
+        if file_set is not None:
+            if db_html_path in file_set:
+                target_db_html = db_html_path
+            elif clean_db_path in file_set:
+                target_db_html = clean_db_path
+        else:
+            target_db_html = db_html_path if db_html_path in zf.namelist() else (clean_db_path if clean_db_path in zf.namelist() else None)
         if target_db_html:
             try:
                 db_soup = BeautifulSoup(zf.read(target_db_html).decode("utf-8"), "html.parser")
@@ -644,7 +677,7 @@ class HtmlZipExtractor:
             row_comments = []
             row_icon = None
             row_cover = None
-            if row_html_file and row_html_file in zf.namelist():
+            if row_html_file and (row_html_file in file_set if file_set is not None else row_html_file in zf.namelist()):
                 row_soup = BeautifulSoup(zf.read(row_html_file).decode("utf-8"), "html.parser")
                 row_icon = self._extract_icon_from_soup(row_soup)
                 cover_img = row_soup.find("img", class_="page-cover-image")
