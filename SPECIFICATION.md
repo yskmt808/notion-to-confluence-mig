@@ -204,7 +204,7 @@ Notionのブロック構造とConfluence Storage Format（XHTML）の完全対�
 | :--- | :--- | :--- |
 | **数式ブロック** (`equation`) | `<ac:image><ri:attachment ri:filename="equation_*.png" />` | **【独自高機能】** matplotlibにより300dpi高解像度PNGを完全オフライン生成し、添付・画像埋め込み。 |
 | **画像** (`image`) | `<ac:image><ri:attachment ri:filename="*.png" />` | Notion署名付きURLまたはZIP内バイナリを永続添付ファイルとしてアップロードし、インライン埋め込み。 |
-| **添付ファイル** (`file`, `pdf`) | `<ac:link><ri:attachment ... />` / `view-file` | 実体ファイルをConfluence添付ファイルとして登録し、ダウンロードリンクおよびプレビューマクロを配置。 |
+| **添付ファイル** (`file`, `pdf`) | `<ac:link><ri:attachment ... />` / `viewpdf` | 実体ファイルをConfluence添付ファイルとして登録し、`file`（HTML上 `data-notion-file` 付きのプレビューなしPDF含む）はダウンロードリンク、`pdf`（埋め込みPDF）は `viewpdf` マクロによるインライン埋め込みプレビューを配置。 |
 | **カバー画像** (`cover`) | `<ac:image ac:align="center" ac:layout="full-width">` | カバー画像を取得し、中央50%（1200x200）でバナー比率にローカルクロップの上、最上部ヘッダーバナーとして配置。 |
 | **マルチコラム（段組）** (`column_list`, `column`) | `<ac:structured-macro ac:name="section\|column">` | 2〜N段組のネイティブセクション・カラムマクロに変換。 |
 | **目次** (`table_of_contents`) | `<ac:structured-macro ac:name="toc" />` | 見出し階層と完全連動するConfluenceネイティブTOCマクロを生成。 |

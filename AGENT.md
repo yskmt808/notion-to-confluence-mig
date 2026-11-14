@@ -75,7 +75,7 @@
 4. **ページアイコン（Emoji）**:
    - ConfluenceのContent Properties（`emoji-title-published`, `emoji-title-draft`）にhexコードを設定して完全同期する。
 5. **PDF・添付ファイルビューア**:
-   - PDFブロックはConfluenceのネイティブプレビューマクロ `<ac:structured-macro ac:name="view-file">` の単一出力とし、直下に重複するダウンロード用 `<ac:link>` リンクを重複生成しない。
+   - Notion上でプレビューありのPDF埋め込みブロック（`pdf` ブロック／HTML上 `data-notion-file` なし）は、Confluenceページ上でインライン埋め込みプレビュー表示（多ページ閲覧・ズーム対応）を行うため、`<p>` ラッパーなしの `<ac:structured-macro ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="..." /></ac:parameter></ac:structured-macro>` の単一出力とし、直下に重複するダウンロード用 `<ac:link>` リンクを生成しない。一方、プレビューなしのファイル添付（`file` ブロック／HTML上 `data-notion-file` あり）はPDF拡張子であってもインラインプレビューにせず `<ac:link><ri:attachment ... /></ac:link>` として移行する。また添付ファイル名はUnicode NFC正規化して一致させる。
 6. **空のデータベースレコード（無題・本文なし）の自動スキップ**:
    - Notion側でタイトルが未設定（Untitled）かつ本文ブロック・独自プロパティを持たない空レコード行について、Confluence側で無意味な「Untitled Page」子ページが量産されるのを防ぐため、子ページ作成を自動スキップする。
 

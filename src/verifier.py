@@ -7,6 +7,7 @@ Playwrightなどのブラウザを介さず、NotionとConfluenceのAPIデータ
 import logging
 import os
 import re
+import unicodedata
 import urllib.parse
 import requests
 from typing import Any, Dict, List, Optional
@@ -70,9 +71,17 @@ class MigrationVerifier:
                 issues.append(f"Parent hierarchy mismatch: Expected parent {expected_parent_id}, got {actual_parent_id}")
 
         # 4. マクロエラー・拡張機能エラーの検知 (View HTML解析)
-        if "拡張機能の読み込み中にエラーが発生しました" in view_body:
-            issues.append("Macro load error detected in view body.")
-        if "confluence-information-macro-error" in view_body or "confluence-error" in view_body:
+        if (
+            "拡張機能の読み込み中にエラーが発生しました" in view_body
+            or "レンダリング中にエラーが発生しました" in view_body
+            or "Failed to find attachment" in view_body
+        ):
+            issues.append("Macro load/render error detected in view body.")
+        if (
+            "confluence-information-macro-error" in view_body
+            or "confluence-error" in view_body
+            or '<div class="error">' in view_body
+        ):
             issues.append("Confluence macro error class detected in view body.")
 
         # 5. Notionブロックのテキスト網羅性検証
@@ -88,8 +97,18 @@ class MigrationVerifier:
             else:
                 issues.append(f"Cover image detected in Notion, but <ac:image> with {cover_prefix} not found in Confluence.")
 
-        # ブロック別の固有要素チェック
-        block_types = [b.get("type") for b in node.blocks]
+        # ブロック別の固有要素チェック（カラム・トグル等のネスト配下も含めて再帰収集）
+        all_blocks: List[Dict[str, Any]] = []
+
+        def _collect_all_blocks(blocks_list: List[Dict[str, Any]]):
+            for b in blocks_list:
+                if isinstance(b, dict):
+                    all_blocks.append(b)
+                    if b.get("children_blocks"):
+                        _collect_all_blocks(b["children_blocks"])
+
+        _collect_all_blocks(node.blocks)
+        block_types = [b.get("type") for b in all_blocks]
         if "equation" in block_types:
             # 数式添付ファイルが存在するか
             if "<ac:image" in storage_body and "equation_" in storage_body:
@@ -116,7 +135,7 @@ class MigrationVerifier:
                 issues.append("To-Do block detected in Notion, but <ac:task-list> not found in Confluence.")
 
         if "callout" in block_types:
-            callout_blocks = [b for b in node.blocks if b.get("type") == "callout"]
+            callout_blocks = [b for b in all_blocks if b.get("type") == "callout"]
             found_callouts = []
             for cb in callout_blocks:
                 c_data = cb.get("callout", {})
@@ -150,38 +169,49 @@ class MigrationVerifier:
         # 添付ファイル実体検証: ブロックツリーから添付ファイル名を収集し、Confluenceの添付ファイル一覧と比較
         expected_attachment_filenames: List[str] = []
 
-        def _collect_attachment_filenames(blocks_list: List[Dict[str, Any]]):
-            for b in blocks_list:
-                b_type = b.get("type", "")
-                fn = b.get("_attachment_filename")
-                if not fn and b_type in ("file", "pdf", "image", "audio", "video"):
-                    f_info = b.get(b_type, {})
-                    f_file = f_info.get("file") or {}
-                    u = f_file.get("url")
-                    if u and not u.startswith(("http://", "https://")):
-                        fn = os.path.basename(urllib.parse.unquote(u))
-                if fn and fn not in expected_attachment_filenames:
-                    expected_attachment_filenames.append(fn)
-
-                if b.get("children_blocks"):
-                    _collect_attachment_filenames(b["children_blocks"])
-
-        _collect_attachment_filenames(node.blocks)
+        for b in all_blocks:
+            if b.get("_attachment_uploaded") is False:
+                continue
+            b_type = b.get("type", "")
+            fn = b.get("_attachment_filename")
+            if not fn and b_type in ("file", "pdf", "image", "audio", "video"):
+                f_info = b.get(b_type, {})
+                f_file = f_info.get("file") or {}
+                u = f_file.get("url")
+                if u and not u.startswith(("http://", "https://")):
+                    fn = os.path.basename(urllib.parse.unquote(u))
+            if fn:
+                fn_nfc = unicodedata.normalize("NFC", str(fn))
+                if fn_nfc not in expected_attachment_filenames:
+                    expected_attachment_filenames.append(fn_nfc)
 
         if expected_attachment_filenames:
             conf_attachments = self.client.get_page_attachments(confluence_page_id) if hasattr(self.client, "get_page_attachments") else []
-            attached_titles = {att.get("title") for att in conf_attachments if isinstance(att, dict)}
+            attached_titles = {att.get("title") for att in conf_attachments if isinstance(att, dict) and att.get("title")}
+            attached_titles_nfc = {unicodedata.normalize("NFC", t) for t in attached_titles}
             for exp_fn in expected_attachment_filenames:
-                if exp_fn in attached_titles:
+                if exp_fn in attached_titles or exp_fn in attached_titles_nfc:
                     checks_passed.append(f"Attachment file '{exp_fn}' verified in Confluence attachments.")
                 else:
                     issues.append(f"Attachment file '{exp_fn}' is missing from Confluence page {confluence_page_id} attachments.")
 
         if "pdf" in block_types:
-            if ('<ac:structured-macro ac:name="view-file"' in storage_body or '<ac:link' in storage_body) and ".pdf" in storage_body.lower():
-                checks_passed.append("PDF block converted to view-file macro / attachment link.")
-            else:
-                issues.append("PDF block detected in Notion, but PDF viewer/link not found in Confluence.")
+            pdf_blocks = [b for b in all_blocks if b.get("type") == "pdf"]
+            attached_pdf_blocks = [b for b in pdf_blocks if b.get("_attachment_uploaded", True)]
+            external_pdf_blocks = [b for b in pdf_blocks if not b.get("_attachment_uploaded", True)]
+            if attached_pdf_blocks:
+                has_viewpdf = '<ac:structured-macro ac:name="viewpdf"' in storage_body
+                if has_viewpdf and ".pdf" in storage_body.lower():
+                    checks_passed.append("PDF block converted to viewpdf inline preview macro.")
+                else:
+                    issues.append("PDF block detected in Notion, but viewpdf inline preview macro not found in Confluence.")
+                if view_body and 'data-macro-name="viewpdf"' in view_body:
+                    checks_passed.append("PDF viewpdf viewer verified in rendered view body.")
+            if external_pdf_blocks:
+                if ('<a ' in storage_body or '📄 ' in storage_body) and ".pdf" in storage_body.lower():
+                    checks_passed.append("External/fallback PDF link verified in Confluence body.")
+                else:
+                    issues.append("External PDF block detected in Notion, but PDF link/reference not found in Confluence.")
 
         if "file" in block_types:
             if "<ac:link" in storage_body and "<ri:attachment" in storage_body:

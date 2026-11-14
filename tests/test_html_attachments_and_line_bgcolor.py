@@ -270,19 +270,25 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         self.assertIn('<span style="background-color: #fbf0f4;', html)
 
     def test_converter_pdf_block_single_macro_no_duplicate_link(self):
-        """PDFブロックがview-fileマクロ単一で出力され、重複リンクが生成されないこと。"""
+        """PDFブロックがviewpdfインラインプレビューマクロ単一で出力され、重複リンクが生成されないこと。"""
         blocks = [
             {
                 "type": "pdf",
-                "pdf": {"file": {"url": "test.pdf"}},
+                "pdf": {
+                    "file": {"url": "test.pdf"},
+                    "caption": [{"type": "text", "text": {"content": "資料キャプション"}, "plain_text": "資料キャプション"}],
+                },
                 "_attachment_filename": "test.pdf",
                 "_attachment_uploaded": True,
             }
         ]
         html = self.converter.blocks_to_storage_format(blocks)
         assert_valid_storage_xml(self, html)
-        self.assertIn('<ac:structured-macro ac:name="view-file"', html)
-        self.assertEqual(html.count('<ac:structured-macro ac:name="view-file"'), 1)
+        self.assertIn('<ac:structured-macro ac:name="viewpdf">', html)
+        self.assertIn('<ri:attachment ri:filename="test.pdf" />', html)
+        self.assertIn('<p><em>資料キャプション</em></p>', html)
+        self.assertEqual(html.count('<ac:structured-macro ac:name="viewpdf"'), 1)
+        self.assertNotIn('<p><ac:structured-macro ac:name="viewpdf"', html)
         self.assertNotIn('<ac:link>', html)
 
     def test_converter_custom_link_text_no_card_appearance(self):
@@ -394,6 +400,312 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         res = verifier.verify_page_node(node, "p-1")
         self.assertEqual(res["status"], "FAIL")
         self.assertTrue(any("overwriting custom link text '熊本城'" in issue for issue in res["issues"]))
+
+    def test_html_extractor_pdf_attachment_ref_normalization_and_icon_skip(self):
+        """attachment:<uuid>:<filename> 表記の正規化・ZIP解決・PDFアイコンimg誤判定回避・キャプション保持を検証。"""
+        html_content = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>PDF Pattern Test</title></head>
+<body>
+  <article id="page-12345678-1234-1234-1234-123456789abc" class="page sans">
+    <header><h1 class="page-title">PDF Pattern Test</h1></header>
+    <div class="page-body">
+      <figure id="pdf-icon-1" class="pdf">
+        <div class="source">
+          <a href="subaru_studres_2016_p01.pdf"><img class="icon" src="https://app.notion.com/icons/pdf.svg" />attachment:80d7f95d-3e53-49a8-af77-d98c350732be:subaru_studres_2016_p01.pdf</a>
+        </div>
+        <figcaption>attachment:80d7f95d-3e53-49a8-af77-d98c350732be:資料補足</figcaption>
+      </figure>
+      <figure id="pdf-uri-href" class="file">
+        <a href="attachment:80d7f95d-3e53-49a8-af77-d98c350732be:subaru_studres_2016_p01.pdf">attachment:80d7f95d-3e53-49a8-af77-d98c350732be:subaru_studres_2016_p01.pdf</a>
+      </figure>
+      <p id="inline-ref">参照: <a href="subaru_studres_2016_p01.pdf">attachment:80d7f95d-3e53-49a8-af77-d98c350732be:subaru_studres_2016_p01.pdf</a></p>
+    </div>
+  </article>
+</body>
+</html>"""
+        pdf_bytes = b"%PDF-1.4 subaru bytes"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "pdf_patterns.zip")
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("エラーパターン/page.html", html_content)
+                zf.writestr("エラーパターン/subaru_studres_2016_p01.pdf", pdf_bytes)
+
+            tree = HtmlZipExtractor(zip_path).extract_tree()
+            self.assertEqual(len(tree.blocks), 3)
+
+            b0 = tree.blocks[0]
+            self.assertEqual(b0["type"], "pdf")
+            self.assertEqual(b0.get("_attachment_filename"), "subaru_studres_2016_p01.pdf")
+            self.assertEqual(b0.get("_display_name"), "subaru_studres_2016_p01.pdf")
+            self.assertEqual(b0.get("_attachment_bytes"), pdf_bytes)
+            self.assertEqual(b0["pdf"]["caption"][0]["text"]["content"], "資料補足")
+
+            b1 = tree.blocks[1]
+            self.assertEqual(b1["type"], "pdf")
+            self.assertEqual(b1.get("_attachment_filename"), "subaru_studres_2016_p01.pdf")
+            self.assertEqual(b1.get("_display_name"), "subaru_studres_2016_p01.pdf")
+            self.assertEqual(b1.get("_attachment_bytes"), pdf_bytes)
+
+            b2 = tree.blocks[2]
+            self.assertEqual(b2["type"], "paragraph")
+            link_rt = b2["paragraph"]["rich_text"][1]
+            self.assertEqual(link_rt["plain_text"], "subaru_studres_2016_p01.pdf")
+            self.assertNotIn("page_id", link_rt)
+
+    def test_html_extractor_pdf_nfd_nfc_and_column_nesting_with_converter(self):
+        """カラム内にネストされたNFD日本語ファイル名PDFがNFC正規化で抽出・viewpdf変換されること。"""
+        import unicodedata
+        nfd_name = unicodedata.normalize("NFD", "A10_SPWorkshop_2019_ご案内.pdf")
+        nfc_name = unicodedata.normalize("NFC", "A10_SPWorkshop_2019_ご案内.pdf")
+        encoded_nfc = "A10_SPWorkshop_2019_%E3%81%94%E6%A1%88%E5%86%85.pdf"
+
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Column PDF Test</title></head>
+<body>
+  <article id="4137be77-284d-801d-9fcf-c13c0989f376" class="page sans">
+    <header><h1 class="page-title">Column PDF Test</h1></header>
+    <div class="page-body">
+      <div class="column-list" id="col-list-1">
+        <div class="column" id="col-1">
+          <figure id="pdf-col-1" class="pdf">
+            <div class="source"><a href="エラーパターン/{encoded_nfc}">{nfc_name}</a></div>
+          </figure>
+        </div>
+        <div class="column" id="col-2">
+          <p>右カラムテキスト</p>
+        </div>
+      </div>
+    </div>
+  </article>
+</body>
+</html>"""
+        pdf_bytes = b"%PDF-1.4 a10 workshop bytes"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "nfd_col.zip")
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("プライベート/エラーパターン.html", html_content)
+                zf.writestr(f"プライベート/エラーパターン/{nfd_name}", pdf_bytes)
+
+            tree = HtmlZipExtractor(zip_path).extract_tree()
+            self.assertEqual(len(tree.blocks), 1)
+            col_list = tree.blocks[0]
+            self.assertEqual(col_list["type"], "column_list")
+            pdf_block = col_list["children_blocks"][0]["children_blocks"][0]
+            self.assertEqual(pdf_block["type"], "pdf")
+            self.assertEqual(pdf_block.get("_attachment_filename"), nfc_name)
+            self.assertEqual(pdf_block.get("_attachment_bytes"), pdf_bytes)
+
+            # Storage Format変換・XML整形式検証
+            storage_xml = self.converter.blocks_to_storage_format(tree.blocks)
+            assert_valid_storage_xml(self, storage_xml)
+            self.assertIn('<ac:structured-macro ac:name="section">', storage_xml)
+            self.assertIn('<ac:structured-macro ac:name="column">', storage_xml)
+            self.assertIn(f'<ac:structured-macro ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="{nfc_name}" /></ac:parameter></ac:structured-macro>', storage_xml)
+
+    def test_importer_uploads_nested_column_pdf_with_nfc_filename(self):
+        """ConfluenceImporter._process_attachmentsがカラム内ネストPDFをNFCファイル名でアップロードすること。"""
+        import unicodedata
+        from unittest.mock import patch
+        from src.importer import ConfluenceImporter
+
+        nfd_name = unicodedata.normalize("NFD", "A10_SPWorkshop_2019_ご案内.pdf")
+        nfc_name = unicodedata.normalize("NFC", "A10_SPWorkshop_2019_ご案内.pdf")
+        pdf_bytes = b"%PDF-1.4 dummy"
+
+        pdf_block = {
+            "id": "pdf-nested",
+            "type": "pdf",
+            "pdf": {"type": "file", "file": {"url": nfd_name}, "caption": []},
+            "_attachment_filename": nfd_name,
+            "_attachment_bytes": pdf_bytes,
+        }
+        col_list = {
+            "id": "col-list",
+            "type": "column_list",
+            "children_blocks": [
+                {"id": "c1", "type": "column", "children_blocks": [pdf_block]},
+                {"id": "c2", "type": "column", "children_blocks": []},
+            ],
+        }
+        with patch("src.importer.ConfluenceClient") as mock_cli_cls:
+            mock_cli = mock_cli_cls.return_value
+            mock_cli.base_url = "https://example.atlassian.net/wiki"
+            mock_cli.upload_attachment.return_value = {"results": [{"id": "att-1"}]}
+
+            importer = ConfluenceImporter("https://example.atlassian.net/wiki", "u", "t", "SPACE")
+            importer._process_attachments([col_list], "page-999")
+
+            mock_cli.upload_attachment.assert_called_once_with(
+                page_id="page-999",
+                filename=nfc_name,
+                file_bytes=pdf_bytes,
+                mime_type="application/pdf",
+            )
+            self.assertEqual(pdf_block["_attachment_filename"], nfc_name)
+            self.assertTrue(pdf_block["_attachment_uploaded"])
+
+            # アップロード失敗(None返却)時は _attachment_uploaded が False になること
+            pdf_fail = {
+                "id": "pdf-fail",
+                "type": "pdf",
+                "pdf": {"type": "file", "file": {"url": "fail.pdf"}, "caption": []},
+                "_attachment_filename": "fail.pdf",
+                "_attachment_bytes": b"%PDF-1.4 fail",
+            }
+            mock_cli.upload_attachment.return_value = None
+            importer._process_attachments([pdf_fail], "page-999")
+            self.assertFalse(pdf_fail["_attachment_uploaded"])
+
+    def test_verifier_pdf_viewpdf_nested_column_and_view_error_detection(self):
+        """MigrationVerifierがカラム内PDFのviewpdf検証、添付欠落検知、view_bodyエラー検知を行うこと。"""
+        import unicodedata
+        nfc_name = unicodedata.normalize("NFC", "A10_SPWorkshop_2019_ご案内.pdf")
+        nfd_name = unicodedata.normalize("NFD", "A10_SPWorkshop_2019_ご案内.pdf")
+        col_node = PageNode(
+            id="p-pdf",
+            title="PDF Column Page",
+            node_type="page",
+            blocks=[
+                {
+                    "id": "col-list",
+                    "type": "column_list",
+                    "children_blocks": [
+                        {
+                            "id": "col-1",
+                            "type": "column",
+                            "children_blocks": [
+                                {
+                                    "id": "pdf-1",
+                                    "type": "pdf",
+                                    "pdf": {"type": "file", "file": {"url": nfc_name}},
+                                    "_attachment_filename": nfc_name,
+                                    "_attachment_uploaded": True,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        # 1. 正常系 (viewpdf + section/column + attachment あり + view_body 正常)
+        mock_client = MagicMock()
+        mock_client.get_page_by_id.return_value = {
+            "id": "conf-1",
+            "title": "PDF Column Page",
+            "body": {
+                "storage": {
+                    "value": (
+                        '<ac:structured-macro ac:name="section"><ac:rich-text-body>'
+                        '<ac:structured-macro ac:name="column"><ac:rich-text-body>'
+                        f'<ac:structured-macro ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="{nfc_name}" /></ac:parameter></ac:structured-macro>'
+                        '</ac:rich-text-body></ac:structured-macro>'
+                        '</ac:rich-text-body></ac:structured-macro>'
+                    )
+                },
+                "view": {
+                    "value": '<div class="conf-macro output-block" data-macro-name="viewpdf"><div class="office-container"></div></div>'
+                },
+            },
+        }
+        mock_client.get_page_attachments.return_value = [{"title": nfd_name, "id": "att-1"}]
+        verifier = MigrationVerifier(mock_client)
+        res_ok = verifier.verify_page_node(col_node, "conf-1")
+        self.assertEqual(res_ok["status"], "PASS")
+        self.assertTrue(any("viewpdf" in c for c in res_ok["checks_passed"]))
+
+        # 2. view_body にレンダリングエラーがある場合 FAIL になること
+        col_node_err = PageNode(
+            id="p-pdf-err",
+            title="PDF Column Page",
+            node_type="page",
+            blocks=[
+                {
+                    "id": "pdf-1",
+                    "type": "pdf",
+                    "pdf": {"type": "file", "file": {"url": nfc_name}},
+                    "_attachment_filename": nfc_name,
+                    "_attachment_uploaded": True,
+                }
+            ],
+        )
+        mock_client.get_page_by_id.return_value = {
+            "id": "conf-2",
+            "title": "PDF Column Page",
+            "body": {
+                "storage": {
+                    "value": f'<ac:structured-macro ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="{nfc_name}" /></ac:parameter></ac:structured-macro>'
+                },
+                "view": {
+                    "value": '<div class="error">マクロ \'viewpdf\' のレンダリング中にエラーが発生しました : Failed to find attachment</div>'
+                },
+            },
+        }
+        res_err = verifier.verify_page_node(col_node_err, "conf-2")
+        self.assertEqual(res_err["status"], "FAIL")
+        self.assertTrue(any("Macro load/render error" in i for i in res_err["issues"]))
+
+    def test_html_extractor_distinguishes_preview_disabled_file_pdf_vs_embedded_pdf(self):
+        """Notion上のプレビューなしPDF(data-notion-file付与)はfileリンク、PDF埋め込みはviewpdfとして区別変換されること。"""
+        import unicodedata
+        nfd_a10 = unicodedata.normalize("NFD", "A10_SPWorkshop_2019_ご案内.pdf")
+        nfc_a10 = unicodedata.normalize("NFC", "A10_SPWorkshop_2019_ご案内.pdf")
+        nfc_a10_alias = unicodedata.normalize("NFC", "A10 SPWorkshop 2019_ご案内.pdf")
+        nfd_a10_alias = unicodedata.normalize("NFD", "A10 SPWorkshop 2019_ご案内.pdf")
+
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>PDF Preview vs File Test</title></head>
+<body>
+  <article id="4137be77-284d-8041-89c8-d080073331b4" class="page sans">
+    <header><h1 class="page-title">PDF Preview vs File Test</h1></header>
+    <div class="page-body">
+      <figure id="4157be77-284d-800c-a0d2-cb01a1db6288" dir="ltr">
+        <div class="source">
+          <a href="エラーパターン/{nfd_a10}" data-notion-file="エラーパターン/{nfd_a10}" data-notion-file-alias="{nfd_a10_alias}">{nfd_a10_alias}</a>
+        </div>
+      </figure>
+      <figure id="4177be77-284d-80f1-acc0-e8ea00b4f270" dir="ltr">
+        <div class="source">
+          <a href="エラーパターン/subaru_studres_2016_p01.pdf">attachment:bee699b7-a0e3-490b-9fe9-cbabec976562:subaru_studres_2016_p01.pdf</a>
+        </div>
+      </figure>
+    </div>
+  </article>
+</body>
+</html>"""
+        a10_bytes = b"%PDF-1.4 a10 bytes"
+        subaru_bytes = b"%PDF-1.4 subaru bytes"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "distinguish.zip")
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("プライベート/エラーパターン.html", html_content)
+                zf.writestr(f"プライベート/エラーパターン/{nfd_a10}", a10_bytes)
+                zf.writestr("プライベート/エラーパターン/subaru_studres_2016_p01.pdf", subaru_bytes)
+
+            tree = HtmlZipExtractor(zip_path).extract_tree()
+            self.assertEqual(len(tree.blocks), 2)
+
+            b_file = tree.blocks[0]
+            self.assertEqual(b_file["type"], "file")
+            self.assertEqual(b_file.get("_attachment_filename"), nfc_a10)
+            self.assertEqual(b_file.get("_display_name"), nfc_a10_alias)
+            self.assertEqual(b_file.get("_attachment_bytes"), a10_bytes)
+
+            b_pdf = tree.blocks[1]
+            self.assertEqual(b_pdf["type"], "pdf")
+            self.assertEqual(b_pdf.get("_attachment_filename"), "subaru_studres_2016_p01.pdf")
+            self.assertEqual(b_pdf.get("_display_name"), "subaru_studres_2016_p01.pdf")
+            self.assertEqual(b_pdf.get("_attachment_bytes"), subaru_bytes)
+
+            storage_xml = self.converter.blocks_to_storage_format(tree.blocks)
+            assert_valid_storage_xml(self, storage_xml)
+            self.assertIn(f'<ac:link><ri:attachment ri:filename="{nfc_a10}" />', storage_xml)
+            self.assertIn(f'<![CDATA[📎 {nfc_a10_alias} (添付ファイルをダウンロード)]]>', storage_xml)
+            self.assertNotIn(f'ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="{nfc_a10}"', storage_xml)
+            self.assertIn('<ac:structured-macro ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="subaru_studres_2016_p01.pdf" /></ac:parameter></ac:structured-macro>', storage_xml)
 
 
 if __name__ == "__main__":
