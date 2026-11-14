@@ -479,12 +479,58 @@ class MigrationVerifier:
         except Exception as e:
             warnings.append(f"Could not verify database entries count: {e}")
 
-        # 4. プロパティ・スキーマ定義の網羅性検証
+        # 4. プロパティ・スキーマ定義の網羅性およびフィールド型検証
         prop_keys = set()
         for child in node.children:
             prop_keys.update(child.properties.keys())
         if prop_keys:
             checks_passed.append(f"Database schema properties verified ({len(prop_keys)} properties): {', '.join(sorted(prop_keys))}")
+
+        schema = (node.properties or {}).get("schema") or {}
+        if schema and hasattr(self.client, "get_database_fields"):
+            try:
+                conf_fields = self.client.get_database_fields(confluence_db_id)
+                if isinstance(conf_fields, list) and conf_fields:
+                    conf_field_types = {
+                        (f.get("name") or f.get("title") or "").strip(): (f.get("type") or "").strip().lower()
+                        for f in conf_fields
+                        if isinstance(f, dict) and (f.get("name") or f.get("title"))
+                    }
+                    expected_conf_type_map = {
+                        "checkbox": {"checkbox"},
+                        "date": {"date"},
+                        "created_time": {"date"},
+                        "last_edited_time": {"date"},
+                        "number": {"number"},
+                        "url": {"hyperlink", "link", "url"},
+                        "select": {"tag", "select"},
+                        "status": {"tag", "select"},
+                        "multi_select": {"tag", "select"},
+                        "text": {"text"},
+                        "rich_text": {"text"},
+                        "title": {"confluence-page-link", "text", "page-link", "pagelink"},
+                    }
+                    matched_fields = []
+                    for f_name, f_meta in schema.items():
+                        if not isinstance(f_meta, dict):
+                            continue
+                        n_type = (f_meta.get("type") or "").strip().lower()
+                        expected_set = expected_conf_type_map.get(n_type)
+                        if not expected_set or f_name not in conf_field_types:
+                            continue
+                        actual_type = conf_field_types[f_name]
+                        if actual_type in expected_set:
+                            matched_fields.append(f"{f_name}:{actual_type}")
+                        else:
+                            issues.append(
+                                f"Database field '{f_name}' type mismatch: expected {sorted(expected_set)} for Notion '{n_type}', got '{actual_type}'."
+                            )
+                    if matched_fields:
+                        checks_passed.append(
+                            f"Database field types verified ({len(matched_fields)} fields): {', '.join(matched_fields)}"
+                        )
+            except Exception as fe:
+                warnings.append(f"Could not verify database field types: {fe}")
 
         status = "FAIL" if issues else ("WARN" if warnings else "PASS")
         # 検証完了後に即時メモリ解放

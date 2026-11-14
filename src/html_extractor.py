@@ -172,6 +172,117 @@ def _parse_date_string(val: str) -> Optional[str]:
     return None
 
 
+_SAFE_NUMBER_RE = re.compile(r"^[+-]?(?:0|[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d*)(?:\.\d+)?$")
+_CSV_CHECKBOX_TRUE = frozenset({"Yes", "yes", "YES", "true", "True", "TRUE", "☑", "✅"})
+_CSV_CHECKBOX_FALSE = frozenset({"No", "no", "NO", "false", "False", "FALSE", "⬜", "☐"})
+_EXPLICIT_MULTI_SELECT_COLS = frozenset({"カテゴリ", "tags", "labels", "タグ", "ラベル", "category", "categories"})
+
+
+def _parse_date_or_datetime(val: str) -> Optional[str]:
+    """日付・日時文字列を YYYY-MM-DD または YYYY-MM-DDTHH:MM(:SS) 形式に変換する。日付でない場合は None。"""
+    base_date = _parse_date_string(val)
+    if not base_date:
+        return None
+    s = val.strip().lstrip("@").strip()
+    start_part = re.split(r"\s*(?:→|->|〜)\s*", s)[0].strip()
+
+    # ISO形式の時刻付き (例: 2026-11-11T21:30, 2026-11-11T21:30:00Z, 2026-11-11 21:30)
+    m_iso_t = re.match(
+        r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?(?:\s*(AM|PM|am|pm))?",
+        start_part,
+    )
+    if m_iso_t:
+        hh, mm = int(m_iso_t.group(1)), int(m_iso_t.group(2))
+        ss = m_iso_t.group(3)
+        tz_suf = m_iso_t.group(4) or ""
+        ampm = (m_iso_t.group(5) or "").lower()
+        if ampm == "pm" and hh < 12:
+            hh += 12
+        elif ampm == "am" and hh == 12:
+            hh = 0
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            sec_part = f":{ss}" if ss else ""
+            return f"{base_date}T{hh:02d}:{mm:02d}{sec_part}{tz_suf}"
+
+    # 日本語・英語表記等の末尾時刻 (例: 2026年11月11日 21:30 / Nov 11, 2026 9:30 PM)
+    m_t = re.search(r"\s(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*(AM|PM|am|pm))?(?:\s*\(?[A-Za-z0-9_+:\-\/]+\)?)?$", start_part)
+    if m_t:
+        hh, mm = int(m_t.group(1)), int(m_t.group(2))
+        ss = m_t.group(3)
+        ampm = (m_t.group(4) or "").lower()
+        if ampm == "pm" and hh < 12:
+            hh += 12
+        elif ampm == "am" and hh == 12:
+            hh = 0
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            sec_part = f":{ss}" if ss else ""
+            return f"{base_date}T{hh:02d}:{mm:02d}{sec_part}"
+
+    return base_date
+
+
+def _parse_date_range(val: str) -> Optional[Tuple[str, Optional[str]]]:
+    """日付または日付範囲文字列を (start, end) に変換する。範囲指定がある場合は両端とも有効な日付であることを要求する。"""
+    if not val or not isinstance(val, str):
+        return None
+    s = val.strip().lstrip("@").strip()
+    if not s or "\n" in s or "\r" in s:
+        return None
+    if any(sep in s for sep in ("→", "->", "〜")):
+        parts = re.split(r"\s*(?:→|->|〜)\s*", s)
+        if len(parts) != 2:
+            return None
+        st = _parse_date_or_datetime(parts[0])
+        en = _parse_date_or_datetime(parts[1])
+        if st and en:
+            return st, en
+        return None
+    st = _parse_date_or_datetime(s)
+    return (st, None) if st else None
+
+
+def _is_safe_number(val: str) -> bool:
+    """先行ゼロのコード番号・電話番号・日時等と誤認せず、純粋な数値表記（カンマ区切り・符号・小数含む）のみ True を返す。"""
+    if not val or not isinstance(val, str):
+        return False
+    s = val.strip()
+    if not s or "\n" in s or "\r" in s:
+        return False
+    return bool(_SAFE_NUMBER_RE.match(s))
+
+
+def _parse_safe_number(val: str) -> Optional[Union[int, float]]:
+    if not _is_safe_number(val):
+        return None
+    clean = val.strip().replace(",", "")
+    if "." in clean:
+        return float(clean)
+    return int(clean)
+
+
+def _is_valid_http_url(val: str) -> bool:
+    """http:// または https:// の有効な URL 形式であるかを判定する。"""
+    if not val or not isinstance(val, str):
+        return False
+    s = val.strip()
+    if not s or any(c.isspace() for c in s):
+        return False
+    if not re.match(r"^https?://", s, re.IGNORECASE):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(s)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    host = parsed.hostname or ""
+    if not host:
+        return False
+    if host.lower() != "localhost" and "." not in host and ":" not in host:
+        return False
+    return True
+
+
 class AttachmentBlockDict(dict):
     """添付ファイルの実体バイナリをオンメモリに常駐させず、
     アクセス時にZIPから遅延読み込み（Lazy Loading）する辞書クラス。
@@ -645,22 +756,68 @@ class HtmlZipExtractor:
         logger.info(f"Extracting {len(rows)} records from database CSV: [{db_node.title}]")
         used_row_ids = set()
 
+        fieldnames = [fn.lstrip("\ufeff").strip() for fn in (reader.fieldnames or []) if fn is not None]
+        title_col_name: Optional[str] = None
+        for cand in ("タスク名", "名前", "Title", "Name", "タイトル"):
+            if cand in fieldnames:
+                title_col_name = cand
+                break
+        if not title_col_name and fieldnames:
+            title_col_name = fieldnames[0]
+
+        def _is_csv_relation_val(val_str: str) -> bool:
+            unquoted = urllib.parse.unquote(val_str)
+            uids = extract_uuids(unquoted) or extract_uuids(val_str)
+            return bool(uids and (".html" in val_str or "notion.so" in val_str or "notion.com" in val_str))
+
+        def _build_csv_relation_prop(val_str: str) -> Dict[str, Any]:
+            rel_items = []
+            token_matches = re.findall(r"([^,\(\)]*?)\s*\(([^)]+)\)", val_str)
+            if token_matches:
+                for t_name, t_ref in token_matches:
+                    t_uids = extract_uuids(t_ref)
+                    if t_uids:
+                        tid = normalize_id(t_uids[-1])
+                        rel_items.append({
+                            "id": tid,
+                            "text": t_name.strip() or tid[:8],
+                        })
+            if not rel_items:
+                unquoted = urllib.parse.unquote(val_str)
+                rel_uids = extract_uuids(unquoted) or extract_uuids(val_str)
+                for u in rel_uids:
+                    tid = normalize_id(u)
+                    rel_items.append({
+                        "id": tid,
+                        "text": val_str.split("(")[0].strip() or tid[:8],
+                    })
+            return {
+                "type": "relation",
+                "relations": rel_items,
+                "relation": rel_items,
+                "value": rel_items,
+            }
+
+        col_html_types: Dict[str, str] = {}
+        col_csv_values: Dict[str, List[str]] = {}
+        extra_html_cols: List[str] = []
+        staged_rows: List[Dict[str, Any]] = []
+
         import gc
         for idx, row in enumerate(rows, 1):
-            clean_row = {k.lstrip("\ufeff"): v for k, v in row.items()}
-            # タスク名またはタイトル列
-            raw_title = (
-                clean_row.get("タスク名")
-                or clean_row.get("名前")
-                or clean_row.get("Title")
-                or clean_row.get("Name")
-                or clean_row.get("タイトル")
-            )
+            clean_row = {k.lstrip("\ufeff").strip(): (v or "") for k, v in row.items() if k is not None}
+            if title_col_name and title_col_name in clean_row:
+                raw_title = clean_row.get(title_col_name, "")
+            else:
+                raw_title = (
+                    clean_row.get("タスク名")
+                    or clean_row.get("名前")
+                    or clean_row.get("Title")
+                    or clean_row.get("Name")
+                    or clean_row.get("タイトル")
+                    or next(iter(clean_row.values()), "")
+                )
             title_col_val = raw_title
-            if not raw_title:
-                # 最初の列をタイトルとする
-                raw_title = next(iter(clean_row.values()), "Untitled Record")
-                title_col_val = raw_title
 
             # NotionのCSVエクスポートにおけるリンクアーティファクト " (パス/ファイル名.html)" を除去
             raw_title = re.sub(r"\s*\([^)]*\.html\)$", "", raw_title).strip()
@@ -713,8 +870,24 @@ class HtmlZipExtractor:
                         row_html_file = r_path
                         break
 
+            # 6. 無題行のフォールバック一致（CSVが空タイトル・HTMLが「無題」/「Untitled」の場合）
+            if not row_html_file and not raw_title:
+                for untitled_key in (_norm_title_key("無題"), _norm_title_key("Untitled"), _norm_title_key("Untitled Page")):
+                    if untitled_key in row_html_by_title:
+                        cand_id, cand_path = row_html_by_title[untitled_key]
+                        if cand_id not in used_row_ids:
+                            row_id = cand_id
+                            row_html_file = cand_path
+                            break
+                    if untitled_key in row_html_by_stem:
+                        cand_id, cand_path = row_html_by_stem[untitled_key]
+                        if cand_id not in used_row_ids:
+                            row_id = cand_id
+                            row_html_file = cand_path
+                            break
+
             if not row_id:
-                row_id = f"{db_node.id}_row_{len(db_node.children)}"
+                row_id = f"{db_node.id}_row_{idx - 1}"
             used_row_ids.add(row_id)
 
             # レコード本文ブロック、アイコン、カバーおよびコメントの抽出
@@ -731,126 +904,230 @@ class HtmlZipExtractor:
                     row_cover = {"type": "external", "external": {"url": cover_img["src"]}}
                 row_prop_table = row_soup.find("table", class_="properties")
                 if row_prop_table:
-                    row_html_props = self._extract_properties_from_table(row_prop_table)
+                    row_html_props = self._extract_properties_from_table(row_prop_table, col_types_out=col_html_types)
                 row_body = row_soup.find(class_="page-body")
                 if row_body:
                     row_blocks = self._parse_elements_to_blocks(row_body, zf, os.path.dirname(row_html_file))
                 row_comments = self._extract_page_comments(row_soup)
                 row_soup.decompose()
 
-            # プロパティ辞書の整形
-            row_properties = {}
             for col_name, val in clean_row.items():
-                if not val:
+                if not col_name or col_name == title_col_name:
                     continue
-                clean_col = col_name.strip()
                 clean_val = val.strip()
+                if clean_val:
+                    col_csv_values.setdefault(col_name, []).append(clean_val)
 
-                # リレーションのパース（単一およびカンマ区切りの複数リレーション、URLリンク形式に対応）
-                # 例1: "タイトル (フォルダ/ファイル名 00000000...html)"
-                # 例2: "Task A (https://www.notion.so/..., Task B (...html))"
-                unquoted_clean_val = urllib.parse.unquote(clean_val)
-                rel_uids = extract_uuids(unquoted_clean_val) or extract_uuids(clean_val)
-                is_rel = False
-                if rel_uids and (".html" in clean_val or "notion.so" in clean_val or "notion.com" in clean_val):
-                    is_rel = True
+            for hp_name in row_html_props.keys():
+                if hp_name and hp_name != title_col_name and hp_name not in fieldnames and hp_name not in extra_html_cols:
+                    extra_html_cols.append(hp_name)
 
-                if is_rel:
-                    rel_items = []
-                    # カンマ区切りまたはパターンで分割
-                    # "(...)" 形式の各トークンからタイトルとUUIDを抽出
-                    token_matches = re.findall(r"([^,\(\)]*?)\s*\(([^)]+)\)", clean_val)
-                    if token_matches:
-                        for t_name, t_ref in token_matches:
-                            t_uids = extract_uuids(t_ref)
-                            if t_uids:
-                                tid = normalize_id(t_uids[-1])
-                                rel_items.append({
-                                    "id": tid,
-                                    "text": t_name.strip() or tid[:8],
-                                })
-                    if not rel_items:
-                        # トークン分割できなかった場合は抽出した全UUIDをリレーション化
-                        for u in rel_uids:
-                            tid = normalize_id(u)
-                            rel_items.append({
-                                "id": tid,
-                                "text": clean_val.split("(")[0].strip() or tid[:8],
-                            })
-                    row_properties[clean_col] = {
-                        "type": "relation",
-                        "relations": rel_items,
-                        "relation": rel_items,
-                        "value": rel_items,
-                    }
-                elif clean_col in ("カテゴリ", "Tags", "Labels") and "," in clean_val:
-                    # 複数選択
+            staged_rows.append({
+                "row_id": row_id,
+                "row_title": row_title,
+                "raw_title": raw_title,
+                "clean_row": clean_row,
+                "row_html_props": row_html_props,
+                "row_blocks": row_blocks,
+                "row_comments": row_comments,
+                "row_icon": row_icon,
+                "row_cover": row_cover,
+            })
+            if idx % 500 == 0:
+                gc.collect()
+
+        # 列単位の型確定（HTML解析結果を最優先し、未確定列のみCSV列全体の非空値を走査して推論）
+        non_title_cols = [c for c in fieldnames if c and c != title_col_name]
+        for c in extra_html_cols:
+            if c not in non_title_cols:
+                non_title_cols.append(c)
+
+        resolved_col_types: Dict[str, str] = {}
+        for col_name in non_title_cols:
+            if col_name in col_html_types:
+                resolved_col_types[col_name] = col_html_types[col_name]
+                continue
+            vals = col_csv_values.get(col_name, [])
+            if not vals:
+                resolved_col_types[col_name] = "text"
+            elif all(_is_csv_relation_val(v) for v in vals):
+                resolved_col_types[col_name] = "relation"
+            elif all(v in _CSV_CHECKBOX_TRUE or v in _CSV_CHECKBOX_FALSE for v in vals):
+                resolved_col_types[col_name] = "checkbox"
+            elif all(_parse_date_range(v) is not None for v in vals):
+                resolved_col_types[col_name] = "date"
+            elif all(_is_safe_number(v) for v in vals):
+                resolved_col_types[col_name] = "number"
+            elif all(_is_valid_http_url(v) for v in vals):
+                resolved_col_types[col_name] = "url"
+            elif (
+                col_name.lower() in _EXPLICIT_MULTI_SELECT_COLS
+                and any("," in v for v in vals)
+                and not any("\n" in v or "\r" in v for v in vals)
+            ):
+                resolved_col_types[col_name] = "multi_select"
+            else:
+                resolved_col_types[col_name] = "text"
+
+        # db_node.properties["schema"] および title_column へ確定した列型を整合的に反映
+        if not isinstance(db_node.properties, dict):
+            db_node.properties = {}
+        schema = db_node.properties.setdefault("schema", {})
+        if title_col_name:
+            db_node.properties["title_column"] = title_col_name
+            schema[title_col_name] = {"type": "title"}
+        for col_name in non_title_cols:
+            existing_meta = schema.get(col_name) if isinstance(schema.get(col_name), dict) else {}
+            schema[col_name] = {**existing_meta, "type": resolved_col_types[col_name]}
+
+        # 確定した列型とHTMLプロパティを統合して各行 PageNode を構築
+        for staged in staged_rows:
+            clean_row = staged["clean_row"]
+            row_html_props = staged["row_html_props"]
+            row_properties: Dict[str, Any] = {}
+
+            if title_col_name and staged["raw_title"]:
+                row_properties[title_col_name] = {
+                    "type": "title",
+                    "value": staged["row_title"],
+                }
+
+            for col_name, val in clean_row.items():
+                if not col_name or col_name == title_col_name or not val:
+                    continue
+                clean_val = val.strip()
+                if not clean_val:
+                    continue
+
+                ctype = resolved_col_types.get(col_name, "text")
+                if ctype == "relation" or _is_csv_relation_val(clean_val):
+                    row_properties[col_name] = _build_csv_relation_prop(clean_val)
+                elif ctype == "multi_select":
                     items = [item.strip() for item in clean_val.split(",") if item.strip()]
-                    row_properties[clean_col] = {
+                    item_objs = [{"name": item, "value": item} for item in items]
+                    row_properties[col_name] = {
                         "type": "multi_select",
+                        "items": item_objs,
                         "multi_select": [{"name": item} for item in items],
                         "value": [{"name": item} for item in items],
                     }
-                elif clean_val in ("Yes", "No", "true", "false", "True", "False"):
-                    # チェックボックス
-                    is_checked = clean_val in ("Yes", "true", "True")
-                    row_properties[clean_col] = {
-                        "type": "checkbox",
-                        "checkbox": is_checked,
-                        "value": is_checked,
-                    }
-                else:
-                    # 値に改行が含まれている場合は、タグ選択肢(select)ではなくテキスト(text)として保持
+                elif ctype in ("select", "status"):
                     if "\n" in clean_val or "\r" in clean_val:
-                        row_properties[clean_col] = {
+                        row_properties[col_name] = {
                             "type": "text",
                             "value": clean_val,
                         }
                     else:
-                        row_properties[clean_col] = {
-                            "type": "select",
-                            "select": {"name": clean_val},
+                        row_properties[col_name] = {
+                            "type": ctype,
+                            ctype: {"name": clean_val},
                             "value": clean_val,
                         }
+                elif ctype == "checkbox":
+                    if clean_val in _CSV_CHECKBOX_TRUE:
+                        is_checked = True
+                    elif clean_val in _CSV_CHECKBOX_FALSE:
+                        is_checked = False
+                    else:
+                        is_checked = clean_val.lower() in ("yes", "true", "1")
+                    row_properties[col_name] = {
+                        "type": "checkbox",
+                        "checkbox": is_checked,
+                        "value": is_checked,
+                    }
+                elif ctype in ("date", "created_time", "last_edited_time"):
+                    dr = _parse_date_range(clean_val)
+                    if dr:
+                        st, en = dr
+                        prop_d: Dict[str, Any] = {
+                            "type": ctype,
+                            "start": st,
+                            "value": st,
+                        }
+                        if en:
+                            prop_d["end"] = en
+                        row_properties[col_name] = prop_d
+                    else:
+                        row_properties[col_name] = {
+                            "type": ctype,
+                            "start": clean_val,
+                            "value": clean_val,
+                        }
+                elif ctype == "number":
+                    num_val = _parse_safe_number(clean_val)
+                    final_num = num_val if num_val is not None else clean_val
+                    row_properties[col_name] = {
+                        "type": "number",
+                        "number": final_num,
+                        "value": final_num,
+                    }
+                elif ctype == "url":
+                    row_properties[col_name] = {
+                        "type": "url",
+                        "url": clean_val,
+                        "value": clean_val,
+                    }
+                elif ctype in ("people", "created_by", "last_edited_by"):
+                    users_csv = [{"name": n.strip().lstrip("@")} for n in clean_val.split(",") if n.strip()]
+                    prop_u_csv: Dict[str, Any] = {
+                        "type": ctype,
+                        "users": users_csv,
+                        "value": ", ".join(u["name"] for u in users_csv),
+                    }
+                    if ctype in ("created_by", "last_edited_by") and users_csv:
+                        prop_u_csv[ctype] = users_csv[0]
+                    row_properties[col_name] = prop_u_csv
+                else:
+                    row_properties[col_name] = {
+                        "type": "text",
+                        "value": clean_val,
+                    }
 
-            # HTMLプロパティテーブルから取得した people / created_by / last_edited_by を正規化マージ
+            # HTMLプロパティテーブルから取得した全プロパティ型を優先マージ（CSV側の複数リレーション補完は維持）
             row_created_by = None
             row_last_edited_by = None
             for hp_name, hp_val in row_html_props.items():
-                if not isinstance(hp_val, dict):
+                if not isinstance(hp_val, dict) or not hp_name or hp_name == title_col_name:
                     continue
                 hp_type = hp_val.get("type")
-                if hp_type in ("people", "created_by", "last_edited_by"):
-                    row_properties[hp_name] = hp_val
+                if hp_type == "relation":
+                    existing_csv_prop = row_properties.get(hp_name)
+                    if (
+                        isinstance(existing_csv_prop, dict)
+                        and existing_csv_prop.get("type") == "relation"
+                        and len(existing_csv_prop.get("relations") or []) > len(hp_val.get("relations") or [])
+                    ):
+                        continue
+                row_properties[hp_name] = hp_val
+                if hp_type in ("created_by", "last_edited_by"):
                     users_list = hp_val.get("users") or []
                     if hp_type == "created_by" and users_list and not row_created_by:
                         row_created_by = users_list[0]
                     elif hp_type == "last_edited_by" and users_list and not row_last_edited_by:
                         row_last_edited_by = users_list[0]
 
+            row_blocks = staged["row_blocks"]
             row_ext_synced = collect_external_synced_blocks_from_blocks(row_blocks)
             if row_ext_synced:
                 logger.warning(
-                    f"External/unexpanded synced_block detected in DB row [{row_title}] ({row_id}): {len(row_ext_synced)} block(s)"
+                    f"External/unexpanded synced_block detected in DB row [{staged['row_title']}] ({staged['row_id']}): {len(row_ext_synced)} block(s)"
                 )
 
             row_node = PageNode(
-                id=row_id,
-                title=row_title,
+                id=staged["row_id"],
+                title=staged["row_title"],
                 node_type="database_row",
-                icon=row_icon,
-                cover=row_cover,
+                icon=staged["row_icon"],
+                cover=staged["row_cover"],
                 properties=row_properties,
                 blocks=row_blocks,
                 children=[],
-                comments=row_comments,
+                comments=staged["row_comments"],
                 created_by=row_created_by,
                 last_edited_by=row_last_edited_by,
                 external_synced_blocks=row_ext_synced,
             )
             db_node.children.append(row_node)
-            if idx % 500 == 0:
-                gc.collect()
 
         gc.collect()
 
@@ -892,7 +1169,7 @@ class HtmlZipExtractor:
                     elif raw_t in ("status",):
                         detected_type = "status"
                     elif raw_t in ("date", "created_time", "last_edited_time"):
-                        detected_type = "date"
+                        detected_type = raw_t
                     elif raw_t in ("checkbox",):
                         detected_type = "checkbox"
                     elif raw_t in ("url",):
@@ -912,34 +1189,36 @@ class HtmlZipExtractor:
                 if detected_type == "multi_select" or p_name not in col_types_out:
                     col_types_out[p_name] = detected_type
 
-            # 1. リレーションリンクの検出
-            rel_links = td.find_all("a")
-            relations = []
-            for a in rel_links:
-                target_id = None
-                if a.get("data-notion-page-id"):
-                    target_id = normalize_id(a["data-notion-page-id"])
-                else:
-                    href = a.get("href", "")
-                    if not href.startswith(("http://", "https://")) or "notion.so" in href or "notion.com" in href:
-                        href_uids = extract_uuids(href)
-                        if href_uids:
-                            target_id = normalize_id(href_uids[-1])
-                if target_id:
-                    relations.append({
-                        "id": target_id,
-                        "text": a.get_text(strip=True) or target_id[:8],
-                    })
-            if relations:
-                if col_types_out is not None:
-                    col_types_out.setdefault(p_name, "relation")
-                result[p_name] = {
-                    "type": "relation",
-                    "relations": relations,
-                    "relation": relations,
-                    "value": relations,
-                }
-                continue
+            # 1. リレーションリンクの検出（url/text等と誤認しないよう未確定またはrelation列のみ対象）
+            if detected_type in (None, "relation"):
+                rel_links = td.find_all("a")
+                relations = []
+                for a in rel_links:
+                    target_id = None
+                    if a.get("data-notion-page-id"):
+                        target_id = normalize_id(a["data-notion-page-id"])
+                    else:
+                        href = a.get("href", "")
+                        if not href.startswith(("http://", "https://")) or "notion.so" in href or "notion.com" in href:
+                            href_uids = extract_uuids(href)
+                            if href_uids:
+                                target_id = normalize_id(href_uids[-1])
+                    if target_id:
+                        relations.append({
+                            "id": target_id,
+                            "text": a.get_text(strip=True) or target_id[:8],
+                        })
+                if relations or detected_type == "relation":
+                    if col_types_out is not None:
+                        col_types_out.setdefault(p_name, "relation")
+                    if relations:
+                        result[p_name] = {
+                            "type": "relation",
+                            "relations": relations,
+                            "relation": relations,
+                            "value": relations,
+                        }
+                    continue
 
             # 1.5. ユーザー / 作成者 / 最終更新者 (property-row-people / person / created_by / last_edited_by)
             if detected_type in ("people", "created_by", "last_edited_by"):
@@ -982,36 +1261,35 @@ class HtmlZipExtractor:
                     result[p_name] = prop_u
                 continue
 
-            # 2. 日付 (property-row-date または <time> タグ)
+            # 2. 日付 / 作成日時 / 最終更新日時 (property-row-date / created_time / last_edited_time または <time> タグ)
             time_tags = td.find_all("time")
-            if detected_type == "date" or time_tags:
+            if detected_type in ("date", "created_time", "last_edited_time") or (detected_type is None and time_tags):
+                actual_dt_type = detected_type if detected_type in ("created_time", "last_edited_time") else "date"
                 iso_start = None
                 iso_end = None
                 if time_tags:
                     t0 = time_tags[0]
                     raw_s = t0.get("datetime") or t0.get_text(strip=True)
-                    iso_start = _parse_date_string(raw_s) or _parse_date_string(t0.get_text(strip=True))
+                    iso_start = _parse_date_or_datetime(raw_s) or _parse_date_or_datetime(t0.get_text(strip=True))
                     if len(time_tags) >= 2:
                         t1 = time_tags[1]
                         raw_e = t1.get("datetime") or t1.get_text(strip=True)
-                        iso_end = _parse_date_string(raw_e) or _parse_date_string(t1.get_text(strip=True))
+                        iso_end = _parse_date_or_datetime(raw_e) or _parse_date_or_datetime(t1.get_text(strip=True))
                     elif any(sep in t0.get_text() for sep in ("→", "->", "〜")):
                         parts = re.split(r"\s*(?:→|->|〜)\s*", t0.get_text(strip=True))
                         if len(parts) >= 2:
-                            iso_end = _parse_date_string(parts[1])
+                            iso_end = _parse_date_or_datetime(parts[1])
                 else:
                     td_txt = td.get_text(strip=True)
-                    iso_start = _parse_date_string(td_txt)
-                    if iso_start and any(sep in td_txt for sep in ("→", "->", "〜")):
-                        parts = re.split(r"\s*(?:→|->|〜)\s*", td_txt)
-                        if len(parts) >= 2:
-                            iso_end = _parse_date_string(parts[1])
+                    dr = _parse_date_range(td_txt)
+                    if dr:
+                        iso_start, iso_end = dr
 
                 if col_types_out is not None:
-                    col_types_out.setdefault(p_name, "date")
+                    col_types_out.setdefault(p_name, actual_dt_type)
                 if iso_start:
                     prop_obj: Dict[str, Any] = {
-                        "type": "date",
+                        "type": actual_dt_type,
                         "start": iso_start,
                         "value": iso_start,
                     }
@@ -1022,7 +1300,7 @@ class HtmlZipExtractor:
 
             # 3. 複数選択 / 単一選択 / ステータス (<span class="selected-value">)
             sel_spans = td.find_all("span", class_=lambda c: c and "selected-value" in c)
-            if detected_type == "multi_select" or len(sel_spans) > 1:
+            if detected_type == "multi_select" or (detected_type in (None, "select", "status") and len(sel_spans) > 1):
                 if col_types_out is not None:
                     col_types_out[p_name] = "multi_select"
                 if sel_spans:
@@ -1040,7 +1318,7 @@ class HtmlZipExtractor:
                     }
                 continue
 
-            if detected_type in ("select", "status") or len(sel_spans) == 1:
+            if detected_type in ("select", "status") or (detected_type is None and len(sel_spans) == 1):
                 actual_t = "status" if detected_type == "status" else "select"
                 if col_types_out is not None and col_types_out.get(p_name) != "multi_select":
                     col_types_out.setdefault(p_name, actual_t)
@@ -1054,7 +1332,7 @@ class HtmlZipExtractor:
                 continue
 
             # 4. チェックボックス
-            cb_el = td.find(class_=lambda c: c and "checkbox" in c)
+            cb_el = td.find(class_=lambda c: c and "checkbox" in c) or td.find("input", attrs={"type": "checkbox"})
             if detected_type == "checkbox" or cb_el is not None:
                 if col_types_out is not None:
                     col_types_out.setdefault(p_name, "checkbox")
@@ -1062,10 +1340,12 @@ class HtmlZipExtractor:
                     cb_cls = cb_el.get("class") or []
                     if isinstance(cb_cls, str):
                         cb_cls = [cb_cls]
-                    is_checked = any("checkbox-on" in c for c in cb_cls)
+                    is_checked = any("checkbox-on" in c for c in cb_cls) or (
+                        cb_el.has_attr("checked") and not any("checkbox-off" in c for c in cb_cls)
+                    )
                 else:
                     txt = td.get_text(strip=True)
-                    is_checked = txt in ("Yes", "true", "True", "☑", "✅")
+                    is_checked = txt in _CSV_CHECKBOX_TRUE
                 result[p_name] = {
                     "type": "checkbox",
                     "checkbox": is_checked,
@@ -1089,29 +1369,43 @@ class HtmlZipExtractor:
             if detected_type == "number":
                 n_val = td.get_text(strip=True)
                 if n_val:
+                    parsed_n = _parse_safe_number(n_val)
+                    final_n = parsed_n if parsed_n is not None else n_val
                     result[p_name] = {
                         "type": "number",
-                        "number": n_val,
-                        "value": n_val,
+                        "number": final_n,
+                        "value": final_n,
                     }
                 continue
 
-            # 7. その他テキスト (日付形式なら日付として判別)
-            p_val = td.get_text(strip=True)
+            # 7. その他テキスト (未指定型かつ日付形式なら日付として判別、改行 <br> は保持)
+            if td.find("br"):
+                for br in td.find_all("br"):
+                    br.replace_with("\n")
+                p_val = td.get_text().strip()
+            else:
+                p_val = td.get_text(strip=True)
             if p_val:
-                iso_d = _parse_date_string(p_val)
-                if iso_d and detected_type != "text":
+                dr = _parse_date_range(p_val) if detected_type != "text" else None
+                if dr:
+                    iso_d, iso_d_end = dr
                     if col_types_out is not None:
                         col_types_out.setdefault(p_name, "date")
-                    result[p_name] = {
+                    prop_d_fb: Dict[str, Any] = {
                         "type": "date",
                         "start": iso_d,
                         "value": iso_d,
                     }
+                    if iso_d_end:
+                        prop_d_fb["end"] = iso_d_end
+                    result[p_name] = prop_d_fb
                 else:
+                    if col_types_out is not None:
+                        col_types_out.setdefault(p_name, "text")
                     result[p_name] = {"type": "text", "value": p_val}
 
         return result
+
 
     @staticmethod
     def _parse_data_uri(src: str) -> Optional[Tuple[bytes, str, str]]:

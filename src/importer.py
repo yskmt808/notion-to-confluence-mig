@@ -562,6 +562,18 @@ class ConfluenceClient:
                     time.sleep(delay)
         return []
 
+    def get_database_fields(self, database_id: str) -> List[Dict[str, Any]]:
+        """Confluence Databases のフィールド定義一覧 (/api/v2/databases/{id}/fields) を取得する。"""
+        url = f"{self.base_url}/api/v2/databases/{database_id}/fields"
+        try:
+            res = requests.get(url, auth=self.auth, timeout=15)
+            if res.ok:
+                results = res.json().get("results", [])
+                return results if isinstance(results, list) else []
+        except Exception as e:
+            logger.debug(f"Failed to get database fields for {database_id}: {e}")
+        return []
+
     def create_database_view(
         self,
         database_id: str,
