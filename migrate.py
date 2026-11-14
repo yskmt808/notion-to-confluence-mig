@@ -22,7 +22,7 @@ from src.extractor import NotionExtractor, PageNode, get_node_external_synced_bl
 from src.html_extractor import HtmlZipExtractor, MultiZipExtractor
 from src.importer import ConfluenceImporter
 from src.verifier import MigrationVerifier
-from src.checkpoint import MigrationCheckpoint
+from src.checkpoint import MigrationCheckpoint, CheckpointWriteError
 from src.cancellation import CancellationManager, MigrationCancelledException
 from src.telemetry import SanitizedTelemetry
 from src.api_enricher import NotionApiEnricher
@@ -525,7 +525,11 @@ def main():
             logging.info("[Resume] チェックポイントから private_mode=True (--visibility private) を自動復元しました。")
 
     # SIGINT/SIGTERM 安全中断ハンドラーの登録 (Task B.7)
-    cancel_manager = CancellationManager(on_cancel_callback=lambda: checkpoint.mark_interrupted())
+    def _on_cancel_checkpoint():
+        if not getattr(checkpoint, "write_failed", False):
+            checkpoint.mark_interrupted()
+
+    cancel_manager = CancellationManager(on_cancel_callback=_on_cancel_checkpoint)
     cancel_manager.install()
 
     # ZIPファイルの収集 (--zip / --zip-dir)
@@ -733,7 +737,17 @@ def main():
     }
     checkpoint.space_key = conf_space or ""
     checkpoint.parent_id = conf_parent_id
-    checkpoint.save()
+    try:
+        checkpoint.save()
+    except CheckpointWriteError as e:
+        logging.error(f"チェックポイントの初期保存に失敗したため即時停止します: {e}")
+        print(f"❌ エラー: チェックポイントファイル '{args.checkpoint}' への書き込みに失敗しました: {e}")
+        telemetry.record_error(e, context="Step 1 Checkpoint Save")
+        if args.generate_debug_report:
+            json_p = os.path.join(args.debug_report_dir, "debug_report.json")
+            md_p = os.path.join(args.debug_report_dir, "debug_report.md")
+            telemetry.save_reports(json_path=json_p, md_path=md_p)
+        sys.exit(1)
 
     print_tree_summary(tree, verbose=args.verbose, show_all=args.show_all_pages)
 
@@ -785,7 +799,17 @@ def main():
         prune_blocks_on_pass2=(args.no_verify and not args.repair_inpage_links),
     )
 
+    def _safe_mark_interrupted():
+        if getattr(checkpoint, "write_failed", False):
+            return
+        try:
+            checkpoint.mark_interrupted()
+        except CheckpointWriteError as ce:
+            logging.error(f"中断時のチェックポイント保存に失敗しました: {ce}")
+
     setup_logger(args.verbose, dashboard_mode=dashboard.enabled)
+    import_aborted_or_failed = False
+    post_import_flush_error: Optional[CheckpointWriteError] = None
     try:
         mapping = importer.import_tree(
             root_node=tree,
@@ -793,9 +817,10 @@ def main():
             overwrite=not args.no_overwrite,
         )
     except MigrationCancelledException:
+        import_aborted_or_failed = True
         if cancel_manager.is_error_halt:
             logging.error(f"Migration aborted due to fatal error: {cancel_manager.halt_reason}")
-            checkpoint.mark_interrupted()
+            _safe_mark_interrupted()
             telemetry.record_error(Exception(cancel_manager.halt_reason or "Error halt"), context="Step 2 Import Tree")
             if args.generate_debug_report:
                 json_p = os.path.join(args.debug_report_dir, "debug_report.json")
@@ -806,11 +831,18 @@ def main():
         else:
             print("\n" + "=" * 50)
             print("⏸️ 移行処理を安全に中断しました。")
-            print(f"現在の進捗状況はチェックポイント '{args.checkpoint}' に保存されています。")
-            print("次回再開するには、以下のコマンドを実行してください:")
-            print(f"  python migrate.py --resume" + (f" --checkpoint {args.checkpoint}" if args.checkpoint != "migration_checkpoint.json" else ""))
+            if not getattr(checkpoint, "write_failed", False):
+                try:
+                    checkpoint.mark_interrupted()
+                    print(f"現在の進捗状況はチェックポイント '{args.checkpoint}' に保存されています。")
+                    print("次回再開するには、以下のコマンドを実行してください:")
+                    print(f"  python migrate.py --resume" + (f" --checkpoint {args.checkpoint}" if args.checkpoint != "migration_checkpoint.json" else ""))
+                except CheckpointWriteError as ce:
+                    logging.error(f"中断時のチェックポイント保存に失敗しました: {ce}")
+                    print(f"❌ エラー: 中断時のチェックポイント保存に失敗しました: {ce}")
+                    print("=" * 50)
+                    sys.exit(1)
             print("=" * 50)
-            checkpoint.mark_interrupted()
             if args.generate_debug_report:
                 json_p = os.path.join(args.debug_report_dir, "debug_report.json")
                 md_p = os.path.join(args.debug_report_dir, "debug_report.md")
@@ -818,8 +850,9 @@ def main():
                 print(f"📋 サニタイズド診断レポートを出力しました: {json_p}, {md_p}")
             sys.exit(0)
     except Exception as e:
+        import_aborted_or_failed = True
         logging.error(f"Confluence移行エラー: {e}", exc_info=args.verbose)
-        checkpoint.mark_interrupted()
+        _safe_mark_interrupted()
         telemetry.record_error(e, context="Step 2 Import Tree")
         if args.generate_debug_report:
             json_p = os.path.join(args.debug_report_dir, "debug_report.json")
@@ -828,8 +861,30 @@ def main():
             print(f"🚨 開発者報告用のサニタイズド診断レポートを出力しました: {json_p}, {md_p}")
         sys.exit(1)
     finally:
-        checkpoint.flush()
-        setup_logger(args.verbose, dashboard_mode=False)
+        try:
+            if import_aborted_or_failed:
+                if not getattr(checkpoint, "write_failed", False):
+                    try:
+                        checkpoint.flush()
+                    except CheckpointWriteError as ce:
+                        logging.error(f"終了処理中のチェックポイントフラッシュに失敗しました: {ce}")
+            else:
+                try:
+                    checkpoint.flush()
+                except CheckpointWriteError as ce:
+                    post_import_flush_error = ce
+        finally:
+            setup_logger(args.verbose, dashboard_mode=False)
+
+    if post_import_flush_error is not None:
+        logging.error(f"Step 2 完了後のチェックポイントフラッシュに失敗したため即時停止します: {post_import_flush_error}")
+        telemetry.record_error(post_import_flush_error, context="Step 2 Checkpoint Flush")
+        if args.generate_debug_report:
+            json_p = os.path.join(args.debug_report_dir, "debug_report.json")
+            md_p = os.path.join(args.debug_report_dir, "debug_report.md")
+            telemetry.save_reports(json_path=json_p, md_path=md_p)
+            print(f"🚨 開発者報告用のサニタイズド診断レポートを出力しました: {json_p}, {md_p}")
+        sys.exit(1)
 
     step2_end = datetime.now(timezone.utc)
     step2_elapsed = (step2_end - step2_start).total_seconds()
@@ -871,7 +926,16 @@ def main():
     telemetry.record_timing("step2_import_seconds", step2_elapsed)
     telemetry.record_timing("step3_verify_seconds", step3_elapsed)
     telemetry.record_timing("total_seconds", total_elapsed)
-    checkpoint.mark_completed()
+    try:
+        checkpoint.mark_completed()
+    except CheckpointWriteError as e:
+        logging.error(f"移行完了時のチェックポイント保存に失敗したためエラー終了します: {e}")
+        telemetry.record_error(e, context="Step 3 Checkpoint Complete")
+        if args.generate_debug_report:
+            json_p = os.path.join(args.debug_report_dir, "debug_report.json")
+            md_p = os.path.join(args.debug_report_dir, "debug_report.md")
+            telemetry.save_reports(json_path=json_p, md_path=md_p)
+        sys.exit(1)
 
     if args.generate_debug_report:
         json_p = os.path.join(args.debug_report_dir, "debug_report.json")

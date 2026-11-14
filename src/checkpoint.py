@@ -7,6 +7,9 @@
 import os
 import json
 import time
+import errno
+import random
+import tempfile
 import logging
 import threading
 from datetime import datetime, timezone
@@ -18,6 +21,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_CHECKPOINT_PATH = "migration_checkpoint.json"
 
 
+class CheckpointWriteError(RuntimeError):
+    """チェックポイントファイルへのアトミック書き込みが恒久的に失敗した場合の例外。"""
+    pass
+
+
+def _is_retryable_write_error(exc: BaseException) -> bool:
+    """Windows Defender / クラウド同期 (WinError 5, 32) や一時的ファイルロック競合か判定する。"""
+    if isinstance(exc, PermissionError):
+        return True
+    winerr = getattr(exc, "winerror", None)
+    if winerr in (5, 32):
+        return True
+    err_no = getattr(exc, "errno", None)
+    if err_no in (errno.EACCES, errno.EPERM, errno.EBUSY):
+        return True
+    return False
+
+
 class MigrationCheckpoint:
     """移行進捗のチェックポイント状態を管理するクラス。"""
 
@@ -26,12 +47,17 @@ class MigrationCheckpoint:
         checkpoint_path: str = DEFAULT_CHECKPOINT_PATH,
         save_interval_sec: float = 0.0,
         max_pending_changes: int = 50,
+        max_retries: int = 5,
+        retry_base_delay: float = 0.1,
     ):
         self.checkpoint_path = checkpoint_path
         self.save_interval_sec = max(0.0, float(save_interval_sec))
         self.max_pending_changes = max(1, int(max_pending_changes))
+        self.max_retries = max(0, int(max_retries))
+        self.retry_base_delay = max(0.0, float(retry_base_delay))
         self._last_saved_time: float = 0.0
         self._pending_changes: int = 0
+        self.write_failed: bool = False
         self._lock = threading.RLock()
         self.session_id: str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         self.started_at: str = datetime.now(timezone.utc).isoformat()
@@ -65,12 +91,16 @@ class MigrationCheckpoint:
                 return False
 
     def save(self, force: bool = False):
-        """現在のチェックポイント状態を一時ファイル経由で安全（アトミック）に保存する。"""
+        """現在のチェックポイント状態を一時ファイル経由で安全（アトミック）に保存する。
+        一時的なロック競合（PermissionError / WinError 5, 32 等）は WARNING ログで指数バックオフリトライし、
+        全リトライ上限を超過した恒久書込障害時は ERROR ログを出力して CheckpointWriteError を送出する。
+        """
         acquired_immediately = self._lock.acquire(blocking=False)
         if not acquired_immediately:
             logger.notice(f"Checkpoint lock contention detected: thread {threading.get_ident()} waiting for lock on {self.checkpoint_path}...")
             self._lock.acquire()
 
+        tmp_path: Optional[str] = None
         try:
             now = time.time()
             if not force and self.save_interval_sec > 0.0:
@@ -97,25 +127,67 @@ class MigrationCheckpoint:
                 "nodes": self.nodes,
             }
 
-            tmp_path = f"{self.checkpoint_path}.tmp"
-            try:
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+            abs_cp_path = os.path.abspath(self.checkpoint_path)
+            parent_dir = os.path.dirname(abs_cp_path) or "."
+            base_name = os.path.basename(abs_cp_path) or "migration_checkpoint.json"
+
+            for attempt in range(self.max_retries + 1):
                 try:
-                    os.chmod(tmp_path, 0o600)
+                    if tmp_path is None:
+                        os.makedirs(parent_dir, exist_ok=True)
+                        with tempfile.NamedTemporaryFile(
+                            mode="w",
+                            encoding="utf-8",
+                            dir=parent_dir,
+                            prefix=f".{base_name}.",
+                            suffix=".tmp",
+                            delete=False,
+                        ) as f:
+                            tmp_path = f.name
+                            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+                            f.flush()
+                        if os.name != "nt":
+                            try:
+                                os.chmod(tmp_path, 0o600)
+                            except Exception:
+                                pass
+
+                    os.replace(tmp_path, self.checkpoint_path)
+                    tmp_path = None
+                    self._last_saved_time = time.time()
+                    self._pending_changes = 0
+                    self.write_failed = False
+                    return
+                except Exception as e:
+                    was_missing_tmp = isinstance(e, FileNotFoundError) and tmp_path is not None and not os.path.exists(tmp_path)
+                    if was_missing_tmp:
+                        tmp_path = None
+                    retryable = _is_retryable_write_error(e) or was_missing_tmp
+                    if retryable and attempt < self.max_retries:
+                        delay = self.retry_base_delay * (2 ** attempt) + random.uniform(0.0, self.retry_base_delay * 0.5)
+                        logger.warning(
+                            f"Checkpoint write contention on [{self.checkpoint_path}] "
+                            f"(attempt {attempt + 1}/{self.max_retries + 1}), retrying in {delay:.2f}s: {e}"
+                        )
+                        if delay > 0:
+                            time.sleep(delay)
+                        continue
+
+                    self._last_saved_time = time.time()
+                    self.write_failed = True
+                    logger.error(
+                        f"Failed to write checkpoint atomically to [{self.checkpoint_path}] "
+                        f"after {attempt + 1} attempt(s): {e}"
+                    )
+                    raise CheckpointWriteError(
+                        f"Failed to write checkpoint atomically to [{self.checkpoint_path}]: {e}"
+                    ) from e
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
                 except Exception:
                     pass
-                os.replace(tmp_path, self.checkpoint_path)
-                self._last_saved_time = now
-                self._pending_changes = 0
-            except Exception as e:
-                logger.error(f"Failed to write checkpoint atomically to [{self.checkpoint_path}]: {e}")
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
-        finally:
             self._lock.release()
 
     def flush(self):
