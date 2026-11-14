@@ -1577,17 +1577,26 @@ class HtmlZipExtractor:
         db_csv_map = db_csv_map or {}
         blocks = []
 
-        def _get_element_block_color(classes_list: Any) -> str:
+        def _normalize_extracted_color(col: Optional[str]) -> str:
+            if not col:
+                return "default"
+            c_norm = str(col).strip()
+            if c_norm == "teal":
+                return "green"
+            elif c_norm == "teal_background":
+                return "green_background"
+            return c_norm or "default"
+
+        def _get_element_block_color(classes_list: Any, tag_el: Optional[Tag] = None) -> str:
             if isinstance(classes_list, str):
                 classes_list = [classes_list]
             for c in classes_list or []:
                 if c.startswith("block-color-"):
-                    col = c.replace("block-color-", "")
-                    if col == "teal":
-                        return "green"
-                    elif col == "teal_background":
-                        return "green_background"
-                    return col
+                    return _normalize_extracted_color(c.replace("block-color-", ""))
+            if tag_el is not None:
+                hl = tag_el.get("data-notion-highlight")
+                if hl:
+                    return _normalize_extracted_color(hl)
             return "default"
 
         for el in container.children:
@@ -1600,21 +1609,21 @@ class HtmlZipExtractor:
 
             # 1. 見出し
             if tag == "h1":
-                b_color = _get_element_block_color(classes)
+                b_color = _get_element_block_color(classes, el)
                 blocks.append({
                     "id": el_id,
                     "type": "heading_1",
                     "heading_1": {"rich_text": self._parse_inline_rich_text(el, ignore_block_color=True), "color": b_color, "is_toggleable": False},
                 })
             elif tag == "h2":
-                b_color = _get_element_block_color(classes)
+                b_color = _get_element_block_color(classes, el)
                 blocks.append({
                     "id": el_id,
                     "type": "heading_2",
                     "heading_2": {"rich_text": self._parse_inline_rich_text(el, ignore_block_color=True), "color": b_color, "is_toggleable": False},
                 })
             elif tag == "h3":
-                b_color = _get_element_block_color(classes)
+                b_color = _get_element_block_color(classes, el)
                 blocks.append({
                     "id": el_id,
                     "type": "heading_3",
@@ -1623,7 +1632,7 @@ class HtmlZipExtractor:
 
             # 2. 段落
             elif tag == "p":
-                b_color = _get_element_block_color(classes)
+                b_color = _get_element_block_color(classes, el)
                 blocks.append({
                     "id": el_id,
                     "type": "paragraph",
@@ -1634,7 +1643,7 @@ class HtmlZipExtractor:
             elif tag == "ul" and "bulleted-list" in classes:
                 for li in el.find_all("li", recursive=False):
                     li_id = li.get("id") or el_id
-                    li_color = _get_element_block_color(li.get("class", []))
+                    li_color = _get_element_block_color(li.get("class", []), li)
                     rich_texts, child_blocks = self._extract_list_item_content(
                         li, zf, current_dir, db_csv_map=db_csv_map
                     )
@@ -1650,7 +1659,7 @@ class HtmlZipExtractor:
             elif tag == "ol" and "numbered-list" in classes:
                 for li in el.find_all("li", recursive=False):
                     li_id = li.get("id") or el_id
-                    li_color = _get_element_block_color(li.get("class", []))
+                    li_color = _get_element_block_color(li.get("class", []), li)
                     rich_texts, child_blocks = self._extract_list_item_content(
                         li, zf, current_dir, db_csv_map=db_csv_map
                     )
@@ -1666,6 +1675,7 @@ class HtmlZipExtractor:
             elif tag == "ul" and "to-do-list" in classes:
                 for li in el.find_all("li", recursive=False):
                     li_id = li.get("id") or el_id
+                    li_color = _get_element_block_color(li.get("class", []), li)
                     inp = li.find("input", type="checkbox", recursive=False) or li.find("input", type="checkbox")
                     is_checked = False
                     if inp:
@@ -1681,6 +1691,7 @@ class HtmlZipExtractor:
                         "to_do": {
                             "rich_text": rich_texts,
                             "checked": is_checked,
+                            "color": li_color,
                         },
                         "children_blocks": child_blocks,
                         "has_children": bool(child_blocks),
@@ -1688,8 +1699,9 @@ class HtmlZipExtractor:
 
             # 6. トグル
             elif tag == "details":
+                b_color = _get_element_block_color(classes, el)
                 summary = el.find("summary")
-                summary_text = self._parse_inline_rich_text(summary) if summary else []
+                summary_text = self._parse_inline_rich_text(summary, ignore_block_color=True) if summary else []
                 child_blocks = []
                 indented = el.find(class_="indented")
                 if indented:
@@ -1705,14 +1717,14 @@ class HtmlZipExtractor:
                 blocks.append({
                     "id": el_id,
                     "type": "toggle",
-                    "toggle": {"rich_text": summary_text},
+                    "toggle": {"rich_text": summary_text, "color": b_color},
                     "children_blocks": child_blocks,
                     "has_children": bool(child_blocks),
                 })
 
             # 7. 引用
             elif tag == "blockquote":
-                b_color = _get_element_block_color(classes)
+                b_color = _get_element_block_color(classes, el)
                 rich_texts, child_blocks = self._extract_list_item_content(el, zf, current_dir, db_csv_map=db_csv_map)
                 blocks.append({
                     "id": el_id,
@@ -1725,12 +1737,13 @@ class HtmlZipExtractor:
             # 8. コールアウト
             elif tag == "aside" or "callout" in classes:
                 from src.icon_mapper import resolve_notion_icon_to_emoji, is_unicode_emoji
-                bg_color = el.get("data-notion-callout-background") or "default"
+                bg_color = el.get("data-notion-callout-background") or el.get("data-notion-highlight") or "default"
                 if "block-color-" in str(classes):
                     for c in classes:
                         if c.startswith("block-color-"):
                             bg_color = c.replace("block-color-", "")
                             break
+                bg_color = _normalize_extracted_color(bg_color)
 
                 icon_val = el.get("data-notion-callout-icon")
                 if not icon_val:
@@ -2529,7 +2542,7 @@ class HtmlZipExtractor:
                 else:
                     inline_container.append(copy.copy(child))
 
-        rich_texts = self._parse_inline_rich_text(inline_container, skip_classes=skip_cls)
+        rich_texts = self._parse_inline_rich_text(inline_container, skip_classes=skip_cls, ignore_block_color=True)
         # 先頭・末尾の改行や空白のみのノードを整理
         if rich_texts:
             rich_texts[0]["plain_text"] = rich_texts[0]["plain_text"].lstrip("\n\r ")
@@ -2648,7 +2661,7 @@ class HtmlZipExtractor:
         rich_texts = []
 
         def _extract_highlight_color(tag_el: Tag, is_root: bool = False) -> Optional[str]:
-            hl = tag_el.get("data-notion-highlight")
+            hl = None if (is_root and ignore_block_color) else tag_el.get("data-notion-highlight")
             if not hl:
                 t_cls = tag_el.get("class") or []
                 if isinstance(t_cls, str):

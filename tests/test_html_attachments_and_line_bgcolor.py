@@ -207,7 +207,7 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
                 os.remove(tmp_zip_path)
 
     def test_repro_converter_line_level_background_color_rendering(self):
-        """Notionで行単位背景色が設定されたブロックがConfluence Storage Formatでタグ自体のstyleとしてレンダリングされること。"""
+        """Notionで行単位背景色が設定されたブロックがConfluence panelマクロとして出力され、重複spanが生成されないこと。"""
         blocks = [
             {
                 "type": "paragraph",
@@ -238,11 +238,28 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
                 },
             },
             {
+                "type": "numbered_list_item",
+                "numbered_list_item": {
+                    "color": "red_background",
+                    "rich_text": [{"type": "text", "text": {"content": "Numbered red"}, "annotations": {"color": "default"}}],
+                },
+            },
+            {
+                "type": "to_do",
+                "to_do": {
+                    "color": "orange_background",
+                    "checked": False,
+                    "rich_text": [{"type": "text", "text": {"content": "Todo orange"}, "annotations": {"color": "default"}}],
+                },
+            },
+            {
                 "type": "paragraph",
                 "paragraph": {
                     "color": "yellow_background",
                     "rich_text": [
                         {"type": "text", "text": {"content": "Normal "}, "annotations": {"color": "default"}},
+                        {"type": "text", "text": {"content": "same yellow"}, "annotations": {"color": "yellow_background"}},
+                        {"type": "text", "text": {"content": " and "}, "annotations": {"color": "default"}},
                         {"type": "text", "text": {"content": "pink"}, "annotations": {"color": "pink_background"}},
                     ],
                 },
@@ -252,22 +269,164 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         html = self.converter.blocks_to_storage_format(blocks)
         assert_valid_storage_xml(self, html)
 
-        # 段落全体に背景色スタイルが適用されていること
-        self.assertIn('<p style="background-color: #fbf3db;', html)
-        # 文字単位の <span style="background-color: #fbf3db;"> でラップされていないこと
+        # 段落全体が panel マクロ（yellow: bgColor=#fbf3db, borderColor=#f4e6b5）で出力されること
+        self.assertIn(
+            '<ac:structured-macro ac:name="panel">'
+            '<ac:parameter ac:name="bgColor">#fbf3db</ac:parameter>'
+            '<ac:parameter ac:name="borderColor">#f4e6b5</ac:parameter>'
+            '<ac:rich-text-body><p>Line with yellow background</p></ac:rich-text-body>'
+            '</ac:structured-macro>',
+            html,
+        )
+        # インライン CSS style や同一背景色 span が生成されないこと
+        self.assertNotIn('<p style="background-color:', html)
+        self.assertNotIn('<h1 style="background-color:', html)
+        self.assertNotIn('<blockquote style="background-color:', html)
+        self.assertNotIn('<li style="background-color:', html)
         self.assertNotIn('<span style="background-color: #fbf3db;', html)
 
-        # 見出し全体に背景色スタイルが適用されていること
-        self.assertIn('<h1 style="background-color: #e7f3f8;', html)
+        # 見出し全体が panel マクロ（blue: #e7f3f8 / #dbeaf6）で出力されること
+        self.assertIn(
+            '<ac:structured-macro ac:name="panel">'
+            '<ac:parameter ac:name="bgColor">#e7f3f8</ac:parameter>'
+            '<ac:parameter ac:name="borderColor">#dbeaf6</ac:parameter>'
+            '<ac:rich-text-body><h1>Heading blue</h1></ac:rich-text-body>'
+            '</ac:structured-macro>',
+            html,
+        )
 
-        # 引用全体に背景色スタイルが適用されていること
-        self.assertIn('<blockquote style="background-color: #f4f0f7;', html)
+        # 引用全体が panel マクロ（purple: #f4f0f7 / #eae3f2）で出力されること
+        self.assertIn(
+            '<ac:structured-macro ac:name="panel">'
+            '<ac:parameter ac:name="bgColor">#f4f0f7</ac:parameter>'
+            '<ac:parameter ac:name="borderColor">#eae3f2</ac:parameter>'
+            '<ac:rich-text-body><blockquote><p>Quote purple</p></blockquote></ac:rich-text-body>'
+            '</ac:structured-macro>',
+            html,
+        )
 
-        # 箇条書き全体に背景色スタイルが適用されていること
-        self.assertIn('<li style="background-color: #edf3ec;', html)
+        # 箇条書き・番号付きリストが <ul>/<ol> -> <li> -> panel マクロの構造で出力されること
+        self.assertIn(
+            '<ul><li><ac:structured-macro ac:name="panel">'
+            '<ac:parameter ac:name="bgColor">#edf3ec</ac:parameter>'
+            '<ac:parameter ac:name="borderColor">#dbe8d9</ac:parameter>'
+            '<ac:rich-text-body><p>Bullet green</p></ac:rich-text-body>'
+            '</ac:structured-macro></li></ul>',
+            html,
+        )
+        self.assertIn(
+            '<ol><li><ac:structured-macro ac:name="panel">'
+            '<ac:parameter ac:name="bgColor">#fdebec</ac:parameter>'
+            '<ac:parameter ac:name="borderColor">#f9d3d6</ac:parameter>'
+            '<ac:rich-text-body><p>Numbered red</p></ac:rich-text-body>'
+            '</ac:structured-macro></li></ol>',
+            html,
+        )
 
-        # インライン指定 (pink_background) はそのまま保持されること
-        self.assertIn('<span style="background-color: #fbf0f4;', html)
+        # ToDo が <ac:task-list> ごと panel マクロ（orange: #faece3 / #f4d8be）で出力されること
+        self.assertIn(
+            '<ac:structured-macro ac:name="panel">'
+            '<ac:parameter ac:name="bgColor">#faece3</ac:parameter>'
+            '<ac:parameter ac:name="borderColor">#f4d8be</ac:parameter>'
+            '<ac:rich-text-body><ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status>'
+            '<ac:task-body>Todo orange</ac:task-body></ac:task></ac:task-list></ac:rich-text-body>'
+            '</ac:structured-macro>',
+            html,
+        )
+
+        # 親と異なるインラインハイライト (pink_background) は保持され、同一背景 (yellow_background) の重複spanは抑止されること
+        self.assertIn('<p>Normal same yellow and <span style="background-color: #fbf0f4;', html)
+
+    def test_html_extractor_ignores_root_data_notion_highlight_and_converts_to_panel(self):
+        """data-notion-highlight付きブロック抽出時にrich_textへ重複伝播せず、panelマクロへ変換されること。"""
+        html_content = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Highlight Dedup Test</title></head>
+<body>
+  <article id="page-12345678-1234-1234-1234-123456789abc" class="page sans">
+    <div class="page-body">
+      <p id="p1" class="block-color-yellow_background" data-notion-highlight="yellow_background">Paragraph both attrs</p>
+      <p id="p2" data-notion-highlight="blue_background">Paragraph data attr only with <mark class="highlight-pink_background">pink mark</mark></p>
+      <h2 id="h2" data-notion-highlight="teal_background">Heading teal attr</h2>
+      <ul class="bulleted-list">
+        <li id="li1" class="block-color-purple_background" data-notion-highlight="purple_background">List item with <span data-notion-highlight="green_background">green inline</span></li>
+      </ul>
+      <blockquote id="q1" data-notion-highlight="red_background">Quote red attr</blockquote>
+    </div>
+  </article>
+</body>
+</html>"""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_zip:
+            tmp_zip_path = tmp_zip.name
+
+        try:
+            with zipfile.ZipFile(tmp_zip_path, "w") as zf:
+                zf.writestr("highlight_dedup.html", html_content)
+
+            tree = HtmlZipExtractor(tmp_zip_path).extract_tree()
+            self.assertEqual(len(tree.blocks), 5)
+
+            # p1: ブロック色は抽出され、rich_text側は default のまま
+            self.assertEqual(tree.blocks[0]["paragraph"]["color"], "yellow_background")
+            self.assertEqual(tree.blocks[0]["paragraph"]["rich_text"][0]["annotations"]["color"], "default")
+
+            # p2: data-notion-highlight のみでもブロック色として抽出され、内部 <mark> だけがハイライト保持される
+            self.assertEqual(tree.blocks[1]["paragraph"]["color"], "blue_background")
+            self.assertEqual(tree.blocks[1]["paragraph"]["rich_text"][0]["annotations"]["color"], "default")
+            self.assertEqual(tree.blocks[1]["paragraph"]["rich_text"][1]["annotations"]["color"], "pink_background")
+
+            # h2: teal_background -> green_background 正規化、rich_text側は default
+            self.assertEqual(tree.blocks[2]["heading_2"]["color"], "green_background")
+            self.assertEqual(tree.blocks[2]["heading_2"]["rich_text"][0]["annotations"]["color"], "default")
+
+            # li1: purple_background が親、子 span の green_background のみインライン保持
+            self.assertEqual(tree.blocks[3]["bulleted_list_item"]["color"], "purple_background")
+            self.assertEqual(tree.blocks[3]["bulleted_list_item"]["rich_text"][0]["annotations"]["color"], "default")
+            self.assertEqual(tree.blocks[3]["bulleted_list_item"]["rich_text"][1]["annotations"]["color"], "green_background")
+
+            # q1: quote red_background
+            self.assertEqual(tree.blocks[4]["quote"]["color"], "red_background")
+            self.assertEqual(tree.blocks[4]["quote"]["rich_text"][0]["annotations"]["color"], "default")
+
+            # Storage Format 変換検証
+            storage = self.converter.blocks_to_storage_format(tree.blocks)
+            assert_valid_storage_xml(self, storage)
+            self.assertNotIn('<span style="background-color: #fbf3db;', storage)
+            self.assertNotIn('<span style="background-color: #e7f3f8;', storage)
+            self.assertNotIn('<span style="background-color: #f4f0f7;', storage)
+            self.assertNotIn('<span style="background-color: #fdebec;', storage)
+            self.assertIn('<span style="background-color: #fbf0f4;', storage)
+            self.assertIn('<span style="background-color: #edf3ec;', storage)
+            self.assertEqual(storage.count('<ac:structured-macro ac:name="panel">'), 5)
+        finally:
+            if os.path.exists(tmp_zip_path):
+                os.remove(tmp_zip_path)
+
+    def test_error_pattern_zip_blocks_convert_to_valid_panels_without_inline_dup(self):
+        """error_pattern_ExportBlock.zip 内の色付きブロックが整形式panelマクロに変換され、重複spanがないこと。"""
+        zip_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "error_pattern_ExportBlock.zip")
+        if not os.path.exists(zip_path):
+            self.skipTest("error_pattern_ExportBlock.zip not found")
+
+        tree = HtmlZipExtractor(zip_path).extract_tree()
+        all_nodes = []
+
+        def _walk(node):
+            all_nodes.append(node)
+            for c in node.children:
+                _walk(c)
+
+        _walk(tree)
+        self.assertGreater(len(all_nodes), 0)
+
+        panel_count = 0
+        for node in all_nodes:
+            storage = self.converter.blocks_to_storage_format(node.blocks)
+            assert_valid_storage_xml(self, storage, label=node.title)
+            panel_count += storage.count('<ac:structured-macro ac:name="panel">')
+            self.assertNotIn('<span style="background-color:', storage)
+
+        self.assertGreater(panel_count, 0)
 
     def test_converter_pdf_block_single_macro_no_duplicate_link(self):
         """PDFブロックがviewpdfインラインプレビューマクロ単一で出力され、重複リンクが生成されないこと。"""

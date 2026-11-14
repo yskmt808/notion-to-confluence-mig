@@ -456,11 +456,21 @@ class NotionToConfluenceConverter:
             val = prop.get("value")
             return html.escape(str(val)) if val is not None else "-"
 
-    def convert_rich_text(self, rich_text_list: List[Dict[str, Any]], default_color: str = "default") -> str:
+    def convert_rich_text(
+        self,
+        rich_text_list: List[Dict[str, Any]],
+        default_color: str = "default",
+        suppress_bg_color: Optional[str] = None,
+    ) -> str:
         """Notionのrich_text配列をConfluence Storage FormatのXHTML文字列に変換する。
         メンション（日付、ページ、データベース、ユーザー、リンクプレビュー等）や書式、カラーも完全サポート。"""
         if not rich_text_list:
             return ""
+        norm_suppress = (
+            "green_background"
+            if suppress_bg_color == "teal_background"
+            else (suppress_bg_color.lower().strip() if suppress_bg_color else None)
+        )
 
         result = []
         for item in rich_text_list:
@@ -602,7 +612,9 @@ class NotionToConfluenceConverter:
                     color = "green"
                 elif color == "teal_background":
                     color = "green_background"
-                if color in NOTION_TEXT_COLOR_MAP:
+                if norm_suppress and color == norm_suppress:
+                    color = "default"
+                elif color in NOTION_TEXT_COLOR_MAP:
                     escaped = f'<span style="color: {NOTION_TEXT_COLOR_MAP[color]};">{escaped}</span>'
                 elif color in NOTION_BG_COLOR_MAP:
                     escaped = f'<span style="background-color: {NOTION_BG_COLOR_MAP[color]}; padding: 2px 4px; border-radius: 3px;">{escaped}</span>'
@@ -752,26 +764,53 @@ class NotionToConfluenceConverter:
 
         return "".join(result)
 
+    def _normalize_block_color(self, color: Optional[str]) -> str:
+        """ブロック単位の色指定を正規化する（teal系→green系、default_background→default）。"""
+        if not color:
+            return "default"
+        c = str(color).strip().lower()
+        if not c or c in ("default", "default_background"):
+            return "default"
+        if c == "teal":
+            return "green"
+        if c == "teal_background":
+            return "green_background"
+        return c
+
+    def _is_background_color(self, color: Optional[str]) -> bool:
+        """ブロック単位の色指定が背景色（xxx_background）であるか判定する。"""
+        return self._normalize_block_color(color) in NOTION_BG_COLOR_MAP
+
+    def _render_bg_panel_macro(self, bg_color: str, body_html: str) -> str:
+        """ブロック（行単位）背景色を Confluence Cloud で幅100%描画される panel マクロでラップする。"""
+        norm = self._normalize_block_color(bg_color)
+        bg_hex = NOTION_BG_COLOR_MAP.get(norm, CALLOUT_PANEL_COLORS["default"]["bg"])
+        color_key = norm[:-len("_background")] if norm.endswith("_background") else norm
+        border_hex = CALLOUT_PANEL_COLORS.get(color_key, CALLOUT_PANEL_COLORS["default"])["border"]
+        safe_body = body_html if body_html else "<p></p>"
+        return (
+            f'<ac:structured-macro ac:name="panel">'
+            f'<ac:parameter ac:name="bgColor">{bg_hex}</ac:parameter>'
+            f'<ac:parameter ac:name="borderColor">{border_hex}</ac:parameter>'
+            f'<ac:rich-text-body>{safe_body}</ac:rich-text-body>'
+            f'</ac:structured-macro>'
+        )
+
     def _get_block_style_attr(self, color: str, base_padding: str = "6px 10px") -> Tuple[str, str]:
         """ブロックレベルの色指定から、タグのstyle属性とインライン用default_colorを返す。
-        - 背景色(xxx_background): 行全体にスタイルを適用し、インライン重複を防ぐためdefault_colorは'default'とする。
+        - 背景色(xxx_background): panelマクロでラップするためstyle属性は付与せず、インライン重複を防ぐためdefault_colorは'default'とする。
         - 文字色(xxx): 行全体に文字色スタイルを適用し、default_colorとしても引き継ぐ。
         """
-        if not color or color == "default":
+        norm = self._normalize_block_color(color)
+        if norm == "default":
             return "", "default"
-        if color == "teal":
-            color = "green"
-        elif color == "teal_background":
-            color = "green_background"
 
-        if color in NOTION_BG_COLOR_MAP:
-            bg_hex = NOTION_BG_COLOR_MAP[color]
-            style_attr = f' style="background-color: {bg_hex}; padding: {base_padding}; border-radius: 4px; margin: 4px 0;"'
-            return style_attr, "default"
-        elif color in NOTION_TEXT_COLOR_MAP:
-            txt_hex = NOTION_TEXT_COLOR_MAP[color]
+        if norm in NOTION_BG_COLOR_MAP:
+            return "", "default"
+        elif norm in NOTION_TEXT_COLOR_MAP:
+            txt_hex = NOTION_TEXT_COLOR_MAP[norm]
             style_attr = f' style="color: {txt_hex};"'
-            return style_attr, color
+            return style_attr, norm
         return "", "default"
 
     def _collect_page_anchors(self, blocks: List[Dict[str, Any]]) -> None:
@@ -852,12 +891,25 @@ class NotionToConfluenceConverter:
                     flush_list()
                     current_list_type = "bulleted"
                 b_color = b.get("bulleted_list_item", {}).get("color", "default")
+                norm_bg = self._normalize_block_color(b_color) if self._is_background_color(b_color) else None
                 style_attr, inline_color = self._get_block_style_attr(b_color, base_padding="2px 6px")
-                text = self.convert_rich_text(b.get("bulleted_list_item", {}).get("rich_text", []), default_color=inline_color)
+                text = self.convert_rich_text(
+                    b.get("bulleted_list_item", {}).get("rich_text", []),
+                    default_color=inline_color,
+                    suppress_bg_color=norm_bg,
+                )
                 nested_html = ""
                 if b.get("children_blocks"):
                     nested_html = self.blocks_to_storage_format(b["children_blocks"])
-                list_buffer.append(f"<li{style_attr}>{text}{nested_html}</li>")
+                if norm_bg:
+                    body_parts = []
+                    if text or not nested_html:
+                        body_parts.append(f"<p>{text}</p>")
+                    if nested_html:
+                        body_parts.append(nested_html)
+                    list_buffer.append(f"<li>{self._render_bg_panel_macro(norm_bg, ''.join(body_parts))}</li>")
+                else:
+                    list_buffer.append(f"<li{style_attr}>{text}{nested_html}</li>")
                 continue
 
             elif b_type == "numbered_list_item":
@@ -865,29 +917,53 @@ class NotionToConfluenceConverter:
                     flush_list()
                     current_list_type = "numbered"
                 b_color = b.get("numbered_list_item", {}).get("color", "default")
+                norm_bg = self._normalize_block_color(b_color) if self._is_background_color(b_color) else None
                 style_attr, inline_color = self._get_block_style_attr(b_color, base_padding="2px 6px")
-                text = self.convert_rich_text(b.get("numbered_list_item", {}).get("rich_text", []), default_color=inline_color)
+                text = self.convert_rich_text(
+                    b.get("numbered_list_item", {}).get("rich_text", []),
+                    default_color=inline_color,
+                    suppress_bg_color=norm_bg,
+                )
                 nested_html = ""
                 if b.get("children_blocks"):
                     nested_html = self.blocks_to_storage_format(b["children_blocks"])
-                list_buffer.append(f"<li{style_attr}>{text}{nested_html}</li>")
+                if norm_bg:
+                    body_parts = []
+                    if text or not nested_html:
+                        body_parts.append(f"<p>{text}</p>")
+                    if nested_html:
+                        body_parts.append(nested_html)
+                    list_buffer.append(f"<li>{self._render_bg_panel_macro(norm_bg, ''.join(body_parts))}</li>")
+                else:
+                    list_buffer.append(f"<li{style_attr}>{text}{nested_html}</li>")
                 continue
 
             elif b_type == "to_do":
-                if current_list_type != "to_do":
-                    flush_list()
-                    current_list_type = "to_do"
                 todo_data = b.get("to_do", {})
                 is_checked = todo_data.get("checked", False)
                 status = "complete" if is_checked else "incomplete"
                 b_color = todo_data.get("color", "default")
-                text = self.convert_rich_text(todo_data.get("rich_text", []), default_color=b_color)
+                norm_bg = self._normalize_block_color(b_color) if self._is_background_color(b_color) else None
+                _, inline_color = self._get_block_style_attr(b_color, base_padding="2px 6px")
+                text = self.convert_rich_text(
+                    todo_data.get("rich_text", []),
+                    default_color=inline_color,
+                    suppress_bg_color=norm_bg,
+                )
                 nested_html = ""
                 if b.get("children_blocks"):
                     nested_html = self.blocks_to_storage_format(b["children_blocks"])
-                list_buffer.append(
+                task_item_html = (
                     f'<ac:task><ac:task-status>{status}</ac:task-status><ac:task-body>{text}{nested_html}</ac:task-body></ac:task>'
                 )
+                if norm_bg:
+                    flush_list()
+                    output.append(self._render_bg_panel_macro(norm_bg, f'<ac:task-list>{task_item_html}</ac:task-list>'))
+                else:
+                    if current_list_type != "to_do":
+                        flush_list()
+                        current_list_type = "to_do"
+                    list_buffer.append(task_item_html)
                 continue
 
             # リスト以外のブロックが来たらバッファをフラッシュ
@@ -896,18 +972,33 @@ class NotionToConfluenceConverter:
             if b_type == "paragraph":
                 p_data = b.get("paragraph", {})
                 p_color = p_data.get("color", "default")
+                norm_bg = self._normalize_block_color(p_color) if self._is_background_color(p_color) else None
                 style_attr, inline_color = self._get_block_style_attr(p_color, base_padding="6px 10px")
-                text = self.convert_rich_text(p_data.get("rich_text", []), default_color=inline_color)
+                text = self.convert_rich_text(
+                    p_data.get("rich_text", []),
+                    default_color=inline_color,
+                    suppress_bg_color=norm_bg,
+                )
                 children_html = ""
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"])
-                output.append(f"<p{style_attr}>{text if text else '<br />'}</p>{children_html}")
+                inner_html = f"<p{style_attr}>{text if text else '<br />'}</p>{children_html}"
+                if norm_bg:
+                    output.append(self._render_bg_panel_macro(norm_bg, inner_html))
+                else:
+                    output.append(inner_html)
 
-            elif b_type == "heading_1":
-                h_data = b.get("heading_1", {})
+            elif b_type in ("heading_1", "heading_2", "heading_3"):
+                h_tag = f"h{b_type[-1]}"
+                h_data = b.get(b_type, {})
                 h_color = h_data.get("color", "default")
+                norm_bg = self._normalize_block_color(h_color) if self._is_background_color(h_color) else None
                 style_attr, inline_color = self._get_block_style_attr(h_color, base_padding="6px 10px")
-                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=inline_color)
+                text = self.convert_rich_text(
+                    h_data.get("rich_text", []),
+                    default_color=inline_color,
+                    suppress_bg_color=norm_bg,
+                )
                 current_heading = text
                 raw_h_text = "".join(t.get("plain_text", "") for t in h_data.get("rich_text", [])).strip()
                 clean_h_text = re.sub(r"<[^>]+>", "", raw_h_text).strip()
@@ -930,7 +1021,7 @@ class NotionToConfluenceConverter:
                 if h_data.get("is_toggleable") and b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
                     param_title = clean_parameter_text(text) or "詳細"
-                    output.append(
+                    inner_html = (
                         f'{anchor_macro}'
                         f'<ac:structured-macro ac:name="expand">'
                         f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
@@ -938,81 +1029,11 @@ class NotionToConfluenceConverter:
                         f'</ac:structured-macro>'
                     )
                 else:
-                    output.append(f"<h1{style_attr}>{anchor_macro}{text}</h1>")
-
-            elif b_type == "heading_2":
-                h_data = b.get("heading_2", {})
-                h_color = h_data.get("color", "default")
-                style_attr, inline_color = self._get_block_style_attr(h_color, base_padding="6px 10px")
-                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=inline_color)
-                current_heading = text
-                raw_h_text = "".join(t.get("plain_text", "") for t in h_data.get("rich_text", [])).strip()
-                clean_h_text = re.sub(r"<[^>]+>", "", raw_h_text).strip()
-                b_id = b.get("id")
-                anchor_macro = ""
-                if clean_h_text:
-                    anchor_macro += (
-                        f'<ac:structured-macro ac:name="anchor">'
-                        f'<ac:parameter ac:name="">{html.escape(clean_h_text)}</ac:parameter>'
-                        f'</ac:structured-macro>'
-                    )
-                if b_id:
-                    norm_id = b_id.replace("-", "").lower()
-                    if norm_id and norm_id != clean_h_text:
-                        anchor_macro += (
-                            f'<ac:structured-macro ac:name="anchor">'
-                            f'<ac:parameter ac:name="">{norm_id}</ac:parameter>'
-                            f'</ac:structured-macro>'
-                        )
-                if h_data.get("is_toggleable") and b.get("children_blocks"):
-                    children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
-                    param_title = clean_parameter_text(text) or "詳細"
-                    output.append(
-                        f'{anchor_macro}'
-                        f'<ac:structured-macro ac:name="expand">'
-                        f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
-                        f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
-                        f'</ac:structured-macro>'
-                    )
+                    inner_html = f"<{h_tag}{style_attr}>{anchor_macro}{text}</{h_tag}>"
+                if norm_bg:
+                    output.append(self._render_bg_panel_macro(norm_bg, inner_html))
                 else:
-                    output.append(f"<h2{style_attr}>{anchor_macro}{text}</h2>")
-
-            elif b_type == "heading_3":
-                h_data = b.get("heading_3", {})
-                h_color = h_data.get("color", "default")
-                style_attr, inline_color = self._get_block_style_attr(h_color, base_padding="6px 10px")
-                text = self.convert_rich_text(h_data.get("rich_text", []), default_color=inline_color)
-                current_heading = text
-                raw_h_text = "".join(t.get("plain_text", "") for t in h_data.get("rich_text", [])).strip()
-                clean_h_text = re.sub(r"<[^>]+>", "", raw_h_text).strip()
-                b_id = b.get("id")
-                anchor_macro = ""
-                if clean_h_text:
-                    anchor_macro += (
-                        f'<ac:structured-macro ac:name="anchor">'
-                        f'<ac:parameter ac:name="">{html.escape(clean_h_text)}</ac:parameter>'
-                        f'</ac:structured-macro>'
-                    )
-                if b_id:
-                    norm_id = b_id.replace("-", "").lower()
-                    if norm_id and norm_id != clean_h_text:
-                        anchor_macro += (
-                            f'<ac:structured-macro ac:name="anchor">'
-                            f'<ac:parameter ac:name="">{norm_id}</ac:parameter>'
-                            f'</ac:structured-macro>'
-                        )
-                if h_data.get("is_toggleable") and b.get("children_blocks"):
-                    children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=text)
-                    param_title = clean_parameter_text(text) or "詳細"
-                    output.append(
-                        f'{anchor_macro}'
-                        f'<ac:structured-macro ac:name="expand">'
-                        f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
-                        f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
-                        f'</ac:structured-macro>'
-                    )
-                else:
-                    output.append(f"<h3{style_attr}>{anchor_macro}{text}</h3>")
+                    output.append(inner_html)
 
             elif b_type == "table_of_contents":
                 # Confluence 目次マクロ (TOC Macro)
@@ -1083,23 +1104,33 @@ class NotionToConfluenceConverter:
             elif b_type == "quote":
                 q_data = b.get("quote", {})
                 q_color = q_data.get("color", "default")
+                norm_bg = self._normalize_block_color(q_color) if self._is_background_color(q_color) else None
                 style_attr, inline_color = self._get_block_style_attr(q_color, base_padding="8px 12px")
-                text = self.convert_rich_text(q_data.get("rich_text", []), default_color=inline_color)
+                text = self.convert_rich_text(
+                    q_data.get("rich_text", []),
+                    default_color=inline_color,
+                    suppress_bg_color=norm_bg,
+                )
                 children_html = ""
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"])
-                output.append(f"<blockquote{style_attr}><p>{text}</p>{children_html}</blockquote>")
+                inner_html = f"<blockquote{style_attr}><p>{text}</p>{children_html}</blockquote>"
+                if norm_bg:
+                    output.append(self._render_bg_panel_macro(norm_bg, inner_html))
+                else:
+                    output.append(inner_html)
 
             elif b_type == "callout":
                 from src.icon_mapper import resolve_notion_icon_to_emoji
                 callout_data = b.get("callout", {})
-                color = callout_data.get("color", "default").lower()
+                color = self._normalize_block_color(callout_data.get("color", "default"))
                 color_key = color.replace("_background", "").strip()
                 color_info = CALLOUT_PANEL_COLORS.get(color_key, CALLOUT_PANEL_COLORS["default"])
+                norm_bg = color if color in NOTION_BG_COLOR_MAP else None
 
                 icon_obj = callout_data.get("icon") or {}
                 emoji = resolve_notion_icon_to_emoji(icon_obj)
-                text = self.convert_rich_text(callout_data.get("rich_text", []))
+                text = self.convert_rich_text(callout_data.get("rich_text", []), suppress_bg_color=norm_bg)
 
                 # Confluenceのinfoマクロに固定表示される(i)アイコンを排除し、
                 # Notion本来のアイコン（絵文字・Notionアイコン）のみを単一表示するためpanelマクロを採用
@@ -1128,17 +1159,31 @@ class NotionToConfluenceConverter:
 
             elif b_type == "toggle":
                 toggle_data = b.get("toggle", {})
-                title_text = self.convert_rich_text(toggle_data.get("rich_text", [])) or "詳細"
+                t_color = toggle_data.get("color", "default")
+                norm_bg = self._normalize_block_color(t_color) if self._is_background_color(t_color) else None
+                _, inline_color = self._get_block_style_attr(t_color, base_padding="6px 10px")
+                title_text = (
+                    self.convert_rich_text(
+                        toggle_data.get("rich_text", []),
+                        default_color=inline_color,
+                        suppress_bg_color=norm_bg,
+                    )
+                    or "詳細"
+                )
                 param_title = clean_parameter_text(title_text) or "詳細"
                 children_html = ""
                 if b.get("children_blocks"):
                     children_html = self.blocks_to_storage_format(b["children_blocks"], context_heading=title_text)
-                output.append(
+                expand_html = (
                     f'<ac:structured-macro ac:name="expand">'
                     f'<ac:parameter ac:name="title">{param_title}</ac:parameter>'
                     f'<ac:rich-text-body>{children_html if children_html else "<p></p>"}</ac:rich-text-body>'
                     f'</ac:structured-macro>'
                 )
+                if norm_bg:
+                    output.append(self._render_bg_panel_macro(norm_bg, expand_html))
+                else:
+                    output.append(expand_html)
 
             elif b_type == "divider":
                 output.append("<hr />")
