@@ -1797,7 +1797,85 @@ class NotionToConfluenceConverter:
             return f'"{escaped}"'
         return s
 
-    def _format_prop_for_csv(self, prop: Any, prop_name: str, fallback_title: str) -> str:
+    @staticmethod
+    def _is_datetime_or_range_prop_value(prop: Any) -> bool:
+        """プロパティ値が時刻 (HH:MM) または日付範囲 (end / →) を含むか判定する。"""
+        if not isinstance(prop, dict):
+            return False
+        p_type = prop.get("type")
+        if p_type in ("created_time", "last_edited_time"):
+            return True
+        if p_type != "date":
+            return False
+        date_obj = prop.get("date") if isinstance(prop.get("date"), dict) else {}
+        end = prop.get("end") or date_obj.get("end")
+        if end:
+            return True
+        start = prop.get("start") or date_obj.get("start") or prop.get("value")
+        if not start:
+            return False
+        s_val = str(start).strip()
+        if "→" in s_val:
+            return True
+        if re.search(r"(?:T|\s)\d{1,2}:\d{2}", s_val):
+            return True
+        return False
+
+    @classmethod
+    def column_requires_text_for_datetime(cls, db_node: PageNode, col_name: str, prop_type: str) -> bool:
+        """DBカラムが日時/日付範囲を保持するため Confluence text 型にすべきかを判定する。"""
+        if prop_type in ("created_time", "last_edited_time"):
+            return True
+        if prop_type != "date":
+            return False
+        for child in getattr(db_node, "children", []) or []:
+            prop = (getattr(child, "properties", None) or {}).get(col_name)
+            if cls._is_datetime_or_range_prop_value(prop):
+                return True
+        return False
+
+    def _format_single_datetime_for_csv(self, raw_val: Any, preserve_time: bool) -> str:
+        """単一の日付/日時値を CSV 用文字列（YYYY-MM-DD または YYYY-MM-DD HH:MM）へ整形する。"""
+        s_val = str(raw_val).strip()
+        if not s_val:
+            return ""
+        has_tz = bool(re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", s_val, re.IGNORECASE))
+        if has_tz:
+            from src.timezone_util import format_iso_datetime
+            fmt = "%Y-%m-%d %H:%M" if preserve_time else "%Y-%m-%d"
+            return format_iso_datetime(s_val, tz=self.timezone, fmt=fmt)
+
+        m_iso = re.match(
+            r"^(\d{4}-\d{2}-\d{2})(?:[T\s](\d{1,2}):(\d{2})(?::\d{2})?(?:\.\d+)?)?$",
+            s_val,
+        )
+        if m_iso:
+            date_part = m_iso.group(1)
+            if preserve_time and m_iso.group(2) is not None and m_iso.group(3) is not None:
+                return f"{date_part} {int(m_iso.group(2)):02d}:{m_iso.group(3)}"
+            return date_part
+
+        if preserve_time:
+            from src.html_extractor import _parse_date_or_datetime
+            parsed_dt = _parse_date_or_datetime(s_val)
+            if parsed_dt:
+                m_p = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})", parsed_dt)
+                if m_p:
+                    return f"{m_p.group(1)} {m_p.group(2)}"
+                return parsed_dt
+            return s_val
+
+        from src.html_extractor import _parse_date_string
+        parsed_d = _parse_date_string(s_val)
+        return parsed_d if parsed_d else s_val.split("T")[0]
+
+    def _format_prop_for_csv(
+        self,
+        prop: Any,
+        prop_name: str,
+        fallback_title: str,
+        preserve_time: Optional[bool] = None,
+    ) -> str:
         """NotionプロパティをConfluence Database CSV用のセル値に変換する。"""
         if prop is None:
             return ""
@@ -1829,18 +1907,26 @@ class NotionToConfluenceConverter:
                     vals.append(str(v))
             return "|".join(vals) if vals else ""
         elif p_type in ("date", "created_time", "last_edited_time"):
-            start = prop.get("start") or prop.get(p_type) or (prop.get("date") or {}).get("start") or prop.get("value")
+            date_obj = prop.get("date") if isinstance(prop.get("date"), dict) else {}
+            start = prop.get("start") or prop.get(p_type) or date_obj.get("start") or prop.get("value")
+            end = prop.get("end") or date_obj.get("end")
             if not start:
                 return ""
-            s_val = str(start).strip()
-            if re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", s_val, re.IGNORECASE):
-                from src.timezone_util import format_iso_datetime
-                return format_iso_datetime(s_val, tz=self.timezone, fmt="%Y-%m-%d")
-            if re.match(r"^\d{4}-\d{2}-\d{2}", s_val):
-                return s_val.split("T")[0][:10]
-            from src.html_extractor import _parse_date_string
-            parsed_d = _parse_date_string(s_val)
-            return parsed_d if parsed_d else s_val.split("T")[0]
+            keep_time = (
+                True
+                if p_type in ("created_time", "last_edited_time")
+                else (self._is_datetime_or_range_prop_value(prop) if preserve_time is None else bool(preserve_time))
+            )
+            if not end and isinstance(start, str) and "→" in start:
+                from src.html_extractor import _parse_date_range
+                rng = _parse_date_range(start)
+                if rng:
+                    start, end = rng[0], rng[1]
+            start_fmt = self._format_single_datetime_for_csv(start, preserve_time=keep_time)
+            if keep_time and end:
+                end_fmt = self._format_single_datetime_for_csv(end, preserve_time=True)
+                return f"{start_fmt} → {end_fmt}"
+            return start_fmt
         elif p_type == "checkbox":
             val = prop.get("value") if "value" in prop else prop.get("checkbox")
             if val is None:
@@ -1999,7 +2085,11 @@ class NotionToConfluenceConverter:
                 elif p_type == "checkbox":
                     conf_type = "checkbox"
                 elif p_type in ("date", "created_time", "last_edited_time"):
-                    conf_type = "date"
+                    conf_type = (
+                        "text"
+                        if self.column_requires_text_for_datetime(db_node, p_name, p_type)
+                        else "date"
+                    )
                 elif p_type == "number":
                     conf_type = "number"
                 elif p_type == "url":
@@ -2047,7 +2137,11 @@ class NotionToConfluenceConverter:
                 elif p_type == "checkbox":
                     conf_type = "checkbox"
                 elif p_type in ("date", "created_time", "last_edited_time"):
-                    conf_type = "date"
+                    conf_type = (
+                        "text"
+                        if self.column_requires_text_for_datetime(db_node, p_name, p_type)
+                        else "date"
+                    )
                 elif p_type == "number":
                     conf_type = "number"
                 elif p_type == "url":
@@ -2060,6 +2154,8 @@ class NotionToConfluenceConverter:
                 cfg = 'number_format:number' if conf_type == "number" else ''
                 fields.append((p_name, conf_type, cfg))
                 prop_names.append(p_name)
+
+        field_type_map = {f_name: f_type for f_name, f_type, _ in fields}
 
         field_lines = ["<fields>", "field_name,type,configuration"]
         for f_name, f_type, f_cfg in fields:
@@ -2091,7 +2187,8 @@ class NotionToConfluenceConverter:
 
             for p_name in prop_names:
                 prop = child.properties.get(p_name)
-                val_str = self._format_prop_for_csv(prop, p_name, child.title)
+                preserve_time = field_type_map.get(p_name) == "text"
+                val_str = self._format_prop_for_csv(prop, p_name, child.title, preserve_time=preserve_time)
                 row_cells.append(self._escape_csv_cell(val_str))
 
             data_lines.append(",".join(row_cells))
