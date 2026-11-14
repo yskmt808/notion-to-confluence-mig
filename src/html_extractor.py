@@ -1618,8 +1618,21 @@ class HtmlZipExtractor:
                 elif href:
                     lower_href = href.lower()
                     is_external = href.startswith(("http://", "https://"))
-                    raw_link_text = a_tag.get_text(" ", strip=True) if a_tag else ""
+                    raw_link_text = (
+                        (a_tag.get_text(" ", strip=True) or a_tag.get("data-notion-file-alias") or "")
+                        if a_tag
+                        else ""
+                    )
                     display_name = normalize_attachment_display_name(raw_link_text)
+                    media_tag_present = el.find(["embed", "iframe", "object"]) is not None
+                    has_notion_file_attr = bool(
+                        a_tag and (a_tag.has_attr("data-notion-file") or a_tag.has_attr("data-notion-file-alias"))
+                    )
+                    is_preview_disabled_file = bool(
+                        has_notion_file_attr
+                        and "pdf" not in classes
+                        and not media_tag_present
+                    )
 
                     if att_ref_match:
                         att_filename = unicodedata.normalize("NFC", os.path.basename(att_ref_match.group(2).strip()))
@@ -1654,10 +1667,13 @@ class HtmlZipExtractor:
                             "embed": {"url": href},
                         })
                     elif (
-                        att_filename.lower().endswith(".pdf")
-                        or href_path_lower.endswith(".pdf")
-                        or (resolved_path or "").lower().endswith(".pdf")
-                        or "pdf" in classes
+                        not is_preview_disabled_file
+                        and (
+                            att_filename.lower().endswith(".pdf")
+                            or href_path_lower.endswith(".pdf")
+                            or (resolved_path or "").lower().endswith(".pdf")
+                            or "pdf" in classes
+                        )
                     ):
                         pdf_obj = AttachmentBlockDict({
                             "id": el_id,

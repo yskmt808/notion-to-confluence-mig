@@ -1451,11 +1451,12 @@ class NotionToConfluenceConverter:
                 file_file = file_data.get("file") or {}
                 file_ext = file_data.get("external") or {}
                 file_url = file_file.get("url") or file_ext.get("url", "")
-                filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
+                filename = self._get_attachment_filename(b)
+                display_label = unicodedata.normalize("NFC", str(b.get("_display_name") or filename))
                 caption = self.convert_rich_text(file_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
                 if b.get("_attachment_uploaded", True):
-                    safe_fn_cdata = filename.replace("]]>", "]]]]><![CDATA[>")
+                    safe_fn_cdata = display_label.replace("]]>", "]]]]><![CDATA[>")
                     output.append(
                         f'<p><ac:link>'
                         f'<ri:attachment ri:filename="{html.escape(filename)}" />'
@@ -1464,7 +1465,7 @@ class NotionToConfluenceConverter:
                     )
                 elif file_url:
                     output.append(
-                        f'<p>📎 <a href="{html.escape(file_url)}">添付ファイルを開く: {html.escape(filename)}</a></p>{caption_html}'
+                        f'<p>📎 <a href="{html.escape(file_url)}">添付ファイルを開く: {html.escape(display_label)}</a></p>{caption_html}'
                     )
 
             elif b_type == "video":

@@ -647,6 +647,66 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         self.assertEqual(res_err["status"], "FAIL")
         self.assertTrue(any("Macro load/render error" in i for i in res_err["issues"]))
 
+    def test_html_extractor_distinguishes_preview_disabled_file_pdf_vs_embedded_pdf(self):
+        """Notion上のプレビューなしPDF(data-notion-file付与)はfileリンク、PDF埋め込みはviewpdfとして区別変換されること。"""
+        import unicodedata
+        nfd_a10 = unicodedata.normalize("NFD", "A10_SPWorkshop_2019_ご案内.pdf")
+        nfc_a10 = unicodedata.normalize("NFC", "A10_SPWorkshop_2019_ご案内.pdf")
+        nfc_a10_alias = unicodedata.normalize("NFC", "A10 SPWorkshop 2019_ご案内.pdf")
+        nfd_a10_alias = unicodedata.normalize("NFD", "A10 SPWorkshop 2019_ご案内.pdf")
+
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>PDF Preview vs File Test</title></head>
+<body>
+  <article id="4137be77-284d-8041-89c8-d080073331b4" class="page sans">
+    <header><h1 class="page-title">PDF Preview vs File Test</h1></header>
+    <div class="page-body">
+      <figure id="4157be77-284d-800c-a0d2-cb01a1db6288" dir="ltr">
+        <div class="source">
+          <a href="エラーパターン/{nfd_a10}" data-notion-file="エラーパターン/{nfd_a10}" data-notion-file-alias="{nfd_a10_alias}">{nfd_a10_alias}</a>
+        </div>
+      </figure>
+      <figure id="4177be77-284d-80f1-acc0-e8ea00b4f270" dir="ltr">
+        <div class="source">
+          <a href="エラーパターン/subaru_studres_2016_p01.pdf">attachment:bee699b7-a0e3-490b-9fe9-cbabec976562:subaru_studres_2016_p01.pdf</a>
+        </div>
+      </figure>
+    </div>
+  </article>
+</body>
+</html>"""
+        a10_bytes = b"%PDF-1.4 a10 bytes"
+        subaru_bytes = b"%PDF-1.4 subaru bytes"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "distinguish.zip")
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("プライベート/エラーパターン.html", html_content)
+                zf.writestr(f"プライベート/エラーパターン/{nfd_a10}", a10_bytes)
+                zf.writestr("プライベート/エラーパターン/subaru_studres_2016_p01.pdf", subaru_bytes)
+
+            tree = HtmlZipExtractor(zip_path).extract_tree()
+            self.assertEqual(len(tree.blocks), 2)
+
+            b_file = tree.blocks[0]
+            self.assertEqual(b_file["type"], "file")
+            self.assertEqual(b_file.get("_attachment_filename"), nfc_a10)
+            self.assertEqual(b_file.get("_display_name"), nfc_a10_alias)
+            self.assertEqual(b_file.get("_attachment_bytes"), a10_bytes)
+
+            b_pdf = tree.blocks[1]
+            self.assertEqual(b_pdf["type"], "pdf")
+            self.assertEqual(b_pdf.get("_attachment_filename"), "subaru_studres_2016_p01.pdf")
+            self.assertEqual(b_pdf.get("_display_name"), "subaru_studres_2016_p01.pdf")
+            self.assertEqual(b_pdf.get("_attachment_bytes"), subaru_bytes)
+
+            storage_xml = self.converter.blocks_to_storage_format(tree.blocks)
+            assert_valid_storage_xml(self, storage_xml)
+            self.assertIn(f'<ac:link><ri:attachment ri:filename="{nfc_a10}" />', storage_xml)
+            self.assertIn(f'<![CDATA[📎 {nfc_a10_alias} (添付ファイルをダウンロード)]]>', storage_xml)
+            self.assertNotIn(f'ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="{nfc_a10}"', storage_xml)
+            self.assertIn('<ac:structured-macro ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="subaru_studres_2016_p01.pdf" /></ac:parameter></ac:structured-macro>', storage_xml)
+
 
 if __name__ == "__main__":
     unittest.main()
