@@ -18,6 +18,7 @@ from collections import Counter
 
 from src.extractor import (
     get_node_external_synced_blocks,
+    is_substanceless_unsupported_block,
     is_unsupported_page_element_block,
     KNOWN_UNSUPPORTED_SERVICE_NAMES,
 )
@@ -53,6 +54,7 @@ class SanitizedTelemetry:
         self.warnings: List[str] = []
         self.errors: List[Dict[str, Any]] = []
         self.unsupported_elements: List[str] = []
+        self.skipped_substanceless_elements_count: int = 0
         self.external_synced_blocks_count: int = 0
 
         # ノード構造の抽象化サマリー（タイトル等の機密を含まない）
@@ -143,10 +145,13 @@ class SanitizedTelemetry:
                         )
                         if elem_label not in self.unsupported_elements:
                             self.unsupported_elements.append(elem_label)
-                        svc_info = f", service={svc}" if svc in KNOWN_UNSUPPORTED_SERVICE_NAMES else ""
-                        self.record_warning(
-                            f"Unsupported page element detected in {n.node_type} {n.id} (type={b_type}{svc_info})"
-                        )
+                        if is_substanceless_unsupported_block(b):
+                            self.skipped_substanceless_elements_count += 1
+                        else:
+                            svc_info = f", service={svc}" if svc in KNOWN_UNSUPPORTED_SERVICE_NAMES else ""
+                            self.record_warning(
+                                f"Unsupported page element detected in {n.node_type} {n.id} (type={b_type}{svc_info})"
+                            )
                     if b.get("children_blocks"):
                         _walk_blocks(b["children_blocks"])
 
@@ -270,6 +275,7 @@ class SanitizedTelemetry:
                 "block_types_distribution": dict(self.block_types_counter),
                 "confluence_macros_distribution": dict(self.confluence_macros_counter),
                 "unsupported_elements_detected": self.unsupported_elements,
+                "skipped_substanceless_elements_count": self.skipped_substanceless_elements_count,
                 "external_synced_blocks_count": self.external_synced_blocks_count,
                 "http_summary": http_summary,
             },
@@ -343,10 +349,13 @@ class SanitizedTelemetry:
             md.append(f"| `{m_name}` | {count} |")
         md.append("")
 
-        if diag["unsupported_elements_detected"]:
+        if diag["unsupported_elements_detected"] or diag.get("skipped_substanceless_elements_count", 0) > 0:
             md.append(f"### ⚠️ 検出されたNotion固有未対応要素")
             for elem in diag["unsupported_elements_detected"]:
                 md.append(f"- `{elem}` (フォールバック注記として保持)")
+            skipped_cnt = diag.get("skipped_substanceless_elements_count", 0)
+            if skipped_cnt > 0:
+                md.append(f"- 実質無意味な空要素として警告スキップ: {skipped_cnt} 件")
             md.append("")
 
         if data["errors_count"] > 0:

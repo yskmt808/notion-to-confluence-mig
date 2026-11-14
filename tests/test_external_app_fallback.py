@@ -115,10 +115,13 @@ class TestHtmlExternalAppAndBrokenUrlFallback(unittest.TestCase):
         self.assertNotIn("example.comundefined", storage_xml)
         self.assertNotIn('href=""', storage_xml)
         self.assertNotIn('href="#"', storage_xml)
-        self.assertEqual(storage_xml.count('<ac:structured-macro ac:name="note">'), 7)
-        self.assertIn("⚠️ 未対応ページ要素:", storage_xml)
+        # 1件目 (4187be77..., ラベル無しの https://app.notion.comundefined) は実質無意味要素としてスキップされ、
+        # ラベル有り6件のみ note マクロが出力されること（タイトル先頭の ⚠️ は重複回避のため付与しない）
+        self.assertEqual(storage_xml.count('<ac:structured-macro ac:name="note">'), 6)
+        self.assertIn("未対応ページ要素:", storage_xml)
+        self.assertNotIn("⚠️ 未対応ページ要素:", storage_xml)
 
-        # Verifier が WARN 判定（FAIL 誤検知なし）となること
+        # Verifier が WARN 判定（FAIL 誤検知なし）となり、スキップ記録も残ること
         mock_vclient = MagicMock()
         mock_vclient.get_page_attachments.return_value = []
         mock_vclient.get_page_by_id.return_value = {
@@ -130,7 +133,8 @@ class TestHtmlExternalAppAndBrokenUrlFallback(unittest.TestCase):
         res = verifier.verify_page_node(tree, "page-100")
         self.assertEqual(res["status"], "WARN")
         self.assertEqual(res["issues"], [])
-        self.assertTrue(any("未対応要素" in w for w in res["warnings"]))
+        self.assertTrue(any("6 件" in w for w in res["warnings"]))
+        self.assertTrue(any("Substanceless unsupported Notion elements safely skipped (1 item(s))." in c for c in res["checks_passed"]))
 
     def test_google_drive_and_external_auth_apps_extracted_safely(self):
         """Google Drive / Docs / OneDrive / SharePoint / Dropbox(.pdf含む) / Box / Miro / Trello / GitHub / Slack が安全に処理されること。"""
@@ -258,9 +262,11 @@ class TestHtmlExternalAppAndBrokenUrlFallback(unittest.TestCase):
         self.assertIn("https://www.figma.com/file/abc/Design", storage_xml)
         self.assertIn('data-card-appearance="embed"', storage_xml)
         self.assertNotIn("app.notion.comundefined", storage_xml)
-        self.assertEqual(storage_xml.count('<ac:structured-macro ac:name="note">'), 3)
+        # emb-broken / obj-empty は実質無意味な空要素として警告スキップされ、if-gd のみ note マクロ出力されること
+        self.assertEqual(storage_xml.count('<ac:structured-macro ac:name="note">'), 1)
+        self.assertNotIn("⚠️ 未対応ページ要素:", storage_xml)
 
-        # Verifier がカラム内ネストの未対応要素を検知して WARN になること
+        # Verifier が有意味な未対応要素(1件)を WARN 記録し、実質無意味要素(2件)はスキップ扱いとすること
         mock_vclient = MagicMock()
         mock_vclient.get_page_attachments.return_value = []
         mock_vclient.get_page_by_id.return_value = {
@@ -271,7 +277,8 @@ class TestHtmlExternalAppAndBrokenUrlFallback(unittest.TestCase):
         res = MigrationVerifier(mock_vclient).verify_page_node(tree, "page-nested")
         self.assertEqual(res["status"], "WARN")
         self.assertEqual(res["issues"], [])
-        self.assertTrue(any("3 件" in w for w in res["warnings"]))
+        self.assertTrue(any("1 件" in w for w in res["warnings"]))
+        self.assertTrue(any("Substanceless unsupported Notion elements safely skipped (2 item(s))." in c for c in res["checks_passed"]))
 
     def test_preserves_figma_maps_codepen_and_local_pdf_attachments(self):
         """回帰確認: figma.com / maps.google / codepen.io は embed 維持、ローカル添付PDF(TCK_00011)も壊れないこと。"""
@@ -387,11 +394,13 @@ class TestNotionApiExternalAppFallback(unittest.TestCase):
             mock_cli.upload_attachment.assert_not_called()
 
         # Converter が XML 整形式で note マクロ + figma embed を出力すること
+        # 実質無意味な 4件 (b-unsup, b-lp-empty, b-emb-empty, b-pdf-empty) はスキップされ、有意味な 3件のみ note 出力
         converter = NotionToConfluenceConverter()
         storage_xml = converter.blocks_to_storage_format(extracted)
         assert_valid_storage_xml(self, storage_xml)
-        self.assertEqual(storage_xml.count('<ac:structured-macro ac:name="note">'), 7)
+        self.assertEqual(storage_xml.count('<ac:structured-macro ac:name="note">'), 3)
         self.assertNotIn("app.notion.comundefined", storage_xml)
+        self.assertNotIn("⚠️ 未対応ページ要素:", storage_xml)
         self.assertIn("https://drive.google.com/file/d/999/view", storage_xml)
         self.assertIn("https://github.com/org/repo/pull/10", storage_xml)
         self.assertIn("https://www.figma.com/file/xyz/Mock", storage_xml)
@@ -408,6 +417,98 @@ class TestNotionApiExternalAppFallback(unittest.TestCase):
         res = MigrationVerifier(mock_vclient).verify_page_node(node, "conf-api-1")
         self.assertEqual(res["status"], "WARN")
         self.assertEqual(res["issues"], [])
+        self.assertTrue(any("Substanceless unsupported Notion elements safely skipped (4 item(s))." in c for c in res["checks_passed"]))
+
+    def test_substanceless_only_elements_suppressed_with_pass_and_telemetry(self):
+        """実質無意味な未対応要素のみのページは warning note を出さず Verifier PASS となり、Telemetry にスキップ数が記録されること。"""
+        blocks = [
+            {
+                "id": "blk-empty-notion-undef",
+                "type": "embed",
+                "embed": {"url": ""},
+                "raw_label": "",
+                "_is_unsupported_external_embed": True,
+                "_unsupported_reason": "broken_or_placeholder_url",
+            },
+            {
+                "id": "blk-breadcrumb",
+                "type": "breadcrumb",
+                "breadcrumb": {},
+            },
+            {
+                "id": "blk-empty-button",
+                "type": "button",
+                "button": {},
+            },
+            {
+                "id": "blk-empty-template",
+                "type": "template",
+                "template": {},
+            },
+            {
+                "id": "blk-empty-unsupported",
+                "type": "unsupported",
+                "unsupported": {},
+            },
+        ]
+        node = PageNode(id="page-substanceless", title="Substanceless Only", node_type="page", blocks=blocks)
+        telemetry = SanitizedTelemetry()
+        telemetry.record_tree(node)
+        report = telemetry.generate_report()
+        self.assertEqual(report["diagnostics"]["skipped_substanceless_elements_count"], 5)
+        self.assertIn("breadcrumb", report["diagnostics"]["unsupported_elements_detected"])
+        self.assertEqual(report["warnings_count"], 0)
+
+        converter = NotionToConfluenceConverter()
+        storage_xml = converter.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, storage_xml)
+        self.assertNotIn('<ac:structured-macro ac:name="note">', storage_xml)
+
+        mock_vclient = MagicMock()
+        mock_vclient.get_page_attachments.return_value = []
+        mock_vclient.get_page_by_id.return_value = {
+            "id": "conf-sub-1",
+            "title": "Substanceless Only",
+            "body": {"storage": {"value": storage_xml}, "view": {"value": storage_xml}},
+        }
+        res = MigrationVerifier(mock_vclient).verify_page_node(node, "conf-sub-1")
+        self.assertEqual(res["status"], "PASS")
+        self.assertEqual(res["issues"], [])
+        self.assertEqual(res["warnings"], [])
+        self.assertTrue(any("Substanceless unsupported Notion elements safely skipped (5 item(s))." in c for c in res["checks_passed"]))
+
+    def test_note_macro_titles_have_no_duplicate_warning_emoji(self):
+        """note マクロのタイトルに ⚠️ が付与されないこと（Notion固有機能 / 未対応ブロック / 未対応ページ要素）。"""
+        blocks = [
+            {
+                "id": "blk-btn-with-child",
+                "type": "button",
+                "button": {"title": "新規タスク作成"},
+                "children_blocks": [
+                    {"id": "c-1", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "plain_text": "補足テキスト"}]}}
+                ],
+            },
+            {
+                "id": "blk-unknown-custom",
+                "type": "custom_widget_xyz",
+                "custom_widget_xyz": {"title": "独自ウィジェット"},
+            },
+            {
+                "id": "blk-meaningful-gd",
+                "type": "google_drive",
+                "google_drive": {"url": "https://drive.google.com/file/d/123/view"},
+                "_is_unsupported_external_embed": True,
+                "service_name": "Google Drive",
+            },
+        ]
+        converter = NotionToConfluenceConverter()
+        storage_xml = converter.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, storage_xml)
+        self.assertEqual(storage_xml.count('<ac:structured-macro ac:name="note">'), 3)
+        self.assertIn('<ac:parameter ac:name="title">Notion固有機能: アクションボタン (Button)</ac:parameter>', storage_xml)
+        self.assertIn('<ac:parameter ac:name="title">未対応ブロック: custom_widget_xyz</ac:parameter>', storage_xml)
+        self.assertIn('<ac:parameter ac:name="title">未対応ページ要素: Google Drive</ac:parameter>', storage_xml)
+        self.assertNotIn("⚠️", storage_xml)
 
 
 if __name__ == "__main__":

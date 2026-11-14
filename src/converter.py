@@ -16,6 +16,7 @@ from src.extractor import (
     classify_external_app_url,
     extract_block_url,
     is_broken_or_placeholder_url,
+    is_substanceless_unsupported_block,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,7 +220,15 @@ class NotionToConfluenceConverter:
         return f"{b_type}_{b_id_short}.{default_ext}"
 
     def _render_unsupported_external_embed_note(self, b: Dict[str, Any]) -> str:
-        """未対応外部アプリ連携・URL空・破損プレースホルダーURLブロックをConfluence noteマクロで安全にレンダリングする。"""
+        """未対応外部アプリ連携・URL空・破損プレースホルダーURLブロックをConfluence noteマクロで安全にレンダリングする。
+        実質的に無意味な空要素の場合は警告ブロックを出さず空文字列を返す。"""
+        if is_substanceless_unsupported_block(b):
+            logger.info(
+                f"Skipping substanceless unsupported Notion element from Confluence body "
+                f"(id={b.get('id')}, type={b.get('type')}, reason={b.get('_unsupported_reason', 'empty')})"
+            )
+            return ""
+
         b_type = str(b.get("type") or "unsupported")
         raw_url = extract_block_url(b)
         is_broken = is_broken_or_placeholder_url(raw_url)
@@ -252,7 +261,8 @@ class NotionToConfluenceConverter:
         if b.get("children_blocks"):
             children_html = self.blocks_to_storage_format(b["children_blocks"])
 
-        title_param = clean_parameter_text(f"⚠️ 未対応ページ要素: {svc_name}")
+        # noteマクロ自体がConfluence標準の「！」アイコンを描画するため、タイトル先頭に ⚠️ を付けない
+        title_param = clean_parameter_text(f"未対応ページ要素: {svc_name}")
         body_parts: List[str] = []
         if safe_url:
             body_parts.append(
@@ -1448,7 +1458,9 @@ class NotionToConfluenceConverter:
                     or is_broken_or_placeholder_url(url)
                     or classify_external_app_url(url) is not None
                 ):
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
                 else:
                     # Confluenceのスマートリンク Embed カード + 直リンク
                     output.append(
@@ -1466,7 +1478,9 @@ class NotionToConfluenceConverter:
                     or is_broken_or_placeholder_url(url)
                     or classify_external_app_url(url) is not None
                 ):
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
                 else:
                     output.append(
                         f'<p><a href="{html.escape(url)}" data-card-appearance="block">{html.escape(url)}</a></p>'
@@ -1474,7 +1488,14 @@ class NotionToConfluenceConverter:
 
             elif b_type in ("breadcrumb", "unsupported", "button", "template"):
                 if b.get("_is_unsupported_external_embed"):
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
+                elif is_substanceless_unsupported_block(b):
+                    logger.info(
+                        f"Skipping substanceless Notion UI block from Confluence body "
+                        f"(id={b.get('id')}, type={b_type})"
+                    )
                 else:
                     # Notion固有・Confluence非対応ブロックのフォールバック表示
                     b_name_map = {
@@ -1489,7 +1510,7 @@ class NotionToConfluenceConverter:
                         children_html = self.blocks_to_storage_format(b["children_blocks"])
                     output.append(
                         f'<ac:structured-macro ac:name="note">'
-                        f'<ac:parameter ac:name="title">⚠️ Notion固有機能: {html.escape(disp_name)}</ac:parameter>'
+                        f'<ac:parameter ac:name="title">Notion固有機能: {html.escape(disp_name)}</ac:parameter>'
                         f'<ac:rich-text-body><p>この要素（種別: <code>{html.escape(b_type)}</code>）はConfluence側に同等の機能が存在しないため、フォールバック注記として保持されています。</p>{children_html}</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
@@ -1504,7 +1525,9 @@ class NotionToConfluenceConverter:
                     or not url
                     or is_broken_or_placeholder_url(url, allow_notion_page_url=True)
                 ):
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
                 else:
                     output.append(
                         f'<p><a href="{html.escape(url)}" data-card-appearance="block">{html.escape(url)}</a></p>{caption_html}'
@@ -1558,7 +1581,9 @@ class NotionToConfluenceConverter:
                         or classify_external_app_url(pdf_url) is not None
                     )
                 ):
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
                 elif b.get("_attachment_uploaded", True):
                     output.append(
                         f'<ac:structured-macro ac:name="viewpdf">'
@@ -1574,7 +1599,9 @@ class NotionToConfluenceConverter:
                         f'<p>📄 {html.escape(filename)}</p>{caption_html}'
                     )
                 else:
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
 
             elif b_type == "file":
                 file_data = b.get("file", {}) if isinstance(b.get("file"), dict) else {}
@@ -1595,7 +1622,9 @@ class NotionToConfluenceConverter:
                         or classify_external_app_url(file_url) is not None
                     )
                 ):
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
                 elif b.get("_attachment_uploaded", True):
                     safe_fn_cdata = display_label.replace("]]>", "]]]]><![CDATA[>")
                     output.append(
@@ -1609,7 +1638,9 @@ class NotionToConfluenceConverter:
                         f'<p>📎 <a href="{html.escape(file_url)}">添付ファイルを開く: {html.escape(display_label)}</a></p>{caption_html}'
                     )
                 else:
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
 
             elif b_type == "video":
                 video_data = b.get("video", {}) if isinstance(b.get("video"), dict) else {}
@@ -1637,7 +1668,9 @@ class NotionToConfluenceConverter:
                     and not b.get("_attachment_zip_entry")
                     and (not video_url or is_broken_or_placeholder_url(video_url) or classify_external_app_url(video_url) is not None)
                 ):
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
                 else:
                     filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
                     if b.get("_attachment_uploaded", True):
@@ -1682,7 +1715,9 @@ class NotionToConfluenceConverter:
                     and not b.get("_attachment_zip_entry")
                     and (not audio_url or is_broken_or_placeholder_url(audio_url) or classify_external_app_url(audio_url) is not None)
                 ):
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
                 else:
                     filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
                     if b.get("_attachment_uploaded", True):
@@ -1703,7 +1738,14 @@ class NotionToConfluenceConverter:
 
             else:
                 if b.get("_is_unsupported_external_embed"):
-                    output.append(self._render_unsupported_external_embed_note(b))
+                    note_html = self._render_unsupported_external_embed_note(b)
+                    if note_html:
+                        output.append(note_html)
+                elif is_substanceless_unsupported_block(b):
+                    logger.info(
+                        f"Skipping substanceless unknown Notion block from Confluence body "
+                        f"(id={b.get('id')}, type={b_type})"
+                    )
                 else:
                     # 未知・未対応のNotionブロック型
                     logger.warning(f"Unknown or unsupported Notion block type: {b_type}")
@@ -1712,7 +1754,7 @@ class NotionToConfluenceConverter:
                         children_html = self.blocks_to_storage_format(b["children_blocks"])
                     output.append(
                         f'<ac:structured-macro ac:name="note">'
-                        f'<ac:parameter ac:name="title">⚠️ 未対応ブロック: {html.escape(str(b_type))}</ac:parameter>'
+                        f'<ac:parameter ac:name="title">未対応ブロック: {html.escape(str(b_type))}</ac:parameter>'
                         f'<ac:rich-text-body><p>種別 <code>{html.escape(str(b_type))}</code> のNotionブロックが検出されました。</p>{children_html}</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )

@@ -167,6 +167,65 @@ def is_unsupported_page_element_block(block: Dict[str, Any]) -> bool:
     return False
 
 
+def _rich_text_has_content(rt_list: Any) -> bool:
+    """rich_text / caption 配列に空白以外の有効なテキストが含まれるか判定する。"""
+    if not isinstance(rt_list, list):
+        return False
+    for rt in rt_list:
+        if isinstance(rt, dict):
+            plain = rt.get("plain_text")
+            if isinstance(plain, str) and plain.strip():
+                return True
+            text_obj = rt.get("text")
+            if isinstance(text_obj, dict) and str(text_obj.get("content") or "").strip():
+                return True
+        elif isinstance(rt, str) and rt.strip():
+            return True
+    return False
+
+
+def is_substanceless_unsupported_block(block: Dict[str, Any]) -> bool:
+    """
+    未対応ページ要素のうち、保持すべき実質的情報（有効URL・添付実体・ラベル・キャプション・子要素）が
+    一切無い「実質的に無意味」な要素かを判定する。
+    """
+    if not is_unsupported_page_element_block(block):
+        return False
+
+    # 1. ローカル添付実体や子ブロックがある場合は意味ありとして保持
+    if block.get("_attachment_bytes") or block.get("_attachment_zip_entry"):
+        return False
+    if block.get("children_blocks"):
+        return False
+
+    b_type = str(block.get("type") or "")
+    data = block.get(b_type) if isinstance(block.get(b_type), dict) else {}
+
+    # 2. 有効な外部URLがある場合はリンク保持のため意味あり
+    raw_url = extract_block_url(block)
+    allow_notion = b_type == "bookmark"
+    if (
+        raw_url
+        and raw_url.lower().startswith(("http://", "https://"))
+        and not is_broken_or_placeholder_url(raw_url, allow_notion_page_url=allow_notion)
+    ):
+        return False
+
+    # 3. ユーザー入力ラベル・キャプション・リッチテキストがある場合は情報保持のため意味あり
+    raw_label = str(block.get("raw_label") or block.get("_display_name") or "").strip()
+    if raw_label and not is_broken_or_placeholder_url(raw_label, allow_notion_page_url=allow_notion):
+        return False
+    if _rich_text_has_content(data.get("caption")) or _rich_text_has_content(data.get("rich_text")):
+        return False
+    for title_key in ("title", "name", "text"):
+        val = data.get(title_key)
+        if isinstance(val, str) and val.strip() and not is_broken_or_placeholder_url(val):
+            return False
+
+    # 4. 上記すべてが空であれば、空ウィジェット残骸 / 空breadcrumb / 空button等として実質無意味と判定
+    return True
+
+
 def normalize_notion_block(block: Dict[str, Any]) -> Dict[str, Any]:
     """Notion APIから取得したブロックのうち、未対応外部アプリ・破損/空URLブロックを安全に正規化する。"""
     if not isinstance(block, dict):
