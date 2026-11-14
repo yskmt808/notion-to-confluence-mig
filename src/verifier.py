@@ -12,7 +12,12 @@ import urllib.parse
 import requests
 from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
-from src.extractor import PageNode, get_node_external_synced_blocks, is_unsupported_page_element_block
+from src.extractor import (
+    PageNode,
+    get_node_external_synced_blocks,
+    is_substanceless_unsupported_block,
+    is_unsupported_page_element_block,
+)
 from src.importer import ConfluenceClient
 
 logger = logging.getLogger(__name__)
@@ -234,13 +239,21 @@ class MigrationVerifier:
                 else:
                     issues.append("External file block detected in Notion, but link not found in Confluence.")
 
-        if "video" in block_types:
+        real_video_blocks = [
+            b for b in all_blocks
+            if b.get("type") == "video" and not is_unsupported_page_element_block(b)
+        ]
+        if real_video_blocks:
             if ('data-card-appearance="embed"' in storage_body or '<ac:structured-macro ac:name="multimedia"' in storage_body or '<ac:structured-macro ac:name="widget"' in storage_body or '<ac:link' in storage_body):
                 checks_passed.append("Video block converted to embedded card / multimedia player.")
             else:
                 issues.append("Video block detected in Notion, but embed/multimedia not found in Confluence.")
 
-        if "audio" in block_types:
+        real_audio_blocks = [
+            b for b in all_blocks
+            if b.get("type") == "audio" and not is_unsupported_page_element_block(b)
+        ]
+        if real_audio_blocks:
             if ('data-card-appearance="embed"' in storage_body or '<ac:structured-macro ac:name="multimedia"' in storage_body or '<ac:link' in storage_body):
                 checks_passed.append("Audio block converted to multimedia audio player / link.")
             else:
@@ -270,9 +283,17 @@ class MigrationVerifier:
 
         # 5-b. Notion固有・未対応要素（外部アプリ連携埋め込み・破損URLフォールバック含む）の検知と記録
         unsupported_blocks = [b for b in all_blocks if is_unsupported_page_element_block(b)]
-        if unsupported_blocks:
+        substanceless_blocks = [b for b in unsupported_blocks if is_substanceless_unsupported_block(b)]
+        meaningful_unsupported_blocks = [b for b in unsupported_blocks if not is_substanceless_unsupported_block(b)]
+
+        if substanceless_blocks:
+            checks_passed.append(
+                f"Substanceless unsupported Notion elements safely skipped ({len(substanceless_blocks)} item(s))."
+            )
+
+        if meaningful_unsupported_blocks:
             u_names = []
-            for ub in unsupported_blocks:
+            for ub in meaningful_unsupported_blocks:
                 svc = ub.get("service_name") or ub.get("_unsupported_service_name")
                 b_t = ub.get("type", "unsupported")
                 u_names.append(f"{b_t} ({svc})" if svc else str(b_t))
