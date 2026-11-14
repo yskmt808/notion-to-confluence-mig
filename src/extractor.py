@@ -3,13 +3,251 @@ Notion からページ、ブロック階層、データベースおよびレコ�
 """
 
 import logging
+import re
 import time
+import urllib.parse
 import requests
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from notion_client import Client
 
 logger = logging.getLogger(__name__)
+
+# 認証必須・直接ダウンロード不可の外部アプリ連携ドメイン定義
+# (ドメイン群, サービス表示名, 正規化後のブロック種別)
+EXTERNAL_APP_SERVICE_RULES: Tuple[Tuple[Tuple[str, ...], str, str], ...] = (
+    (("drive.google.com",), "Google Drive", "google_drive"),
+    (("docs.google.com",), "Google Docs", "google_drive"),
+    (("onedrive.live.com", "1drv.ms"), "OneDrive", "embed"),
+    (("sharepoint.com",), "SharePoint", "embed"),
+    (("dropbox.com", "dropboxusercontent.com"), "Dropbox", "embed"),
+    (("box.com", "app.box.com"), "Box", "embed"),
+    (("miro.com",), "Miro", "miro"),
+    (("trello.com",), "Trello", "trello"),
+    (("github.com", "gist.github.com"), "GitHub", "embed"),
+    (("slack.com",), "Slack", "embed"),
+)
+
+KNOWN_UNSUPPORTED_SERVICE_NAMES = frozenset(rule[1] for rule in EXTERNAL_APP_SERVICE_RULES)
+UNSUPPORTED_PAGE_ELEMENT_TYPES = frozenset({"breadcrumb", "unsupported", "button", "template"})
+
+
+def is_broken_or_placeholder_url(url: Optional[str], allow_notion_page_url: bool = False) -> bool:
+    """破損URL・プレースホルダーURL（空・#・app.notion.comundefined・undefined終端ホスト・不正app.notion.comパス等）を判定する。"""
+    if not url or not isinstance(url, str):
+        return True
+    s = url.strip()
+    if not s or s.startswith("#"):
+        return True
+    lower_s = s.lower()
+    if lower_s in ("undefined", "null", "none", "about:blank"):
+        return True
+    if lower_s.startswith(("javascript:", "vbscript:", "about:")):
+        return True
+
+    try:
+        parsed = urllib.parse.urlparse(s)
+    except Exception:
+        return True
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme in ("http", "https"):
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if not host:
+            return True
+        if host in ("undefined", "null", "none"):
+            return True
+        if host.endswith("undefined") or host.endswith("null"):
+            return True
+        if host == "app.notion.com" or host.endswith(".app.notion.com"):
+            path = (parsed.path or "").strip()
+            lower_path = path.lower()
+            lower_query = (parsed.query or "").lower()
+            if not path or path == "/":
+                return True
+            if "undefined" in lower_path or "null" in lower_path or "undefined" in lower_query:
+                return True
+            if not allow_notion_page_url:
+                if not path.startswith("/p/") and not path.startswith("/icons/"):
+                    return True
+    return False
+
+
+def classify_external_app_url(url: Optional[str]) -> Optional[Tuple[str, str]]:
+    """認証必須・外部アプリ連携ドメインのURLを判定し、(service_name, block_type) を返す。該当しない場合は None。"""
+    if not url or not isinstance(url, str):
+        return None
+    s = url.strip()
+    if not s.lower().startswith(("http://", "https://")):
+        return None
+    try:
+        hostname = (urllib.parse.urlparse(s).hostname or "").lower().rstrip(".")
+    except Exception:
+        return None
+    if not hostname:
+        return None
+    for domains, service_name, block_type in EXTERNAL_APP_SERVICE_RULES:
+        for domain in domains:
+            if hostname == domain or hostname.endswith("." + domain):
+                return service_name, block_type
+    return None
+
+
+def extract_block_url(block: Dict[str, Any]) -> str:
+    """ブロック辞書から代表URLを安全に取り出す（存在しない場合は空文字列）。"""
+    if not isinstance(block, dict):
+        return ""
+    b_type = block.get("type", "")
+    data = block.get(b_type)
+    if not isinstance(data, dict):
+        return ""
+    if isinstance(data.get("url"), str):
+        return data["url"].strip()
+    f_obj = data.get("file") or {}
+    if isinstance(f_obj, dict) and isinstance(f_obj.get("url"), str) and f_obj["url"].strip():
+        return f_obj["url"].strip()
+    e_obj = data.get("external") or {}
+    if isinstance(e_obj, dict) and isinstance(e_obj.get("url"), str) and e_obj["url"].strip():
+        return e_obj["url"].strip()
+    return ""
+
+
+def build_unsupported_external_embed_block(
+    block_id: str,
+    block_type: str = "unsupported",
+    service_name: str = "外部埋め込み / 未対応リンク",
+    url: str = "",
+    raw_label: str = "",
+    reason: str = "unsupported_external_embed",
+    caption: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """未対応外部アプリ埋め込み・破損プレースホルダーURL用の安全なブロック辞書を生成する。"""
+    safe_url = "" if is_broken_or_placeholder_url(url) else str(url).strip()
+    payload: Dict[str, Any] = {
+        "url": safe_url,
+        "caption": caption or [],
+    }
+    if block_type in ("file", "pdf"):
+        payload = {
+            "type": "external",
+            "caption": caption or [],
+            "external": {"url": safe_url} if safe_url else None,
+            "file": None,
+        }
+    return {
+        "id": block_id,
+        "type": block_type,
+        block_type: payload,
+        "_is_unsupported_external_embed": True,
+        "_attachment_uploaded": False,
+        "service_name": service_name,
+        "raw_label": raw_label or "",
+        "_unsupported_reason": reason,
+    }
+
+
+def is_unsupported_page_element_block(block: Dict[str, Any]) -> bool:
+    """Confluence側でネイティブ変換不可・フォールバック注記対象となる未対応ページ要素かを判定する。"""
+    if not isinstance(block, dict):
+        return False
+    b_type = block.get("type", "")
+    if b_type in UNSUPPORTED_PAGE_ELEMENT_TYPES or b_type == "google_drive":
+        return True
+    if block.get("_is_unsupported_external_embed"):
+        return True
+    url = extract_block_url(block)
+    if b_type in ("embed", "link_preview", "miro", "trello"):
+        if is_broken_or_placeholder_url(url) or classify_external_app_url(url) is not None:
+            return True
+    if b_type in ("file", "pdf"):
+        has_local_bytes = bool(block.get("_attachment_bytes") or block.get("_attachment_zip_entry"))
+        if not has_local_bytes and not block.get("_attachment_uploaded", True):
+            if is_broken_or_placeholder_url(url) or classify_external_app_url(url) is not None:
+                return True
+    return False
+
+
+def normalize_notion_block(block: Dict[str, Any]) -> Dict[str, Any]:
+    """Notion APIから取得したブロックのうち、未対応外部アプリ・破損/空URLブロックを安全に正規化する。"""
+    if not isinstance(block, dict):
+        return block
+    b_type = block.get("type", "")
+
+    if b_type == "google_drive":
+        gd = block.get("google_drive") if isinstance(block.get("google_drive"), dict) else {}
+        raw_url = gd.get("url") or (gd.get("external") or {}).get("url") or ""
+        safe_url = "" if is_broken_or_placeholder_url(raw_url) else raw_url.strip()
+        block["google_drive"] = {**gd, "url": safe_url}
+        block["_is_unsupported_external_embed"] = True
+        block["_attachment_uploaded"] = False
+        block["service_name"] = block.get("service_name") or "Google Drive"
+        block["raw_label"] = block.get("raw_label") or gd.get("title") or gd.get("name") or ""
+        block["_unsupported_reason"] = "external_app_auth_required" if safe_url else "broken_or_placeholder_url"
+        return block
+
+    if b_type == "unsupported":
+        u_data = block.get("unsupported") if isinstance(block.get("unsupported"), dict) else {}
+        raw_url = u_data.get("url") or ""
+        safe_url = "" if is_broken_or_placeholder_url(raw_url) else raw_url.strip()
+        block["unsupported"] = {**u_data, "url": safe_url}
+        block["_is_unsupported_external_embed"] = True
+        block["_attachment_uploaded"] = False
+        block["service_name"] = block.get("service_name") or "未対応独自機能 (Unsupported)"
+        block["_unsupported_reason"] = block.get("_unsupported_reason") or "notion_unsupported_block"
+        return block
+
+    if b_type in ("embed", "link_preview", "miro", "trello"):
+        data = block.get(b_type) if isinstance(block.get(b_type), dict) else {}
+        raw_url = data.get("url") or ""
+        if is_broken_or_placeholder_url(raw_url):
+            block[b_type] = {**data, "url": ""}
+            block["_is_unsupported_external_embed"] = True
+            block["_attachment_uploaded"] = False
+            block["service_name"] = block.get("service_name") or (
+                "Link Preview" if b_type == "link_preview" else "外部埋め込み (Embed)"
+            )
+            block["_unsupported_reason"] = "broken_or_placeholder_url"
+        else:
+            app_info = classify_external_app_url(raw_url)
+            if app_info:
+                svc_name, _ = app_info
+                block["_is_unsupported_external_embed"] = True
+                block["_attachment_uploaded"] = False
+                block["service_name"] = block.get("service_name") or svc_name
+                block["_unsupported_reason"] = "external_app_auth_required"
+        return block
+
+    if b_type in ("pdf", "file"):
+        if block.get("_attachment_bytes") or block.get("_attachment_zip_entry"):
+            return block
+        data = block.get(b_type) if isinstance(block.get(b_type), dict) else {}
+        f_obj = data.get("file") if isinstance(data.get("file"), dict) else {}
+        e_obj = data.get("external") if isinstance(data.get("external"), dict) else {}
+        target_url = (f_obj.get("url") or e_obj.get("url") or "").strip()
+        if is_broken_or_placeholder_url(target_url):
+            cleaned_data = dict(data)
+            if e_obj:
+                cleaned_data["external"] = {**e_obj, "url": ""}
+            if f_obj and is_broken_or_placeholder_url(f_obj.get("url")):
+                cleaned_data["file"] = {**f_obj, "url": ""}
+            block[b_type] = cleaned_data
+            block["_is_unsupported_external_embed"] = True
+            block["_attachment_uploaded"] = False
+            block["service_name"] = block.get("service_name") or (
+                "PDF埋め込み" if b_type == "pdf" else "ファイル埋め込み"
+            )
+            block["_unsupported_reason"] = "broken_or_placeholder_url"
+        else:
+            app_info = classify_external_app_url(target_url)
+            if app_info:
+                svc_name, _ = app_info
+                block["_is_unsupported_external_embed"] = True
+                block["_attachment_uploaded"] = False
+                block["service_name"] = block.get("service_name") or svc_name
+                block["_unsupported_reason"] = "external_app_auth_required"
+        return block
+
+    return block
 
 
 def _retry_notion_call(fn, max_retries: int = 4, base_delay: float = 1.0):
@@ -243,6 +481,7 @@ class NotionExtractor:
                         nested_blocks, nested_children = self._extract_blocks_and_children(b["id"], visited_synced)
                         b["children_blocks"] = nested_blocks
                         child_nodes.extend(nested_children)
+                    normalize_notion_block(b)
                     blocks.append(b)
 
             if not res.get("has_more"):
