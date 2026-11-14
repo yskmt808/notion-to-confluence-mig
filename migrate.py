@@ -426,7 +426,7 @@ def main():
         "--visibility",
         type=str,
         choices=["space", "private"],
-        default="space",
+        default=None,
         help="移行先ページの公開範囲 ('space' または 'private', デフォルト: 'space')",
     )
     parser.add_argument(
@@ -478,6 +478,10 @@ def main():
             args.confluence_parent_id = saved_source["confluence_parent_id"]
         if saved_source.get("page_workers") and args.page_workers == 8:
             args.page_workers = saved_source["page_workers"]
+        if not args.private and args.visibility is None and saved_source.get("private_mode"):
+            args.private = True
+            args.visibility = "private"
+            logging.info("[Resume] チェックポイントから private_mode=True (--visibility private) を自動復元しました。")
 
     # SIGINT/SIGTERM 安全中断ハンドラーの登録 (Task B.7)
     cancel_manager = CancellationManager(on_cancel_callback=lambda: checkpoint.mark_interrupted())
@@ -544,6 +548,9 @@ def main():
     title_prefix = args.title_prefix
     if title_prefix is None and (use_zip or args.new_tree):
         title_prefix = "[HTML] "
+
+    # 公開範囲（プライベートモード）の決定
+    private_mode = bool(args.private or args.visibility == "private")
 
     # タイムゾーンの解決（CLI引数指定 or ローカル環境自動判定）
     from src.timezone_util import resolve_timezone, get_local_timezone_name
@@ -681,6 +688,7 @@ def main():
         "confluence_parent_id": conf_parent_id,
         "space_key": conf_space,
         "page_workers": args.page_workers,
+        "private_mode": private_mode,
     }
     checkpoint.space_key = conf_space or ""
     checkpoint.parent_id = conf_parent_id
@@ -731,7 +739,7 @@ def main():
         dashboard=dashboard,
         user_mapper=user_mapper,
         metadata_template=meta_tpl,
-        private_mode=(args.private or args.visibility == "private"),
+        private_mode=private_mode,
         prune_blocks_on_pass2=(args.no_verify and not args.repair_inpage_links),
     )
 

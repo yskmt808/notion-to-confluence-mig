@@ -704,6 +704,7 @@ class ConfluenceClient:
             res = requests.get(url, auth=self.auth, timeout=15)
             if res.ok:
                 return res.json()
+            logger.warning(f"Failed to get current user: {res.status_code} - {res.text}")
         except Exception as e:
             logger.warning(f"Failed to get current user: {e}")
         return None
@@ -789,7 +790,13 @@ class ConfluenceImporter:
             current_user = self.client.get_current_user()
             if current_user:
                 self._current_user_account_id = current_user.get("accountId")
+            if self._current_user_account_id:
                 logger.info(f"Private mode active: Root page will be restricted to accountId: {self._current_user_account_id}")
+            else:
+                warn_msg = "Private mode active, but could not determine current user accountId. Will retry at root node creation."
+                logger.warning(warn_msg)
+                if self.telemetry:
+                    self.telemetry.record_warning(warn_msg)
         conv_kwargs = {"timezone": self.timezone, "user_mapper": self.user_mapper}
         if self.metadata_template is not None:
             conv_kwargs["metadata_template"] = self.metadata_template
@@ -1772,6 +1779,22 @@ class ConfluenceImporter:
                 break
         return is_untitled and not has_body and not has_props
 
+    def _apply_root_private_restriction(self, node: PageNode, confluence_page_id: str) -> None:
+        """private_mode 有効かつルートノードの場合、作成直後にプライベート閲覧・編集制限を適用する。"""
+        if not (self.private_mode and getattr(node, "_is_root", False)):
+            return
+        success = self.client.set_page_private(confluence_page_id, account_id=self._current_user_account_id)
+        if not success:
+            warn_msg = (
+                f"Failed to apply private restriction to root node [{node.title}] "
+                f"(Confluence ID: {confluence_page_id}). Continuing migration with default space permissions."
+            )
+            logger.warning(warn_msg)
+            if self.telemetry:
+                self.telemetry.record_warning(warn_msg)
+            if self.dashboard:
+                self.dashboard.record_warning(f"Private restriction failed: {node.title}")
+
     def _import_node_recursive(
         self,
         node: PageNode,
@@ -1972,6 +1995,9 @@ class ConfluenceImporter:
                     confluence_page_id = res["id"]
                     webui = res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{confluence_page_id}")
                     confluence_url = f"{self.client.base_url}{webui}"
+
+            # プライベート移行モード（DBルート作成直後の即時ロック）
+            self._apply_root_private_restriction(node, confluence_page_id)
 
             # 3.5. 単一選択・複数選択プロパティの設定を反映（ステータス等はsingle-select、カテゴリ等はmulti-select）
             single_props, multi_props = self.converter.get_select_field_configurations(node)
@@ -2186,8 +2212,6 @@ class ConfluenceImporter:
                     )
             if self.dashboard:
                 self.dashboard.record_pass1_done(node.title, node_type="database")
-            if self.private_mode and getattr(node, "_is_root", False):
-                self.client.set_page_private(confluence_page_id, account_id=self._current_user_account_id)
             return confluence_page_id
 
         target_title, existing_page = self._resolve_unique_page_title(
@@ -2199,6 +2223,8 @@ class ConfluenceImporter:
 
         if existing_page and overwrite:
             confluence_page_id = existing_page["id"]
+            # プライベート移行モード（既存ルート上書き前の即時ロック）
+            self._apply_root_private_restriction(node, confluence_page_id)
             # カバー画像・添付ファイル処理（既存ページIDを利用）
             self._process_cover(node, confluence_page_id)
             if node.blocks:
@@ -2237,6 +2263,8 @@ class ConfluenceImporter:
                 parent_id=parent_id,
                 overwrite=False,
             )
+            # プライベート移行モード（dummy_body 作成直後・添付/本文更新前の即時ロック）
+            self._apply_root_private_restriction(node, confluence_page_id)
             self._process_cover(node, confluence_page_id)
             if node.blocks:
                 self._process_attachments(node.blocks, confluence_page_id)
@@ -2265,10 +2293,6 @@ class ConfluenceImporter:
         # ページ絵文字アイコンの設定
         if node.icon:
             self.client.set_page_emoji(confluence_page_id, node.icon)
-
-        # プライベート移行モード（ルートページへの閲覧・編集制限適用）
-        if self.private_mode and getattr(node, "_is_root", False):
-            self.client.set_page_private(confluence_page_id, account_id=self._current_user_account_id)
 
         # データベース行の場合、Page Properties Reportマクロ連動用のラベルを付与
         if node.node_type == "database_row":
