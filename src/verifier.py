@@ -12,7 +12,7 @@ import urllib.parse
 import requests
 from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
-from src.extractor import PageNode
+from src.extractor import PageNode, get_node_external_synced_blocks
 from src.importer import ConfluenceClient
 
 logger = logging.getLogger(__name__)
@@ -259,6 +259,15 @@ class MigrationVerifier:
             else:
                 issues.append(f"Unsupported Notion blocks detected ({', '.join(u_names)}), but fallback note was not found in Confluence body.")
 
+        # 5-b2. HTMLエクスポート未収録・未展開の外部同期ブロック検知
+        ext_synced = get_node_external_synced_blocks(node)
+        if ext_synced:
+            refs = [item["synced_from"] for item in ext_synced if item.get("synced_from")]
+            ref_suffix = f" [同期元: {', '.join(refs[:3])}]" if refs else ""
+            warnings.append(
+                f"HTMLエクスポート未収録・未展開の外部同期ブロックを検出しました ({len(ext_synced)} 件){ref_suffix}"
+            )
+
         # 5-c. ページ内リンク（アンカー指定または自ページへのリンク）において、カスタムリンク名がページタイトルで上書きされる不正なインラインスマートカードの検知
         def _is_self_page_title(target_t: str, ref_t: str) -> bool:
             if not target_t or not ref_t:
@@ -314,6 +323,7 @@ class MigrationVerifier:
         node.blocks = []
         node.properties = {}
         node.comments = []
+        node.external_synced_blocks = []
         return {
             "page_id": confluence_page_id,
             "title": node.title,
@@ -452,6 +462,7 @@ class MigrationVerifier:
         node.blocks = []
         node.properties = {}
         node.comments = []
+        node.external_synced_blocks = []
         return {
             "page_id": confluence_db_id,
             "title": node.title,

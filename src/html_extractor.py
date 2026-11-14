@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple, Union
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-from src.extractor import PageNode
+from src.extractor import PageNode, collect_external_synced_blocks_from_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +445,12 @@ class HtmlZipExtractor:
                     if users_list:
                         page_last_edited_by = users_list[0]
 
+        ext_synced = collect_external_synced_blocks_from_blocks(blocks)
+        if ext_synced:
+            logger.warning(
+                f"External/unexpanded synced_block detected in [{title}] ({node_id}): {len(ext_synced)} block(s)"
+            )
+
         node = PageNode(
             id=node_id,
             title=title,
@@ -457,6 +463,7 @@ class HtmlZipExtractor:
             comments=comments,
             created_by=page_created_by,
             last_edited_by=page_last_edited_by,
+            external_synced_blocks=ext_synced,
         )
 
         # BeautifulSoup DOMツリーを明示的に破棄して循環参照を切り離す
@@ -815,6 +822,12 @@ class HtmlZipExtractor:
                     elif hp_type == "last_edited_by" and users_list and not row_last_edited_by:
                         row_last_edited_by = users_list[0]
 
+            row_ext_synced = collect_external_synced_blocks_from_blocks(row_blocks)
+            if row_ext_synced:
+                logger.warning(
+                    f"External/unexpanded synced_block detected in DB row [{row_title}] ({row_id}): {len(row_ext_synced)} block(s)"
+                )
+
             row_node = PageNode(
                 id=row_id,
                 title=row_title,
@@ -827,6 +840,7 @@ class HtmlZipExtractor:
                 comments=row_comments,
                 created_by=row_created_by,
                 last_edited_by=row_last_edited_by,
+                external_synced_blocks=row_ext_synced,
             )
             db_node.children.append(row_node)
             if idx % 500 == 0:
@@ -1880,14 +1894,21 @@ class HtmlZipExtractor:
                             logger.warning(f"Image attachment not found in ZIP: src='{src}'")
                         blocks.append(block_obj)
 
-            # 16. 同期ブロックやネストされたラッパー (div / section または内部にブロック要素を内包する要素)
+            # 16. 同期ブロック（内容欠落・外部参照のみの未収録検知）およびネストされたラッパー
+            elif (ext_sync_block := self._detect_external_synced_block(el, el_id)) is not None:
+                blocks.append(ext_sync_block)
+
             elif (
                 any(self._is_block_tag(sub) for sub in el.children if isinstance(sub, Tag))
                 or (
                     tag in ("div", "section")
                     and "column-list" not in classes
                     and "column" not in classes
-                    and any(self._is_block_tag(sub) for sub in el.find_all() if isinstance(sub, Tag))
+                    and any(
+                        self._is_block_tag(sub) or sub.name.lower() == "p"
+                        for sub in el.find_all()
+                        if isinstance(sub, Tag)
+                    )
                 )
             ):
                 sub_blocks = self._parse_elements_to_blocks(el, zf, current_dir, db_csv_map=db_csv_map)
@@ -1905,6 +1926,117 @@ class HtmlZipExtractor:
                     })
 
         return blocks
+
+    _STRUCTURAL_DIV_CLASSES = frozenset({
+        "page-body", "column-list", "column_list", "column", "indented",
+        "collection-content", "collection-content-wrapper", "icon",
+        "checkbox", "user", "properties", "table-of-contents",
+        "table_of_contents", "link-to-page", "source", "file", "pdf",
+        "bookmark", "image", "callout",
+    })
+    _SYNCED_MARKER_CLASSES = frozenset({"synced-block", "synced_block", "notion-synced-block"})
+    _SYNC_CONTENT_TAGS = (
+        "img", "video", "audio", "iframe", "svg", "hr", "table", "figure",
+        "aside", "pre", "ul", "ol", "details", "blockquote", "h1", "h2",
+        "h3", "p", "nav", "a", "input", "canvas",
+    )
+    _SYNC_BLOCK_CONTENT_TAGS = (
+        "img", "video", "audio", "iframe", "svg", "hr", "table", "figure",
+        "aside", "pre", "ul", "ol", "details", "blockquote", "h1", "h2",
+        "h3", "nav", "input", "canvas",
+    )
+
+    @classmethod
+    def _has_synced_marker(cls, node: Tag) -> bool:
+        raw_cls = node.get("class") or []
+        cls_list = [raw_cls] if isinstance(raw_cls, str) else raw_cls
+        if any(c in cls._SYNCED_MARKER_CLASSES for c in cls_list):
+            return True
+        if node.has_attr("data-notion-synced-block") or node.has_attr("data-synced-from"):
+            return True
+        return node.get("data-block-type") == "synced_block"
+
+    @staticmethod
+    def _extract_sync_ref_from_attrs(el: Tag) -> Optional[str]:
+        candidates = [el] + [d for d in el.find_all(["div", "section"]) if isinstance(d, Tag)]
+        for node in candidates:
+            ref = node.get("data-synced-from")
+            if isinstance(ref, str) and ref.strip():
+                return ref.strip()
+            attr_val = node.get("data-notion-synced-block")
+            if isinstance(attr_val, str) and attr_val.strip() and attr_val.strip().lower() not in ("true", "false", "1", "0"):
+                return attr_val.strip()
+        return None
+
+    def _detect_external_synced_block(self, el: Tag, default_id: str) -> Optional[Dict[str, Any]]:
+        """HTMLエクスポート内で本文が欠落または外部参照のみの同期ブロックを検出する。
+        正常に本文が展開済みの同期ブロック（コールアウトや段落等を内包）は None を返し誤検知しない。
+        """
+        if not isinstance(el, Tag) or not el.name or el.name.lower() not in ("div", "section"):
+            return None
+
+        raw_cls = el.get("class") or []
+        classes = [raw_cls] if isinstance(raw_cls, str) else raw_cls
+        if any(c in self._STRUCTURAL_DIV_CLASSES for c in classes):
+            return None
+
+        has_marker = self._has_synced_marker(el) or any(
+            self._has_synced_marker(d) for d in el.find_all(["div", "section"]) if isinstance(d, Tag)
+        )
+        sync_ref_attr = self._extract_sync_ref_from_attrs(el)
+        is_empty = not el.get_text(strip=True) and el.find(self._SYNC_CONTENT_TAGS) is None
+
+        detected = False
+        sync_ref = sync_ref_attr
+        reason = "missing_content"
+
+        if is_empty:
+            is_notion_wrapper = (
+                has_marker
+                or el.get("dir") == "auto"
+                or bool(el.get("id") and UUID_PATTERN.search(str(el.get("id"))))
+            )
+            if is_notion_wrapper:
+                detected = True
+                reason = "external_reference_only" if sync_ref else "missing_content"
+        elif has_marker and el.find(self._SYNC_BLOCK_CONTENT_TAGS) is None:
+            links = el.find_all("a")
+            if links:
+                link_text = "".join(a.get_text(strip=True) for a in links)
+                if el.get_text(strip=True) == link_text:
+                    href = links[0].get("href") or ""
+                    if sync_ref_attr or "notion.so" in href or "notion.site" in href or links[0].get("data-notion-page-id"):
+                        detected = True
+                        reason = "external_reference_only"
+                        if not sync_ref:
+                            sync_ref = links[0].get("data-notion-page-id") or href or None
+
+        if not detected:
+            return None
+
+        block_id = el.get("id")
+        if not block_id:
+            for d in el.find_all(["div", "section"]):
+                if isinstance(d, Tag) and d.get("id"):
+                    block_id = d.get("id")
+                    break
+        block_id = block_id or default_id
+
+        warn_msg = (
+            "外部同期ブロックの本文がHTMLエクスポートに含まれていません"
+            + (f" (同期元: {sync_ref})" if sync_ref else " (同期元がエクスポート対象外または未展開)")
+        )
+        return {
+            "id": block_id,
+            "type": "synced_block",
+            "synced_block": {
+                "synced_from": {"type": "block_id", "block_id": sync_ref} if sync_ref else None,
+            },
+            "children_blocks": [],
+            "_is_external_synced_block": True,
+            "_external_synced_reason": reason,
+            "_external_synced_warning": warn_msg,
+        }
 
     def _is_block_tag(self, node: Tag) -> bool:
         """与えられたHTML要素がブロック要素（リスト・コールアウト・画像・テーブル・コード等）であるかを判定する。"""
@@ -2081,7 +2213,10 @@ class HtmlZipExtractor:
                     elif self._is_block_tag(child):
                         block_container.append(copy.copy(child))
                     elif c_name == "div":
-                        _process_nodes(list(child.children))
+                        if self._detect_external_synced_block(child, child.get("id") or "callout_sync") is not None:
+                            block_container.append(copy.copy(child))
+                        else:
+                            _process_nodes(list(child.children))
                     else:
                         if not first_p_consumed and not block_container.contents:
                             inline_container.append(copy.copy(child))

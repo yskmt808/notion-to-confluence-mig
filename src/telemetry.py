@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from collections import Counter
 
+from src.extractor import get_node_external_synced_blocks
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +49,7 @@ class SanitizedTelemetry:
         self.warnings: List[str] = []
         self.errors: List[Dict[str, Any]] = []
         self.unsupported_elements: List[str] = []
+        self.external_synced_blocks_count: int = 0
 
         # ノード構造の抽象化サマリー（タイトル等の機密を含まない）
         self.tree_summary: Dict[str, Any] = {
@@ -127,6 +130,16 @@ class SanitizedTelemetry:
                 if b_type in ("breadcrumb", "unsupported", "button", "template"):
                     if b_type not in self.unsupported_elements:
                         self.unsupported_elements.append(b_type)
+
+            ext_blocks = get_node_external_synced_blocks(n)
+            if ext_blocks:
+                self.external_synced_blocks_count += len(ext_blocks)
+                for ext in ext_blocks:
+                    sync_ref = ext.get("synced_from")
+                    ref_info = f", synced_from={sync_ref}" if sync_ref else ""
+                    self.record_warning(
+                        f"External/unexpanded synced_block detected in {n.node_type} {n.id}{ref_info}"
+                    )
 
             for c in getattr(n, "children", []):
                 traverse(c, d + 1)
@@ -236,6 +249,7 @@ class SanitizedTelemetry:
                 "block_types_distribution": dict(self.block_types_counter),
                 "confluence_macros_distribution": dict(self.confluence_macros_counter),
                 "unsupported_elements_detected": self.unsupported_elements,
+                "external_synced_blocks_count": self.external_synced_blocks_count,
                 "http_summary": http_summary,
             },
             "warnings_count": self.total_warnings_count,
@@ -328,6 +342,9 @@ class SanitizedTelemetry:
 
         if data["warnings_count"] > 0:
             md.append(f"## ⚠️ 警告サマリー ({data['warnings_count']} 件)")
+            ext_sync_cnt = diag.get("external_synced_blocks_count", 0)
+            if ext_sync_cnt > 0:
+                md.append(f"- **HTMLエクスポート未収録の外部同期ブロック**: {ext_sync_cnt} 件")
             for w in data["warnings_sample"]:
                 md.append(f"- {w}")
             md.append("")

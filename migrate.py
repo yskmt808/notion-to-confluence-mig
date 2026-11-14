@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import glob
-from src.extractor import NotionExtractor, PageNode
+from src.extractor import NotionExtractor, PageNode, get_node_external_synced_blocks
 from src.html_extractor import HtmlZipExtractor, MultiZipExtractor
 from src.importer import ConfluenceImporter
 from src.verifier import MigrationVerifier
@@ -173,14 +173,55 @@ def print_tree_summary(root: PageNode, verbose: bool = False, show_all: bool = F
     print("")
 
 
+def collect_external_synced_pages(root: PageNode) -> Tuple[int, List[Tuple[PageNode, List[Dict[str, Any]]]]]:
+    """ツリー全体からHTML未収録の外部同期ブロックを含むページ一覧と総件数を収集する。"""
+    total_count = 0
+    affected_pages: List[Tuple[PageNode, List[Dict[str, Any]]]] = []
+
+    def _traverse(n: PageNode):
+        nonlocal total_count
+        ext_blocks = get_node_external_synced_blocks(n)
+        if ext_blocks:
+            total_count += len(ext_blocks)
+            affected_pages.append((n, ext_blocks))
+        for c in n.children:
+            _traverse(c)
+
+    _traverse(root)
+    return total_count, affected_pages
+
+
+def print_dry_run_summary(tree: PageNode, telemetry: SanitizedTelemetry):
+    """ドライラン結果サマリー（WARNING件数・外部同期ブロック検出ページ一覧）を表示する。"""
+    ext_total, affected_pages = collect_external_synced_pages(tree)
+    warning_count = telemetry.total_warnings_count
+
+    print("--------------------------------------------------")
+    print(f"ドライラン結果サマリー: WARNING {warning_count} 件")
+    if ext_total > 0:
+        print(
+            f"⚠️ HTMLエクスポート未収録の外部同期ブロックを {ext_total} 件検出しました"
+            f"（対象ページ: {len(affected_pages)} 件）:"
+        )
+        for node, ext_blocks in affected_pages:
+            print(f"  - [{node.node_type}] {node.title} (ID: {node.id}): {len(ext_blocks)} 件")
+            for item in ext_blocks:
+                msg = item.get("message")
+                if msg:
+                    print(f"      ⚠️ {msg}")
+
+
 def print_verification_results(verify_results: List[Dict[str, Any]], verbose: bool = False, show_all: bool = False):
     """整合性検証結果をサマライズ表示する。"""
     pass_count = sum(1 for r in verify_results if r["status"] == "PASS")
     warn_count = sum(1 for r in verify_results if r["status"] == "WARN")
     fail_count = sum(1 for r in verify_results if r["status"] == "FAIL")
+    total_warning_items = sum(len(r.get("warnings", [])) for r in verify_results)
 
     print("--------------------------------------------------")
     print(f"検証サマリー: 合計 {len(verify_results)} ページ | 正常: {pass_count} | 警告: {warn_count} | 失敗: {fail_count}")
+    if total_warning_items > 0:
+        print(f"  ⚠️ 検出された警告詳細: {total_warning_items} 件")
 
     threshold = 25
     if len(verify_results) <= threshold or verbose or show_all:
@@ -699,6 +740,7 @@ def main():
     if args.dry_run:
         if homonym_warnings:
             print_homonym_warnings(homonym_warnings)
+        print_dry_run_summary(tree, telemetry)
         print("💡 DRY RUN モードのため、Confluence への移行はスキップされました。")
         if args.generate_debug_report:
             json_p = os.path.join(args.debug_report_dir, "debug_report.json")
