@@ -445,6 +445,69 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         self.assertIn("確認・対応が必要なページ (1 件)", output)
         self.assertIn("移行成果サマリー (合計: 30 件)", output)
 
+    def test_zip_open_failure_halts_with_error_without_api_fallback(self):
+        """TCK_00015: --zip / --zip-dir で指定したZIPが開けない場合、Notion APIへフォールバックせず ERROR 終了すること"""
+        api_env = dict(
+            self.CONFLUENCE_ENV,
+            NOTION_TOKEN="ntn_should_never_be_used",
+            NOTION_PARENT_PAGE_ID="page-should-never-be-used",
+        )
+        valid_zip = os.path.join(self.tmpdir, "valid.zip")
+        _create_minimal_zip(valid_zip, "Valid Page")
+        missing_zip = os.path.join(self.tmpdir, "missing.zip")
+        corrupt_zip = os.path.join(self.tmpdir, "corrupt.zip")
+        with open(corrupt_zip, "wb") as f:
+            f.write(b"not-a-zip")
+        empty_dir = os.path.join(self.tmpdir, "empty_zips")
+        os.makedirs(empty_dir, exist_ok=True)
+        missing_dir = os.path.join(self.tmpdir, "missing_zips")
+
+        cases = [
+            (["--zip", missing_zip, "--dry-run"], "not found / missing --zip"),
+            (["--zip", corrupt_zip, "--dry-run"], "corrupted --zip"),
+            (["--zip", valid_zip, missing_zip, "--dry-run"], "mixed valid and missing --zip"),
+            (["--zip", empty_dir, "--dry-run"], "directory passed to --zip"),
+            (["--zip-dir", missing_dir, "--dry-run"], "missing --zip-dir"),
+            (["--zip-dir", empty_dir, "--dry-run"], "empty --zip-dir"),
+        ]
+
+        for argv, label in cases:
+            with self.subTest(case=label):
+                with patch("migrate.NotionExtractor") as mock_notion_ext, \
+                     patch("migrate.ConfluenceImporter") as mock_importer:
+                    with self.assertRaises(SystemExit) as cm:
+                        self._run_main(argv, env=api_env)
+                    self.assertEqual(cm.exception.code, 1)
+                    mock_notion_ext.assert_not_called()
+                    mock_importer.assert_not_called()
+
+        # chmod 000 による権限エラー (非root環境)
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            unreadable_zip = os.path.join(self.tmpdir, "unreadable.zip")
+            _create_minimal_zip(unreadable_zip, "Secret")
+            os.chmod(unreadable_zip, 0o000)
+            try:
+                with patch("migrate.NotionExtractor") as mock_notion_ext:
+                    with self.assertRaises(SystemExit) as cm:
+                        self._run_main(["--zip", unreadable_zip, "--dry-run"], env=api_env)
+                    self.assertEqual(cm.exception.code, 1)
+                    mock_notion_ext.assert_not_called()
+            finally:
+                os.chmod(unreadable_zip, 0o600)
+
+        # --resume で復元された zip_paths が消滅している場合も API フォールバックせず ERROR 停止
+        cp_path = os.path.join(self.tmpdir, "cp_missing_zip.json")
+        cp = MigrationCheckpoint(checkpoint_path=cp_path)
+        cp.status = "interrupted"
+        cp.source_info = {"zip_paths": [missing_zip]}
+        cp.save()
+
+        with patch("migrate.NotionExtractor") as mock_notion_ext:
+            with self.assertRaises(SystemExit) as cm:
+                self._run_main(["--resume", "--checkpoint", cp_path, "--dry-run"], env=api_env)
+            self.assertEqual(cm.exception.code, 1)
+            mock_notion_ext.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

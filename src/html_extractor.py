@@ -342,6 +342,10 @@ class HtmlZipExtractor:
         self.global_db_csv_map = global_db_csv_map or {}
         if not os.path.exists(self.zip_path):
             raise FileNotFoundError(f"Export zip file not found: {self.zip_path}")
+        if not os.path.isfile(self.zip_path):
+            raise IsADirectoryError(f"Export zip path is not a file: {self.zip_path}")
+        with zipfile.ZipFile(self.zip_path, "r"):
+            pass
 
     def extract_tree(self) -> PageNode:
         """ZIPファイル全体を解析し、ルートPageNodeを返す。"""
@@ -2788,10 +2792,19 @@ class MultiZipExtractor:
     """複数のNotion HTML/CSVエクスポートZIPファイルを並行解析し、統合PageNodeツリーを構築するクラス。"""
 
     def __init__(self, zip_paths: List[str], root_title: str = "【統合移行】マルチブロック移行ルート"):
-        self.zip_paths = [p for p in zip_paths if os.path.exists(p)]
-        self.root_title = root_title
-        if not self.zip_paths:
+        if not zip_paths:
             raise FileNotFoundError("有効なZIPファイルが1つも指定されていません。")
+        validated_paths: List[str] = []
+        for p in zip_paths:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"指定されたZIPファイルが見つかりません: {p}")
+            if not os.path.isfile(p):
+                raise IsADirectoryError(f"指定されたZIPパスはファイルではありません: {p}")
+            with zipfile.ZipFile(p, "r"):
+                pass
+            validated_paths.append(p)
+        self.zip_paths = validated_paths
+        self.root_title = root_title
 
     def extract_tree(self) -> PageNode:
         """全ZIPファイルを並行パースし、相互依存関係を内包する単一の統合PageNodeツリーを返す。"""
@@ -2814,7 +2827,8 @@ class MultiZipExtractor:
                                 global_db_csv_map[db_id] = f
                             global_db_csv_map[os.path.splitext(f)[0]] = f
             except Exception as e:
-                logger.warning(f"ZIP事前スキャン警告 ({z_path}): {e}")
+                logger.error(f"ZIP事前スキャンエラー ({z_path}): {e}")
+                raise
 
         logger.info(f"検出されたグローバルDB定義数: {len(global_db_csv_map)} 件")
 

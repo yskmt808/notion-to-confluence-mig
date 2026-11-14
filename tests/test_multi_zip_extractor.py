@@ -47,20 +47,44 @@ class TestMultiZipExtractor(unittest.TestCase):
     def test_single_zip_delegates_directly_without_virtual_root(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             z1 = os.path.join(tmpdir, "part1.zip")
-            missing = os.path.join(tmpdir, "does_not_exist.zip")
             _write_notion_zip(
                 z1,
                 "Solo Root 11111111111111111111111111111111.html",
                 "Solo Root",
             )
 
-            # 存在しないパスが混在しても存在する単一ZIPのみを採用し、そのまま委譲する
-            extractor = MultiZipExtractor([z1, missing])
+            extractor = MultiZipExtractor([z1])
             self.assertEqual(extractor.zip_paths, [z1])
 
             root = extractor.extract_tree()
             self.assertEqual(root.title, "Solo Root")
             self.assertNotEqual(root.id, "multi_block_root_page")
+
+    def test_missing_or_corrupted_zip_raises_error_instead_of_ignoring(self):
+        """TCK_00015: 存在しないZIP・破損ZIP・ディレクトリ混在時は無視せず明示的に例外送出すること"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            z1 = os.path.join(tmpdir, "part1.zip")
+            _write_notion_zip(
+                z1,
+                "Solo Root 11111111111111111111111111111111.html",
+                "Solo Root",
+            )
+            missing = os.path.join(tmpdir, "does_not_exist.zip")
+            corrupted = os.path.join(tmpdir, "corrupted.zip")
+            with open(corrupted, "wb") as f:
+                f.write(b"this is not a valid zip archive")
+
+            with self.assertRaises(FileNotFoundError):
+                MultiZipExtractor([z1, missing])
+
+            with self.assertRaises(zipfile.BadZipFile):
+                MultiZipExtractor([corrupted])
+
+            with self.assertRaises(zipfile.BadZipFile):
+                MultiZipExtractor([z1, corrupted])
+
+            with self.assertRaises(IsADirectoryError):
+                MultiZipExtractor([tmpdir])
 
     def test_multiple_zips_build_sorted_integrated_tree_and_summary_blocks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
