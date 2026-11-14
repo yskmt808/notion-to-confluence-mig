@@ -252,17 +252,31 @@ class NotionToConfluenceConverter:
                 badges.append(_render_badge(str(val), color))
             return " ".join(badges) if badges else "-"
 
-        elif p_type == "date":
-            start = prop.get("start") or (prop.get("date") or {}).get("start") or prop.get("value")
+        elif p_type in ("date", "created_time", "last_edited_time"):
+            start = prop.get("start") or prop.get(p_type) or (prop.get("date") or {}).get("start") or prop.get("value")
             end = prop.get("end") or (prop.get("date") or {}).get("end")
             if not start:
                 return "-"
-            clean_start = str(start).split("T")[0]
             from src.timezone_util import format_iso_datetime
-            start_time_str = f" {format_iso_datetime(start, tz=self.timezone, fmt='%H:%M %Z')}" if "T" in str(start) else ""
+
+            def _fmt_dt_piece(raw_dt: Any, shift_date_for_tz: bool = False) -> Tuple[str, str]:
+                s_dt = str(raw_dt).strip()
+                has_tz = bool(re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", s_dt, re.IGNORECASE))
+                if "T" in s_dt:
+                    if has_tz:
+                        d_part = format_iso_datetime(s_dt, tz=self.timezone, fmt="%Y-%m-%d") if shift_date_for_tz else s_dt.split("T")[0]
+                        t_part = f" {format_iso_datetime(s_dt, tz=self.timezone, fmt='%H:%M %Z')}"
+                        return d_part, t_part
+                    d_part, rest = s_dt.split("T", 1)
+                    m_hm = re.match(r"(\d{2}:\d{2})", rest)
+                    t_part = f" {m_hm.group(1)}" if m_hm else ""
+                    return d_part, t_part
+                return s_dt, ""
+
+            shift_date = p_type in ("created_time", "last_edited_time")
+            clean_start, start_time_str = _fmt_dt_piece(start, shift_date_for_tz=shift_date)
             if end:
-                clean_end = str(end).split("T")[0]
-                end_time_str = f" {format_iso_datetime(end, tz=self.timezone, fmt='%H:%M %Z')}" if "T" in str(end) else ""
+                clean_end, end_time_str = _fmt_dt_piece(end, shift_date_for_tz=shift_date)
                 return f'<time datetime="{clean_start}" />{start_time_str} 〜 <time datetime="{clean_end}" />{end_time_str}'
             return f'<time datetime="{clean_start}" />{start_time_str}'
 
@@ -1630,19 +1644,45 @@ class NotionToConfluenceConverter:
                 if v:
                     vals.append(str(v))
             return "|".join(vals) if vals else ""
-        elif p_type == "date":
-            start = prop.get("start") or (prop.get("date") or {}).get("start") or prop.get("value")
+        elif p_type in ("date", "created_time", "last_edited_time"):
+            start = prop.get("start") or prop.get(p_type) or (prop.get("date") or {}).get("start") or prop.get("value")
             if not start:
                 return ""
-            return str(start).split("T")[0]
+            s_val = str(start).strip()
+            if re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", s_val, re.IGNORECASE):
+                from src.timezone_util import format_iso_datetime
+                return format_iso_datetime(s_val, tz=self.timezone, fmt="%Y-%m-%d")
+            if re.match(r"^\d{4}-\d{2}-\d{2}", s_val):
+                return s_val.split("T")[0][:10]
+            from src.html_extractor import _parse_date_string
+            parsed_d = _parse_date_string(s_val)
+            return parsed_d if parsed_d else s_val.split("T")[0]
         elif p_type == "checkbox":
-            return "完了" if prop.get("value") else "未完了"
+            val = prop.get("value") if "value" in prop else prop.get("checkbox")
+            if val is None:
+                return ""
+            if isinstance(val, bool):
+                return "true" if val else "false"
+            if isinstance(val, str):
+                v_low = val.strip().lower()
+                if v_low in ("true", "yes", "1", "☑", "✅"):
+                    return "true"
+                if v_low in ("false", "no", "0", "⬜", "☐"):
+                    return "false"
+                if not v_low:
+                    return ""
+            return "true" if val else "false"
         elif p_type == "url":
-            val = prop.get("value")
+            val = prop.get("value") or prop.get("url")
             return str(val) if val else ""
         elif p_type == "number":
-            val = prop.get("value")
-            return str(val) if val is not None else ""
+            val = prop.get("value") if prop.get("value") is not None else prop.get("number")
+            if val is None or val == "":
+                return ""
+            s_num = str(val).strip()
+            if re.match(r"^[+-]?(?:0|[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d*)(?:\.\d+)?$", s_num):
+                return s_num.replace(",", "")
+            return s_num
         elif p_type in ("people", "created_by", "last_edited_by"):
             users = prop.get("users") or ([prop[p_type]] if isinstance(prop.get(p_type), dict) and prop[p_type] else [])
             if self.user_mapper and self.user_mapper.mappings:
@@ -1688,7 +1728,7 @@ class NotionToConfluenceConverter:
     def get_select_field_configurations(self, db_node: PageNode) -> Tuple[List[str], List[str]]:
         """
         データベースノードから、単一選択 (single-select) と複数選択 (multi-select) のフィールド名を分類して返す。
-        - single_select: select, status, checkbox
+        - single_select: select, status
         - multi_select: multi_select
         全レコードの値を検証し、改行が含まれる列やキーカラムは除外する。
         """
@@ -1707,7 +1747,7 @@ class NotionToConfluenceConverter:
                 p_type = p_info.get("type", "")
                 if p_name == key_col_name or p_type == "title":
                     continue
-                if p_type in ("status", "select", "checkbox"):
+                if p_type in ("status", "select"):
                     single_select.append(p_name)
                 elif p_type == "multi_select":
                     multi_select.append(p_name)
@@ -1735,7 +1775,7 @@ class NotionToConfluenceConverter:
             for p_name, p_type in col_types.items():
                 if p_name in col_has_multiline or p_name == key_col_name:
                     continue
-                if p_type in ("status", "select", "checkbox"):
+                if p_type in ("status", "select"):
                     single_select.append(p_name)
                 elif p_type == "multi_select":
                     multi_select.append(p_name)
@@ -1770,9 +1810,11 @@ class NotionToConfluenceConverter:
                 p_type = p_info.get("type", "rich_text")
                 if p_name == key_col_name or p_type == "title":
                     continue
-                if p_type in ("select", "status", "multi_select", "checkbox"):
+                if p_type in ("select", "status", "multi_select"):
                     conf_type = "tag"
-                elif p_type == "date":
+                elif p_type == "checkbox":
+                    conf_type = "checkbox"
+                elif p_type in ("date", "created_time", "last_edited_time"):
                     conf_type = "date"
                 elif p_type == "number":
                     conf_type = "number"
@@ -1816,9 +1858,11 @@ class NotionToConfluenceConverter:
                 p_type = col_types.get(p_name, "text")
                 if p_name in col_has_multiline:
                     conf_type = "text"
-                elif p_type in ("select", "status", "multi_select", "checkbox"):
+                elif p_type in ("select", "status", "multi_select"):
                     conf_type = "tag"
-                elif p_type == "date":
+                elif p_type == "checkbox":
+                    conf_type = "checkbox"
+                elif p_type in ("date", "created_time", "last_edited_time"):
                     conf_type = "date"
                 elif p_type == "number":
                     conf_type = "number"

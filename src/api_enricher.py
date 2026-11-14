@@ -365,6 +365,15 @@ class NotionApiEnricher:
                                 p_type: u_copy,
                                 "value": u_copy.get("name", ""),
                             }
+                        elif p_type in ("created_time", "last_edited_time"):
+                            ts_val = col_val.get(p_type)
+                            if ts_val:
+                                target_row.properties[col_name] = {
+                                    "type": p_type,
+                                    p_type: ts_val,
+                                    "start": ts_val,
+                                    "value": ts_val,
+                                }
 
                     summary["rows_enriched"] = summary.get("rows_enriched", 0) + 1
 
@@ -383,6 +392,15 @@ class NotionApiEnricher:
                 existing = row.properties.get(col_name)
 
                 if existing is None:
+                    if p_type in ("created_time", "last_edited_time"):
+                        fallback_ts = getattr(row, p_type, None)
+                        if fallback_ts:
+                            aligned_props[col_name] = {
+                                "type": p_type,
+                                p_type: str(fallback_ts),
+                                "start": str(fallback_ts),
+                                "value": str(fallback_ts),
+                            }
                     continue
 
                 raw_val = existing.get("value") if isinstance(existing, dict) else existing
@@ -406,13 +424,13 @@ class NotionApiEnricher:
                 elif p_type in ("select", "status"):
                     val_str = str(raw_val) if raw_val is not None else ""
                     aligned_props[col_name] = {
-                        "type": "select",
-                        "select": {"name": val_str},
+                        "type": p_type,
+                        p_type: {"name": val_str},
                         "value": val_str,
                     }
 
                 elif p_type == "checkbox":
-                    is_checked = raw_val in (True, "True", "true", "Yes", "yes", "1")
+                    is_checked = raw_val in (True, "True", "true", "Yes", "yes", "1", "☑", "✅")
                     aligned_props[col_name] = {
                         "type": "checkbox",
                         "checkbox": is_checked,
@@ -420,10 +438,50 @@ class NotionApiEnricher:
                     }
 
                 elif p_type == "date":
-                    aligned_props[col_name] = {
+                    raw_start = (
+                        existing.get("start")
+                        or (existing.get("date") or {}).get("start")
+                        or raw_val
+                    ) if isinstance(existing, dict) else raw_val
+                    raw_end = (
+                        existing.get("end")
+                        or (existing.get("date") or {}).get("end")
+                    ) if isinstance(existing, dict) else None
+                    date_obj: Dict[str, Any] = {"start": str(raw_start) if raw_start else None}
+                    if raw_end:
+                        date_obj["end"] = str(raw_end)
+                    aligned_date: Dict[str, Any] = {
                         "type": "date",
-                        "date": {"start": str(raw_val) if raw_val else None},
-                        "value": str(raw_val) if raw_val else None,
+                        "date": date_obj,
+                        "start": str(raw_start) if raw_start else None,
+                        "value": str(raw_start) if raw_start else None,
+                    }
+                    if raw_end:
+                        aligned_date["end"] = str(raw_end)
+                    aligned_props[col_name] = aligned_date
+
+                elif p_type in ("created_time", "last_edited_time"):
+                    ts_val = None
+                    if isinstance(existing, dict):
+                        ts_val = existing.get(p_type) or existing.get("start") or existing.get("value")
+                    elif existing is not None:
+                        ts_val = existing
+                    if not ts_val:
+                        ts_val = getattr(row, p_type, None)
+                    ts_str = str(ts_val) if ts_val else None
+                    aligned_props[col_name] = {
+                        "type": p_type,
+                        p_type: ts_str,
+                        "start": ts_str,
+                        "value": ts_str,
+                    }
+
+                elif p_type == "url":
+                    u_val = (existing.get("url") or raw_val) if isinstance(existing, dict) else raw_val
+                    aligned_props[col_name] = {
+                        "type": "url",
+                        "url": u_val,
+                        "value": u_val,
                     }
 
                 elif p_type == "number":
