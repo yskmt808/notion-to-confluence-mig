@@ -103,7 +103,7 @@ class TestCalloutListImageBgColor(unittest.TestCase):
             self.assertIn(f"background-color: {expected_hex};", html_out)
 
     def test_block_level_color_inheritance(self):
-        """ブロックレベルの背景色 (paragraph.color) が annotations.color == 'default' のテキストに継承されること"""
+        """ブロックレベルの背景色 (paragraph.color) が panel マクロで出力され、文字色は style として継承されること"""
         blocks = [
             {
                 "id": "p-yellow",
@@ -112,11 +112,24 @@ class TestCalloutListImageBgColor(unittest.TestCase):
                     "rich_text": [{"type": "text", "text": {"content": "黄色背景の段落"}, "plain_text": "黄色背景の段落", "annotations": {"color": "default"}}],
                     "color": "yellow_background",
                 },
-            }
+            },
+            {
+                "id": "p-blue-text",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": "青文字の段落"}, "plain_text": "青文字の段落", "annotations": {"color": "default"}}],
+                    "color": "blue",
+                },
+            },
         ]
         storage = self.conv.blocks_to_storage_format(blocks)
         assert_valid_storage_xml(self, storage)
-        self.assertIn(f"background-color: {NOTION_BG_COLOR_MAP['yellow_background']};", storage)
+        self.assertIn('<ac:structured-macro ac:name="panel">', storage)
+        self.assertIn(f'<ac:parameter ac:name="bgColor">{NOTION_BG_COLOR_MAP["yellow_background"]}</ac:parameter>', storage)
+        self.assertIn('<ac:parameter ac:name="borderColor">#f4e6b5</ac:parameter>', storage)
+        self.assertIn("<p>黄色背景の段落</p>", storage)
+        self.assertNotIn("background-color:", storage)
+        self.assertIn('<p style="color: #1f75cb;"><span style="color: #1f75cb;">青文字の段落</span></p>', storage)
 
     def test_html_extractor_nested_callout_in_list(self):
         """HTMLエクスポート内の li 直下にある aside.callout が children_blocks として正しく分離抽出されること"""
