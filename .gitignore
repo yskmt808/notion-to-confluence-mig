@@ -20,6 +20,7 @@ Thumbs.db
 
 # Execution outputs & screenshots
 screenshots/
+reports/
 migration_result.json
 migration_checkpoint.json
 debug_report.json
