@@ -479,7 +479,7 @@ class MigrationVerifier:
                         "multi_select": {"tag", "select"},
                         "text": {"text"},
                         "rich_text": {"text"},
-                        "title": {"confluence-page-link", "text", "page-link"},
+                        "title": {"confluence-page-link", "text", "page-link", "pagelink"},
                     }
                     matched_fields = []
                     for f_name, f_meta in schema.items():

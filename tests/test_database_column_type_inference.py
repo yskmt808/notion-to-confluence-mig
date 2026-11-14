@@ -367,9 +367,9 @@ class TestDatabaseColumnTypeInference(unittest.TestCase):
         mock_db_res = MagicMock(ok=True)
         mock_db_res.json.return_value = {"id": "conf-db-1", "title": "Fields Verify DB", "parentId": "p-1"}
 
-        # 1. 型一致時は PASS
+        # 1. 型一致時は PASS（Confluence API v2 実測値 pageLink も含む）
         mock_client.get_database_fields.return_value = [
-            {"name": "名前", "type": "confluence-page-link"},
+            {"name": "名前", "type": "pageLink"},
             {"name": "完了", "type": "checkbox"},
             {"name": "作成日時", "type": "date"},
             {"name": "メモ", "type": "text"},
