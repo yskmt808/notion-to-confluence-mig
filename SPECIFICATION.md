@@ -276,8 +276,10 @@ flowchart LR
    - Confluence側でインデックス完了したDBエントリを検知し、各子ページへの行ビューカード埋め込みを並行更新。
 
 ### 4.2 レジューム機能 (Resume from Checkpoint)
-* **アトミック逐次同期**: 1ページまたは1DBの作成・更新ごとに `migration_checkpoint.json` へ状態をアトミック保存。
+* **アトミック逐次同期とロック競合耐性**: 1ページまたは1DBの作成・更新ごとに、同一ディレクトリ内の一意な一時ファイル（`tempfile.NamedTemporaryFile`）経由でコンパクト JSON として `migration_checkpoint.json` へアトミック保存（親ディレクトリ不在時は自動作成、POSIX環境のみ `chmod 0600` 適用）。Windows 環境の Defender/EDR やクラウド同期による一時的ロック競合（`PermissionError` / `[WinError 5]`・`[WinError 32]` 等）発生時は、`WARNING` ログを記録しつつ指数バックオフ＋ジッター付きで自動リトライします。
+* **書込不能時の即時停止 (Fail-Fast)**: 全リトライ上限を超過する恒久的な書き込み障害時は、`ERROR` ログを記録した上で `CheckpointWriteError` を送出し、移行処理を即座に安全停止します（未記録のまま移行継続して `--resume` 時に重複作成することを防止）。
 * **差分再開**: `--resume` オプションを指定することで、作成済みノードを自動スキップし、未処理のノードおよび中断されたPassのみを高速かつ安全に再開。
+* **Windows 実地運用推奨**: Google Drive for desktop や OneDrive 等の同期対象フォルダ配下で大規模移行を実行すると同期クライアントによるファイルロック競合が多発するため、作業ディレクトリを非同期ローカルフォルダへ配置するか、`--checkpoint C:\temp\migration_checkpoint.json` のように同期対象外のローカルパスを指定することを推奨します。
 
 ### 4.3 安全な中断機能 (Graceful Cancellation)
 * **シグナル捕捉**: `SIGINT` (Ctrl+C) および `SIGTERM` を検知。

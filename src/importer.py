@@ -30,6 +30,7 @@ from src.extractor import (
     is_unsupported_page_element_block,
 )
 from src.converter import NotionToConfluenceConverter
+from src.checkpoint import CheckpointWriteError
 
 logger = logging.getLogger(__name__)
 
@@ -1011,45 +1012,53 @@ class ConfluenceImporter:
             self.dashboard.start(total_nodes)
             self.dashboard.set_main_task(f"Pass 1: 事前マッピング・タイトル初期化中...")
 
-        if self.dashboard:
-            self.dashboard.set_main_task(f"Pass 1: ルートノード移行中 [{root_node.title}]")
-        self._import_node_recursive(root_node, parent_id=parent_id, overwrite=overwrite, allow_sub_parallel=True)
-
-        # Pass 2: 全ページのリンク解決と更新 (データベースビュー・相互リンクの完全同期)
-        logger.info("Executing Pass 2: Resolving embedded database views, pending row views and cross-page links...")
-        if self.dashboard:
-            self.dashboard.set_main_task("Pass 1 完了: 未解決DB行ビューの非同期解決中...")
-        # 1. 未解決のデータベース行ビューを非同期解決 (Approach B / Resume)
-        self.resolve_pending_database_row_views(root_node)
-
-        # 2. データベースの最新ビュー一覧を再取得して確実に migration_map を補完
-        db_items = [(nid, ninfo) for nid, ninfo in self.migration_map.items() if ninfo.get("node_type") == "database"]
-        for i, (nid, ninfo) in enumerate(db_items, 1):
-            db_conf_id = ninfo["confluence_id"]
+        try:
             if self.dashboard:
-                self.dashboard.set_main_task(f"Pass 2: データベース最新ビュー再取得中 ({i}/{len(db_items)}: [{ninfo['title']}])")
-            views = self.client.get_database_views(db_conf_id)
-            ninfo["views"] = {v["name"]: v["id"] for v in views}
-            logger.info(f"Refreshed views for database [{ninfo['title']}]: {list(ninfo['views'].keys())}")
+                self.dashboard.set_main_task(f"Pass 1: ルートノード移行中 [{root_node.title}]")
+            self._import_node_recursive(root_node, parent_id=parent_id, overwrite=overwrite, allow_sub_parallel=True)
 
-        self.converter.migration_map = self.migration_map
+            # Pass 2: 全ページのリンク解決と更新 (データベースビュー・相互リンクの完全同期)
+            logger.info("Executing Pass 2: Resolving embedded database views, pending row views and cross-page links...")
+            if self.dashboard:
+                self.dashboard.set_main_task("Pass 1 完了: 未解決DB行ビューの非同期解決中...")
+            # 1. 未解決のデータベース行ビューを非同期解決 (Approach B / Resume)
+            self.resolve_pending_database_row_views(root_node)
 
-        if self.dashboard:
-            self.dashboard.set_main_task("Pass 2: 相互リンク・バックリンク構造を解析中...")
-        # Task B.9: 受信リンク（バックリンク）関係を解析・構築
-        self.incoming_links_map = self._build_incoming_links_map(root_node)
-        logger.info(f"Built incoming links map for {len(self.incoming_links_map)} target pages.")
+            # 2. データベースの最新ビュー一覧を再取得して確実に migration_map を補完
+            db_items = [(nid, ninfo) for nid, ninfo in self.migration_map.items() if ninfo.get("node_type") == "database"]
+            for i, (nid, ninfo) in enumerate(db_items, 1):
+                db_conf_id = ninfo["confluence_id"]
+                if self.dashboard:
+                    self.dashboard.set_main_task(f"Pass 2: データベース最新ビュー再取得中 ({i}/{len(db_items)}: [{ninfo['title']}])")
+                views = self.client.get_database_views(db_conf_id)
+                ninfo["views"] = {v["name"]: v["id"] for v in views}
+                logger.info(f"Refreshed views for database [{ninfo['title']}]: {list(ninfo['views'].keys())}")
 
-        self._resolve_and_update_page_links(root_node)
+            self.converter.migration_map = self.migration_map
 
-        # ページ内アンカー欠落リンクの検知レポートを出力
-        self.save_inpage_repair_candidates()
+            if self.dashboard:
+                self.dashboard.set_main_task("Pass 2: 相互リンク・バックリンク構造を解析中...")
+            # Task B.9: 受信リンク（バックリンク）関係を解析・構築
+            self.incoming_links_map = self._build_incoming_links_map(root_node)
+            logger.info(f"Built incoming links map for {len(self.incoming_links_map)} target pages.")
 
-        if self.dashboard:
-            self.dashboard.set_main_task("全ノードの移行完了")
-            self.dashboard.finish()
+            self._resolve_and_update_page_links(root_node)
 
-        return self.migration_map
+            # ページ内アンカー欠落リンクの検知レポートを出力
+            self.save_inpage_repair_candidates()
+
+            if self.dashboard:
+                self.dashboard.set_main_task("全ノードの移行完了")
+                self.dashboard.finish()
+
+            return self.migration_map
+        except Exception:
+            if self.dashboard and getattr(self.dashboard, "live", None):
+                try:
+                    self.dashboard.live.stop()
+                except Exception:
+                    pass
+            raise
 
     def save_inpage_repair_candidates(self, output_path: str = "reports/inpage_link_repair_candidates.json") -> Optional[str]:
         """移行中に検出されたアンカー欠落の可能性のある自ページリンク一覧をJSONレポートとして出力する。"""
@@ -1211,6 +1220,10 @@ class ConfluenceImporter:
                             self.checkpoint.record_pass2(node.id)
                         if self.dashboard:
                             self.dashboard.record_pass2_done(node.title)
+                except CheckpointWriteError as ce:
+                    if self.cancel_manager:
+                        self.cancel_manager.trigger_error_halt(f"Checkpoint write error during Pass 2 for [{node.title}]: {ce}")
+                    raise
                 except Exception as e:
                     logger.warning(f"Pass 2 update error for page {node.title} ({conf_id}): {e}")
                     if self.telemetry:
@@ -1222,7 +1235,12 @@ class ConfluenceImporter:
                         self.dashboard.set_worker_idle()
         else:
             if self.checkpoint:
-                self.checkpoint.record_pass2(node.id)
+                try:
+                    self.checkpoint.record_pass2(node.id)
+                except CheckpointWriteError as ce:
+                    if self.cancel_manager:
+                        self.cancel_manager.trigger_error_halt(f"Checkpoint write error during Pass 2 for [{node.title}]: {ce}")
+                    raise
             if self.dashboard:
                 self.dashboard.record_pass2_skip(node.title)
 
@@ -1427,7 +1445,14 @@ class ConfluenceImporter:
                     logger.info(f"[Resume] Resolving {len(resolved_items)} newly indexed row views for [{node.title}]...")
                     self._embed_row_views_concurrently(resolved_items, db_web_url, db_conf_id)
                     if self.checkpoint:
-                        self.checkpoint.mark_row_views_resolved(node.id, resolved_child_ids)
+                        try:
+                            self.checkpoint.mark_row_views_resolved(node.id, resolved_child_ids)
+                        except CheckpointWriteError as ce:
+                            if self.cancel_manager:
+                                self.cancel_manager.trigger_error_halt(
+                                    f"Checkpoint write error resolving row views for [{node.title}]: {ce}"
+                                )
+                            raise
                     if db_info:
                         db_info["pending_row_views"] = [cid for cid in db_info.get("pending_row_views", []) if cid not in resolved_child_ids]
                     remaining = len(pending_ids) - len(resolved_child_ids)

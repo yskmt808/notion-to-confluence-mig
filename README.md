@@ -79,6 +79,13 @@ python migrate.py --notion-page-id <PAGE_ID>
 
 実行後、対応するIDマップとURLが `migration_result.json` に出力されます。
 
+> [!TIP]
+> **Windows 環境での大規模移行時のご注意（Google Drive / OneDrive 等）**
+> クラウド同期フォルダ配下で大規模移行を実行すると、チェックポイントファイル（`migration_checkpoint.json`）への保存時に同期クライアントやセキュリティソフトのファイルロック競合（`WinError 5` / `WinError 32`）が発生しやすくなります。実地運用では同期対象外のローカルフォルダで実行するか、以下のように `--checkpoint` 先を非同期のローカルパスへ指定することを推奨します。
+> ```bash
+> python migrate.py --zip export.zip --checkpoint C:\temp\migration_checkpoint.json
+> ```
+
 ---
 
 ## 📋 機能仕様・近似対応と制限事項 (Parity & Limitations)
