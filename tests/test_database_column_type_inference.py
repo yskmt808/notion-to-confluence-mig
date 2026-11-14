@@ -266,8 +266,8 @@ class TestDatabaseColumnTypeInference(unittest.TestCase):
         self.assertIn("名前,confluence-page-link,", csv_out)
         self.assertIn("完了,checkbox,", csv_out)
         self.assertIn("期日,date,", csv_out)
-        self.assertIn("作成日時,date,", csv_out)
-        self.assertIn("更新日時,date,", csv_out)
+        self.assertIn("作成日時,text,", csv_out)
+        self.assertIn("更新日時,text,", csv_out)
         self.assertIn("ステータス,tag,", csv_out)
         self.assertIn("選択,tag,", csv_out)
         self.assertIn("タグ,tag,", csv_out)
@@ -283,7 +283,7 @@ class TestDatabaseColumnTypeInference(unittest.TestCase):
 
         self.assertEqual(
             row1_csv,
-            "https://example.atlassian.net/wiki/spaces/S/pages/1,true,2026-11-10,2026-11-08,2026-11-11,進行中,AAA,A|B,1234.5,https://example.com,通常テキスト",
+            "https://example.atlassian.net/wiki/spaces/S/pages/1,true,2026-11-10,2026-11-08 08:30,2026-11-11 21:30,進行中,AAA,A|B,1234.5,https://example.com,通常テキスト",
         )
         self.assertIn(",false,", row2_csv)
         self.assertNotIn("完了", row1_csv.split(",")[1])
@@ -367,11 +367,11 @@ class TestDatabaseColumnTypeInference(unittest.TestCase):
         mock_db_res = MagicMock(ok=True)
         mock_db_res.json.return_value = {"id": "conf-db-1", "title": "Fields Verify DB", "parentId": "p-1"}
 
-        # 1. 型一致時は PASS（Confluence API v2 実測値 pageLink も含む）
+        # 1. 型一致時は PASS（Confluence API v2 実測値 pageLink も含む。created_time は text）
         mock_client.get_database_fields.return_value = [
             {"name": "名前", "type": "pageLink"},
             {"name": "完了", "type": "checkbox"},
-            {"name": "作成日時", "type": "date"},
+            {"name": "作成日時", "type": "text"},
             {"name": "メモ", "type": "text"},
         ]
         verifier = MigrationVerifier(mock_client)
@@ -380,22 +380,120 @@ class TestDatabaseColumnTypeInference(unittest.TestCase):
         self.assertEqual(res_ok["status"], "PASS")
         self.assertTrue(any("Database field types verified" in c for c in res_ok["checks_passed"]))
 
-        # 2. checkbox が tag になっているなど型不一致時は FAIL
+        # 2. created_time が date のまま欠落している場合や checkbox が tag の場合は FAIL
         db_node_bad = PageNode(
             id="db-2",
             title="Fields Verify DB",
             node_type="database",
-            properties={"schema": {"完了": {"type": "checkbox"}}},
+            properties={
+                "schema": {
+                    "完了": {"type": "checkbox"},
+                    "作成日時": {"type": "created_time"},
+                }
+            },
             children=[PageNode(id="r1", title="Row 1", node_type="database_row")],
         )
-        mock_client.get_database_fields.return_value = [{"name": "完了", "type": "tag"}]
+        mock_client.get_database_fields.return_value = [
+            {"name": "完了", "type": "tag"},
+            {"name": "作成日時", "type": "date"},
+        ]
         with patch("requests.get", return_value=mock_db_res):
             res_bad = verifier.verify_database_node(db_node_bad, "conf-db-1", expected_parent_id="p-1")
         self.assertEqual(res_bad["status"], "FAIL")
         self.assertTrue(any("type mismatch" in iss for iss in res_bad["issues"]))
+        self.assertEqual(len(res_bad["issues"]), 2)
+
+        # 3. 時刻付き/範囲付き date 列は text、日付のみの date 列は date を期待すること
+        db_node_mixed_dates = PageNode(
+            id="db-3",
+            title="Fields Verify DB",
+            node_type="database",
+            properties={
+                "schema": {
+                    "日時": {"type": "date"},
+                    "純粋日付": {"type": "date"},
+                }
+            },
+            children=[
+                PageNode(
+                    id="r1",
+                    title="Row 1",
+                    node_type="database_row",
+                    properties={
+                        "日時": {"type": "date", "start": "2026-11-11T09:05"},
+                        "純粋日付": {"type": "date", "start": "2026-11-10"},
+                    },
+                )
+            ],
+        )
+        mock_client.get_database_fields.return_value = [
+            {"name": "日時", "type": "text"},
+            {"name": "純粋日付", "type": "date"},
+        ]
+        with patch("requests.get", return_value=mock_db_res):
+            res_dates = verifier.verify_database_node(db_node_mixed_dates, "conf-db-1", expected_parent_id="p-1")
+        self.assertEqual(res_dates["status"], "PASS")
+
+    def test_date_column_with_time_or_range_converts_to_text_and_preserves_hhmm(self):
+        """date型でも時刻 (HH:MM) や日付範囲を含む列は text 型へ変換され時刻・範囲を保持し、日付のみ列は date 型を維持すること"""
+        conv = NotionToConfluenceConverter(timezone="Asia/Tokyo")
+        db_node = PageNode(
+            id="db-dt",
+            title="Datetime & Range DB",
+            node_type="database",
+            properties={
+                "title_column": "タイトル",
+                "schema": {
+                    "タイトル": {"type": "title"},
+                    "開始日時": {"type": "date"},
+                    "実施期間": {"type": "date"},
+                    "日付のみ": {"type": "date"},
+                },
+            },
+            children=[
+                PageNode(
+                    id="r1",
+                    title="Row 1",
+                    node_type="database_row",
+                    properties={
+                        "タイトル": {"type": "title", "value": "Row 1"},
+                        # UTC -> JST (+9h), ゼロ埋め HH:MM
+                        "開始日時": {"type": "date", "start": "2026-11-11T00:05:00.000Z"},
+                        # 日時範囲 (UTC -> JST)
+                        "実施期間": {"type": "date", "start": "2026-11-10T09:00:00Z", "end": "2026-11-12T10:30:00Z"},
+                        "日付のみ": {"type": "date", "start": "2026-11-10"},
+                    },
+                ),
+                PageNode(
+                    id="r2",
+                    title="Row 2",
+                    node_type="database_row",
+                    properties={
+                        "タイトル": {"type": "title", "value": "Row 2"},
+                        # 同列の別行が日付のみであっても列全体が text になるため時刻無し行も安全に共存
+                        "開始日時": {"type": "date", "start": "2026-11-15"},
+                        # naive HTML 日時 (ダブルシフトしない)
+                        "実施期間": {"type": "date", "start": "2026-11-20T08:05", "end": "2026-11-21T21:45"},
+                        "日付のみ": {"type": "date", "start": "2026-11-20"},
+                    },
+                ),
+            ],
+        )
+
+        csv_out = conv.generate_database_csv(db_node, {})
+        self.assertIn("開始日時,text,", csv_out)
+        self.assertIn("実施期間,text,", csv_out)
+        self.assertIn("日付のみ,date,", csv_out)
+
+        lines = csv_out.splitlines()
+        data_idx = lines.index("<data>")
+        row1_csv = lines[data_idx + 2]
+        row2_csv = lines[data_idx + 3]
+        self.assertEqual(row1_csv, '"",2026-11-11 09:05,2026-11-10 18:00 → 2026-11-12 19:30,2026-11-10')
+        self.assertEqual(row2_csv, '"",2026-11-15,2026-11-20 08:05 → 2026-11-21 21:45,2026-11-20')
 
     def test_error_pattern_export_block_zip_schema_and_csv(self):
-        """error_pattern_ExportBlock.zip 内のDBが過剰tag化せず checkbox/created_time/date/select/title を正しく判別すること"""
+        """error_pattern_ExportBlock.zip 内のDBが過剰tag化せず checkbox/created_time(text+HH:MM)/date/select/title を正しく判別すること"""
         zip_path = "/home/antigravity/yskmt808/notion-to-confluence-mig/error_pattern_ExportBlock.zip"
         if not os.path.exists(zip_path):
             self.skipTest(f"Sample ZIP not found: {zip_path}")
@@ -428,12 +526,12 @@ class TestDatabaseColumnTypeInference(unittest.TestCase):
         csv_str = conv.generate_database_csv(target_db, {})
         self.assertIn("名前,confluence-page-link,", csv_str)
         self.assertIn("チェックボックス,checkbox,", csv_str)
-        self.assertIn("作成日時,date,", csv_str)
+        self.assertIn("作成日時,text,", csv_str)
         self.assertIn("日付,date,", csv_str)
         self.assertIn("選択,tag,", csv_str)
-        self.assertIn(",true,2026-11-11,2026-11-10,AAA", csv_str)
-        self.assertIn(",false,2026-11-11,2026-12-09,BBB", csv_str)
-        self.assertIn(',false,2026-11-11,2026-11-30,""', csv_str)
+        self.assertIn(",true,2026-11-11 21:30,2026-11-10,AAA", csv_str)
+        self.assertIn(",false,2026-11-11 21:30,2026-12-09,BBB", csv_str)
+        self.assertIn(',false,2026-11-11 21:30,2026-11-30,""', csv_str)
 
 
 if __name__ == "__main__":

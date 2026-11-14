@@ -496,11 +496,12 @@ class MigrationVerifier:
                         for f in conf_fields
                         if isinstance(f, dict) and (f.get("name") or f.get("title"))
                     }
+                    from src.converter import NotionToConfluenceConverter
                     expected_conf_type_map = {
                         "checkbox": {"checkbox"},
                         "date": {"date"},
-                        "created_time": {"date"},
-                        "last_edited_time": {"date"},
+                        "created_time": {"text"},
+                        "last_edited_time": {"text"},
                         "number": {"number"},
                         "url": {"hyperlink", "link", "url"},
                         "select": {"tag", "select"},
@@ -515,7 +516,10 @@ class MigrationVerifier:
                         if not isinstance(f_meta, dict):
                             continue
                         n_type = (f_meta.get("type") or "").strip().lower()
-                        expected_set = expected_conf_type_map.get(n_type)
+                        if n_type == "date" and NotionToConfluenceConverter.column_requires_text_for_datetime(node, f_name, n_type):
+                            expected_set = {"text"}
+                        else:
+                            expected_set = expected_conf_type_map.get(n_type)
                         if not expected_set or f_name not in conf_field_types:
                             continue
                         actual_type = conf_field_types[f_name]
