@@ -18,6 +18,7 @@ warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import glob
+import zipfile
 from src.extractor import NotionExtractor, PageNode, get_node_external_synced_blocks
 from src.html_extractor import HtmlZipExtractor, MultiZipExtractor
 from src.importer import ConfluenceImporter
@@ -532,20 +533,50 @@ def main():
     cancel_manager = CancellationManager(on_cancel_callback=_on_cancel_checkpoint)
     cancel_manager.install()
 
-    # ZIPファイルの収集 (--zip / --zip-dir)
+    # ZIPファイルの収集と厳格検証 (--zip / --zip-dir)
+    zip_mode_requested = bool(args.zip_paths or args.zip_dir)
     zip_files = []
-    if args.zip_paths:
-        for p in args.zip_paths:
-            matched = glob.glob(p)
-            if matched:
-                zip_files.extend(matched)
-            elif os.path.exists(p):
-                zip_files.append(p)
-    if args.zip_dir and os.path.isdir(args.zip_dir):
-        zip_files.extend(sorted(glob.glob(os.path.join(args.zip_dir, "*.zip"))))
-    zip_files = sorted(list(dict.fromkeys(zip_files)))
+    if zip_mode_requested:
+        try:
+            if args.zip_paths:
+                for p in args.zip_paths:
+                    if os.path.exists(p):
+                        zip_files.append(p)
+                    else:
+                        matched = sorted(glob.glob(p))
+                        if matched:
+                            zip_files.extend(matched)
+                        else:
+                            raise FileNotFoundError(f"指定されたZIPファイルが見つかりません: {p}")
 
-    use_zip = bool(zip_files)
+            if args.zip_dir:
+                if not os.path.exists(args.zip_dir):
+                    raise FileNotFoundError(f"指定されたZIPディレクトリが見つかりません: {args.zip_dir}")
+                if not os.path.isdir(args.zip_dir):
+                    raise NotADirectoryError(f"指定された --zip-dir パスはディレクトリではありません: {args.zip_dir}")
+                dir_zips = sorted(glob.glob(os.path.join(args.zip_dir, "*.zip")))
+                if not dir_zips:
+                    raise FileNotFoundError(f"指定されたディレクトリ内にZIPファイル (*.zip) が見つかりません: {args.zip_dir}")
+                zip_files.extend(dir_zips)
+
+            zip_files = sorted(list(dict.fromkeys(zip_files)))
+            if not zip_files:
+                raise FileNotFoundError("有効なZIPファイルが指定されていません。")
+
+            for zp in zip_files:
+                if not os.path.exists(zp):
+                    raise FileNotFoundError(f"指定されたZIPファイルが見つかりません: {zp}")
+                if not os.path.isfile(zp):
+                    raise IsADirectoryError(f"指定されたZIPパスはファイルではありません: {zp}")
+                with zipfile.ZipFile(zp, "r") as zf:
+                    zf.namelist()
+        except Exception as e:
+            err_msg = f"指定されたZIPファイルを開けません: {e}"
+            logging.error(err_msg, exc_info=args.verbose)
+            print(f"❌ [ERROR] {err_msg}")
+            sys.exit(1)
+
+    use_zip = zip_mode_requested
 
     # 1. Notion設定の確認 (ZIP利用時はNOTION_TOKEN不要、ただし--enrich-via-api指定時は必要)
     notion_token = os.getenv("NOTION_TOKEN")
@@ -625,11 +656,12 @@ def main():
     step1_start = datetime.now(timezone.utc)
     if use_zip:
         print(f"📥 [Step 1/3] Notion HTMLエクスポートZIP（{len(zip_files)}ファイル）から並行解析中... (開始: {step1_start.strftime('%H:%M:%S')})")
-        extractor = MultiZipExtractor(zip_paths=zip_files)
         try:
+            extractor = MultiZipExtractor(zip_paths=zip_files)
             tree = extractor.extract_tree()
         except Exception as e:
             logging.error(f"HTMLエクスポート解析エラー: {e}", exc_info=args.verbose)
+            print(f"❌ [ERROR] HTMLエクスポート解析エラー: {e}")
             sys.exit(1)
     else:
         print(f"📥 [Step 1/3] Notion APIからページ・ブロック・DBツリーを抽出中... (開始: {step1_start.strftime('%H:%M:%S')})")
