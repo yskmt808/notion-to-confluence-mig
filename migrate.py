@@ -251,6 +251,35 @@ def print_result_summary(mapping: Dict[str, Dict[str, Any]], result_path: str, s
     print(f"\n💡 全 {total} 件のURLを端末に出力するには `--show-all-pages` または `--verbose` を指定してください。")
 
 
+def print_homonym_warnings(homonym_warnings: List[Dict[str, Any]]):
+    """同姓同名ユーザー検知時の WARNING メッセージを標準出力およびログへ出力する。"""
+    if not homonym_warnings:
+        return
+    header = f"⚠️ WARNING: 同姓同名ユーザーを {len(homonym_warnings)} 件検知しました（名前のみ参照の自動確定をスキップ）:"
+    print(header)
+    logging.warning(header)
+    for w in homonym_warnings:
+        disp_name = w.get("name", "")
+        cands = w.get("candidates", [])
+        locs = w.get("affected_locations", [])
+        cand_strs = [
+            f"id={c.get('id') or '(未取得)'} / email={c.get('email') or '(未取得)'}"
+            for c in cands
+        ]
+        msg_line = f"  • 表示名: {disp_name} ({len(cands)} 名) | 候補: {'; '.join(cand_strs)}"
+        print(msg_line)
+        logging.warning(msg_line)
+        if locs:
+            loc_line = f"    影響箇所 ({len(locs)} 件): {', '.join(locs)}"
+            print(loc_line)
+            logging.warning(loc_line)
+        else:
+            loc_line = "    影響箇所 (0 件): 名前のみの未解決参照は検出されませんでした"
+            print(loc_line)
+            logging.warning(loc_line)
+    print("")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Notion to Confluence Migration Tool")
     parser.add_argument(
@@ -572,11 +601,18 @@ def main():
     print(f"✓ Step 1 完了: 所要時間 {step1_elapsed:.2f} 秒\n")
 
     # Task B.3: Notion APIによるハイブリッド補完モード
+    workspace_users: Optional[List[Dict[str, Any]]] = None
     if args.enrich_via_api:
         print("⚡ [Task B.3] Notion APIからDBプロパティスキーマ・ビュー属性をピンポイント取得中...")
         enricher = NotionApiEnricher(token=notion_token)
         enrich_summary = enricher.enrich_tree(tree)
-        print(f"✓ API補完完了: {enrich_summary['databases_enriched']} 件のデータベース, {enrich_summary['properties_mapped']} 件の正確なカラム型をマージしました\n")
+        ws_u = getattr(enricher, "workspace_users", None)
+        if isinstance(ws_u, list):
+            workspace_users = ws_u
+        user_msg = ""
+        if enrich_summary.get("users_fetched") or enrich_summary.get("users_enriched"):
+            user_msg = f", {enrich_summary.get('users_fetched', 0)} 名のユーザーキャッシュ ({enrich_summary.get('users_enriched', 0)} 箇所補完)"
+        print(f"✓ API補完完了: {enrich_summary['databases_enriched']} 件のデータベース, {enrich_summary['properties_mapped']} 件の正確なカラム型をマージしました{user_msg}\n")
 
     # Task B.4: 人間確認済みチェックシートの読込・適用
     if args.import_worksheet:
@@ -627,6 +663,13 @@ def main():
         user_mapper = UserMappingManager(args.user_mapping)
         print(f"👥 ユーザーマッピング適用: {len(user_mapper.mappings)} 名の定義を読み込みました ({args.user_mapping})\n")
 
+    # 同姓同名ユーザー検知
+    homonym_warnings = UserMappingManager.detect_homonyms(
+        tree,
+        workspace_users=workspace_users,
+        user_mapper=user_mapper,
+    )
+
     # テレメトリとチェックポイントにツリー情報を記録
     telemetry.record_tree(tree)
     checkpoint.source_info = {
@@ -646,6 +689,8 @@ def main():
     print_tree_summary(tree, verbose=args.verbose, show_all=args.show_all_pages)
 
     if args.dry_run:
+        if homonym_warnings:
+            print_homonym_warnings(homonym_warnings)
         print("💡 DRY RUN モードのため、Confluence への移行はスキップされました。")
         if args.generate_debug_report:
             json_p = os.path.join(args.debug_report_dir, "debug_report.json")

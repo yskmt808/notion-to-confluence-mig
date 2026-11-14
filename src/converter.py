@@ -263,8 +263,8 @@ class NotionToConfluenceConverter:
                 return "-"
             return f'<a href="{html.escape(url)}">{html.escape(url)}</a>'
 
-        elif p_type == "people":
-            users = prop.get("users", [])
+        elif p_type in ("people", "created_by", "last_edited_by"):
+            users = prop.get("users") or ([prop[p_type]] if isinstance(prop.get(p_type), dict) and prop[p_type] else [])
             if not users:
                 return "-"
             if self.user_mapper:
@@ -276,7 +276,7 @@ class NotionToConfluenceConverter:
                     badges.append(self.user_mapper.format_mention(user_id=u_id, email=u_email, name=u_name))
                 return "👤 " + ", ".join(badges)
             names = [u.get("name") for u in users if u.get("name")]
-            return "👤 " + ", ".join(html.escape(n) for n in names)
+            return "👤 " + ", ".join(html.escape(n) for n in names) if names else "-"
 
         elif p_type == "relation":
             relations = prop.get("relations") or prop.get("relation") or []
@@ -1621,8 +1621,8 @@ class NotionToConfluenceConverter:
         elif p_type == "number":
             val = prop.get("value")
             return str(val) if val is not None else ""
-        elif p_type == "people":
-            users = prop.get("users", [])
+        elif p_type in ("people", "created_by", "last_edited_by"):
+            users = prop.get("users") or ([prop[p_type]] if isinstance(prop.get(p_type), dict) and prop[p_type] else [])
             if self.user_mapper and self.user_mapper.mappings:
                 acc_ids = []
                 for u in users:
@@ -1756,7 +1756,7 @@ class NotionToConfluenceConverter:
                     conf_type = "number"
                 elif p_type == "url":
                     conf_type = "hyperlink"
-                elif p_type == "people" and self.user_mapper and self.user_mapper.mappings:
+                elif p_type in ("people", "created_by", "last_edited_by") and self.user_mapper and self.user_mapper.mappings:
                     conf_type = "user"
                 else:
                     conf_type = "text"
@@ -1802,7 +1802,7 @@ class NotionToConfluenceConverter:
                     conf_type = "number"
                 elif p_type == "url":
                     conf_type = "hyperlink"
-                elif p_type == "people" and self.user_mapper and self.user_mapper.mappings:
+                elif p_type in ("people", "created_by", "last_edited_by") and self.user_mapper and self.user_mapper.mappings:
                     conf_type = "user"
                 else:
                     conf_type = "text"
