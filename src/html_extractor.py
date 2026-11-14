@@ -20,7 +20,13 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple, Union
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-from src.extractor import PageNode, collect_external_synced_blocks_from_blocks
+from src.extractor import (
+    PageNode,
+    build_unsupported_external_embed_block,
+    classify_external_app_url,
+    collect_external_synced_blocks_from_blocks,
+    is_broken_or_placeholder_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1595,13 +1601,39 @@ class HtmlZipExtractor:
                 })
 
             # 14. 画像 / 子ページリンク / 外部ファイル・動画・音声・埋め込み
-            elif tag == "figure" or "link-to-page" in classes or "file" in classes or "source" in classes or "pdf" in classes:
-                a_tag = el.find("a")
-                href = a_tag.get("href") if a_tag else ""
-                if not href:
+            elif (
+                tag in ("figure", "iframe", "embed", "object")
+                or "link-to-page" in classes
+                or "file" in classes
+                or "source" in classes
+                or "pdf" in classes
+            ):
+                if tag in ("iframe", "embed", "object"):
+                    a_tag = None
+                    media_tag = el
+                    href = (el.get("src") or el.get("data") or "").strip()
+                    raw_link_text = (el.get("title") or el.get("aria-label") or el.get_text(" ", strip=True) or "").strip()
+                else:
+                    a_tag = el.find("a")
                     media_tag = el.find(["embed", "iframe", "object"])
-                    if media_tag:
-                        href = media_tag.get("src") or media_tag.get("data") or ""
+                    href = (a_tag.get("href") or "") if a_tag else ""
+                    if (not href.strip() or href.strip().startswith("#")) and media_tag:
+                        media_src = (media_tag.get("src") or media_tag.get("data") or "").strip()
+                        if media_src:
+                            href = media_src
+                    if not href.strip():
+                        av_tag = el.find(["video", "audio"])
+                        if av_tag:
+                            src_tag = av_tag.find("source")
+                            href = (av_tag.get("src") or (src_tag.get("src") if src_tag else "") or "").strip()
+                    raw_link_text = (
+                        (a_tag.get_text(" ", strip=True) or a_tag.get("data-notion-file-alias") or "")
+                        if a_tag
+                        else ""
+                    )
+                    if not raw_link_text and media_tag:
+                        raw_link_text = (media_tag.get("title") or media_tag.get("aria-label") or "").strip()
+
                 img_tag = el.find("img")
                 figcaption = el.find("figcaption")
                 caption_text = normalize_attachment_display_name(figcaption.get_text().strip()) if figcaption else ""
@@ -1684,6 +1716,18 @@ class HtmlZipExtractor:
                             })
                             logger.info(f"Loaded inline base64/data URI image: {filename} ({len(data_bytes)} bytes)")
                             blocks.append(block_obj)
+                        elif src.startswith(("http://", "https://")) and is_broken_or_placeholder_url(src):
+                            blocks.append(
+                                build_unsupported_external_embed_block(
+                                    block_id=el_id,
+                                    block_type="unsupported",
+                                    service_name="画像埋め込み / 未対応リンク",
+                                    url="",
+                                    raw_label=caption_text,
+                                    reason="broken_or_placeholder_url",
+                                    caption=caption_rich,
+                                )
+                            )
                         else:
                             is_external = src.startswith(("http://", "https://"))
                             img_filename = unicodedata.normalize("NFC", os.path.basename(urllib.parse.unquote(src).split("#", 1)[0].split("?", 1)[0]))
@@ -1709,144 +1753,200 @@ class HtmlZipExtractor:
                             elif not is_external:
                                 logger.warning(f"Image attachment not found in ZIP: src='{src}'")
                             blocks.append(block_obj)
-                elif href:
-                    lower_href = href.lower()
-                    is_external = href.startswith(("http://", "https://"))
-                    raw_link_text = (
-                        (a_tag.get_text(" ", strip=True) or a_tag.get("data-notion-file-alias") or "")
-                        if a_tag
-                        else ""
-                    )
+                else:
+                    clean_href = href.strip() if href else ""
+                    lower_href = clean_href.lower()
+                    is_external = clean_href.startswith(("http://", "https://"))
                     display_name = normalize_attachment_display_name(raw_link_text)
-                    media_tag_present = el.find(["embed", "iframe", "object"]) is not None
-                    has_notion_file_attr = bool(
-                        a_tag and (a_tag.has_attr("data-notion-file") or a_tag.has_attr("data-notion-file-alias"))
-                    )
-                    is_preview_disabled_file = bool(
-                        has_notion_file_attr
-                        and "pdf" not in classes
-                        and not media_tag_present
-                    )
+                    raw_label = display_name or caption_text
+                    media_tag_present = tag in ("iframe", "embed", "object") or el.find(["embed", "iframe", "object"]) is not None
+                    is_bookmark = "bookmark" in classes or el.find(class_="bookmark") is not None
 
-                    if att_ref_match:
-                        att_filename = unicodedata.normalize("NFC", os.path.basename(att_ref_match.group(2).strip()))
-                    else:
-                        href_path = urllib.parse.urlparse(unquoted_href).path if is_external else unquoted_href.split("#", 1)[0].split("?", 1)[0]
-                        att_filename = unicodedata.normalize("NFC", os.path.basename(href_path))
-
-                    resolved_path = None
-                    if not is_external:
-                        resolved_path = self._resolve_zip_attachment_path(zf, current_dir, href)
-                        if not resolved_path and display_name and display_name != att_filename:
-                            resolved_path = self._resolve_zip_attachment_path(zf, current_dir, display_name)
-                    if not att_filename and resolved_path:
-                        att_filename = unicodedata.normalize("NFC", os.path.basename(resolved_path))
-                    if not att_filename and display_name:
-                        att_filename = unicodedata.normalize("NFC", os.path.basename(display_name))
-
-                    is_attachment_uri = bool(att_ref_match)
-                    fallback_external = {"url": href} if (is_external or (not resolved_path and not is_attachment_uri)) else None
-                    resolved_type = "file" if (resolved_path or is_attachment_uri) else "external"
-
-                    if "bookmark" in classes or el.find(class_="bookmark"):
-                        blocks.append({
-                            "id": el_id,
-                            "type": "bookmark",
-                            "bookmark": {"url": href},
-                        })
+                    if is_bookmark:
+                        if is_broken_or_placeholder_url(clean_href, allow_notion_page_url=True):
+                            blocks.append(
+                                build_unsupported_external_embed_block(
+                                    block_id=el_id,
+                                    block_type="unsupported",
+                                    service_name="Web Bookmark",
+                                    url="",
+                                    raw_label=raw_label,
+                                    reason="broken_or_placeholder_url",
+                                    caption=caption_rich,
+                                )
+                            )
+                        else:
+                            blocks.append({
+                                "id": el_id,
+                                "type": "bookmark",
+                                "bookmark": {"url": clean_href},
+                            })
+                    elif is_broken_or_placeholder_url(clean_href):
+                        hint_svc = (
+                            "Google Drive"
+                            if "drive" in raw_label.lower()
+                            else ("<iframe> 埋め込み" if media_tag_present else "外部埋め込み / 未対応リンク")
+                        )
+                        blocks.append(
+                            build_unsupported_external_embed_block(
+                                block_id=el_id,
+                                block_type="unsupported",
+                                service_name=hint_svc,
+                                url="",
+                                raw_label=raw_label,
+                                reason="broken_or_placeholder_url",
+                                caption=caption_rich,
+                            )
+                        )
                     elif any(svc in lower_href for svc in ("figma.com", "maps.google", "codepen.io")):
                         blocks.append({
                             "id": el_id,
                             "type": "embed",
-                            "embed": {"url": href},
+                            "embed": {"url": clean_href},
                         })
-                    elif (
-                        not is_preview_disabled_file
-                        and (
-                            att_filename.lower().endswith(".pdf")
-                            or href_path_lower.endswith(".pdf")
-                            or (resolved_path or "").lower().endswith(".pdf")
-                            or "pdf" in classes
+                    elif (ext_app := classify_external_app_url(clean_href)) is not None:
+                        svc_name, ext_block_type = ext_app
+                        blocks.append(
+                            build_unsupported_external_embed_block(
+                                block_id=el_id,
+                                block_type=ext_block_type,
+                                service_name=svc_name,
+                                url=clean_href,
+                                raw_label=raw_label,
+                                reason="external_app_auth_required",
+                                caption=caption_rich,
+                            )
                         )
-                    ):
-                        pdf_obj = AttachmentBlockDict({
-                            "id": el_id,
-                            "type": "pdf",
-                            "pdf": {
-                                "type": resolved_type,
-                                "caption": caption_rich,
-                                "external": None if resolved_path else fallback_external,
-                                "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
-                            },
-                            "_attachment_filename": att_filename,
-                        })
-                        if display_name:
-                            pdf_obj["_display_name"] = display_name
-                        if resolved_path:
-                            pdf_obj["_attachment_zip_path"] = self.zip_path
-                            pdf_obj["_attachment_zip_entry"] = resolved_path
-                            logger.info(f"Resolved inline PDF attachment in ZIP: {resolved_path}")
-                        elif not is_external:
-                            logger.warning(f"PDF attachment not found in ZIP: href='{href}', filename='{att_filename}'")
-                        blocks.append(pdf_obj)
-                    elif href_path_lower.endswith((".mp3", ".wav", ".m4a", ".aac")) or att_filename.lower().endswith((".mp3", ".wav", ".m4a", ".aac")):
-                        audio_obj = AttachmentBlockDict({
-                            "id": el_id,
-                            "type": "audio",
-                            "audio": {
-                                "type": resolved_type,
-                                "caption": caption_rich,
-                                "external": None if resolved_path else fallback_external,
-                                "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
-                            },
-                            "_attachment_filename": att_filename,
-                        })
-                        if resolved_path:
-                            audio_obj["_attachment_zip_path"] = self.zip_path
-                            audio_obj["_attachment_zip_entry"] = resolved_path
-                            logger.info(f"Resolved inline audio attachment in ZIP: {resolved_path}")
-                        blocks.append(audio_obj)
-                    elif (
-                        href_path_lower.endswith((".mp4", ".mov", ".webm"))
-                        or att_filename.lower().endswith((".mp4", ".mov", ".webm"))
-                        or "youtube.com" in lower_href
-                        or "youtu.be" in lower_href
-                    ):
-                        video_obj = AttachmentBlockDict({
-                            "id": el_id,
-                            "type": "video",
-                            "video": {
-                                "type": resolved_type,
-                                "caption": caption_rich,
-                                "external": None if resolved_path else fallback_external,
-                                "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
-                            },
-                            "_attachment_filename": att_filename,
-                        })
-                        if resolved_path:
-                            video_obj["_attachment_zip_path"] = self.zip_path
-                            video_obj["_attachment_zip_entry"] = resolved_path
-                            logger.info(f"Resolved inline video attachment in ZIP: {resolved_path}")
-                        blocks.append(video_obj)
                     else:
-                        file_obj = AttachmentBlockDict({
-                            "id": el_id,
-                            "type": "file",
-                            "file": {
-                                "type": resolved_type,
-                                "caption": caption_rich,
-                                "external": None if resolved_path else fallback_external,
-                                "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
-                            },
-                            "_attachment_filename": att_filename,
-                        })
-                        if display_name:
-                            file_obj["_display_name"] = display_name
-                        if resolved_path:
-                            file_obj["_attachment_zip_path"] = self.zip_path
-                            file_obj["_attachment_zip_entry"] = resolved_path
-                            logger.info(f"Resolved inline file attachment in ZIP: {resolved_path}")
-                        blocks.append(file_obj)
+                        has_notion_file_attr = bool(
+                            a_tag and (a_tag.has_attr("data-notion-file") or a_tag.has_attr("data-notion-file-alias"))
+                        )
+                        is_preview_disabled_file = bool(
+                            has_notion_file_attr
+                            and "pdf" not in classes
+                            and not media_tag_present
+                        )
+
+                        if att_ref_match:
+                            att_filename = unicodedata.normalize("NFC", os.path.basename(att_ref_match.group(2).strip()))
+                        else:
+                            href_path = urllib.parse.urlparse(unquoted_href).path if is_external else unquoted_href.split("#", 1)[0].split("?", 1)[0]
+                            att_filename = unicodedata.normalize("NFC", os.path.basename(href_path))
+
+                        resolved_path = None
+                        if not is_external:
+                            resolved_path = self._resolve_zip_attachment_path(zf, current_dir, clean_href)
+                            if not resolved_path and display_name and display_name != att_filename:
+                                resolved_path = self._resolve_zip_attachment_path(zf, current_dir, display_name)
+                        if not att_filename and resolved_path:
+                            att_filename = unicodedata.normalize("NFC", os.path.basename(resolved_path))
+                        if not att_filename and display_name:
+                            att_filename = unicodedata.normalize("NFC", os.path.basename(display_name))
+
+                        is_attachment_uri = bool(att_ref_match)
+                        fallback_external = {"url": clean_href} if (is_external or (not resolved_path and not is_attachment_uri)) else None
+                        resolved_type = "file" if (resolved_path or is_attachment_uri) else "external"
+
+                        if (
+                            not is_preview_disabled_file
+                            and (
+                                att_filename.lower().endswith(".pdf")
+                                or href_path_lower.endswith(".pdf")
+                                or (resolved_path or "").lower().endswith(".pdf")
+                                or "pdf" in classes
+                            )
+                        ):
+                            pdf_obj = AttachmentBlockDict({
+                                "id": el_id,
+                                "type": "pdf",
+                                "pdf": {
+                                    "type": resolved_type,
+                                    "caption": caption_rich,
+                                    "external": None if resolved_path else fallback_external,
+                                    "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
+                                },
+                                "_attachment_filename": att_filename,
+                            })
+                            if display_name:
+                                pdf_obj["_display_name"] = display_name
+                            if resolved_path:
+                                pdf_obj["_attachment_zip_path"] = self.zip_path
+                                pdf_obj["_attachment_zip_entry"] = resolved_path
+                                logger.info(f"Resolved inline PDF attachment in ZIP: {resolved_path}")
+                            elif not is_external:
+                                logger.warning(f"PDF attachment not found in ZIP: href='{clean_href}', filename='{att_filename}'")
+                            blocks.append(pdf_obj)
+                        elif href_path_lower.endswith((".mp3", ".wav", ".m4a", ".aac")) or att_filename.lower().endswith((".mp3", ".wav", ".m4a", ".aac")):
+                            audio_obj = AttachmentBlockDict({
+                                "id": el_id,
+                                "type": "audio",
+                                "audio": {
+                                    "type": resolved_type,
+                                    "caption": caption_rich,
+                                    "external": None if resolved_path else fallback_external,
+                                    "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
+                                },
+                                "_attachment_filename": att_filename,
+                            })
+                            if resolved_path:
+                                audio_obj["_attachment_zip_path"] = self.zip_path
+                                audio_obj["_attachment_zip_entry"] = resolved_path
+                                logger.info(f"Resolved inline audio attachment in ZIP: {resolved_path}")
+                            blocks.append(audio_obj)
+                        elif (
+                            href_path_lower.endswith((".mp4", ".mov", ".webm"))
+                            or att_filename.lower().endswith((".mp4", ".mov", ".webm"))
+                            or "youtube.com" in lower_href
+                            or "youtu.be" in lower_href
+                        ):
+                            video_obj = AttachmentBlockDict({
+                                "id": el_id,
+                                "type": "video",
+                                "video": {
+                                    "type": resolved_type,
+                                    "caption": caption_rich,
+                                    "external": None if resolved_path else fallback_external,
+                                    "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
+                                },
+                                "_attachment_filename": att_filename,
+                            })
+                            if resolved_path:
+                                video_obj["_attachment_zip_path"] = self.zip_path
+                                video_obj["_attachment_zip_entry"] = resolved_path
+                                logger.info(f"Resolved inline video attachment in ZIP: {resolved_path}")
+                            blocks.append(video_obj)
+                        elif media_tag_present and not resolved_path and not is_attachment_uri:
+                            parsed_host = (urllib.parse.urlparse(clean_href).hostname or "") if is_external else ""
+                            blocks.append(
+                                build_unsupported_external_embed_block(
+                                    block_id=el_id,
+                                    block_type="embed",
+                                    service_name=parsed_host or "外部埋め込み (iframe)",
+                                    url=clean_href if is_external else "",
+                                    raw_label=raw_label,
+                                    reason="unsupported_iframe_embed",
+                                    caption=caption_rich,
+                                )
+                            )
+                        else:
+                            file_obj = AttachmentBlockDict({
+                                "id": el_id,
+                                "type": "file",
+                                "file": {
+                                    "type": resolved_type,
+                                    "caption": caption_rich,
+                                    "external": None if resolved_path else fallback_external,
+                                    "file": {"url": att_filename} if (resolved_path or is_attachment_uri) else None,
+                                },
+                                "_attachment_filename": att_filename,
+                            })
+                            if display_name:
+                                file_obj["_display_name"] = display_name
+                            if resolved_path:
+                                file_obj["_attachment_zip_path"] = self.zip_path
+                                file_obj["_attachment_zip_entry"] = resolved_path
+                                logger.info(f"Resolved inline file attachment in ZIP: {resolved_path}")
+                            blocks.append(file_obj)
 
             # 15. 単独のimgタグ
             elif tag == "img":
@@ -2046,7 +2146,7 @@ class HtmlZipExtractor:
         t_classes = node.get("class") or []
         if isinstance(t_classes, str):
             t_classes = [t_classes]
-        if t_name in ("ul", "ol", "aside", "figure", "blockquote", "pre", "table", "details", "hr", "h1", "h2", "h3", "nav"):
+        if t_name in ("ul", "ol", "aside", "figure", "blockquote", "pre", "table", "details", "hr", "h1", "h2", "h3", "nav", "iframe", "embed", "object"):
             return True
         if any(
             c in t_classes

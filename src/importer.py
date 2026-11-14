@@ -23,7 +23,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import requests
-from src.extractor import PageNode
+from src.extractor import (
+    PageNode,
+    classify_external_app_url,
+    is_broken_or_placeholder_url,
+    is_unsupported_page_element_block,
+)
 from src.converter import NotionToConfluenceConverter
 
 logger = logging.getLogger(__name__)
@@ -61,6 +66,8 @@ def detect_attachment_mime_type(filename: str) -> str:
 def _is_safe_external_url(url: str) -> bool:
     """外部URLの安全性（SSRF防止）を検証する。http/httpsスキームのみを許可し、ループバック・リンクローカル・プライベートIPを拒否する。"""
     if not url or not isinstance(url, str):
+        return False
+    if is_broken_or_placeholder_url(url, allow_notion_page_url=True):
         return False
     try:
         parsed = urllib.parse.urlparse(url.strip())
@@ -1507,6 +1514,12 @@ class ConfluenceImporter:
 
         for b in blocks:
             b_type = b.get("type")
+            if b.get("_is_unsupported_external_embed") or is_unsupported_page_element_block(b):
+                b["_attachment_uploaded"] = False
+                if b.get("children_blocks"):
+                    self._process_attachments(b["children_blocks"], page_id, uploaded_filenames=uploaded_filenames)
+                continue
+
             file_url = None
             is_embed = False
 
@@ -1593,40 +1606,55 @@ class ConfluenceImporter:
                         b.pop("_attachment_zip_entry", None)
                         b.pop("_attachment_zip_path", None)
             elif file_url and not is_embed:
-                filename = unicodedata.normalize("NFC", self.converter._get_attachment_filename(b))
-                b["_attachment_filename"] = filename
-
-                if not _is_safe_external_url(file_url):
-                    logger.warning(f"Skipped unsafe or non-HTTP attachment URL for page {page_id}: {file_url}")
+                if is_broken_or_placeholder_url(file_url):
                     b["_attachment_uploaded"] = False
-                elif filename in uploaded_filenames:
-                    b["_attachment_uploaded"] = True
+                    b["_is_unsupported_external_embed"] = True
+                    b["_unsupported_reason"] = "broken_or_placeholder_url"
+                    logger.info(f"Skipped downloading broken/placeholder URL for page {page_id}: {file_url}")
+                elif (ext_app := classify_external_app_url(file_url)) is not None:
+                    svc_name, _ = ext_app
+                    b["_attachment_uploaded"] = False
+                    b["_is_unsupported_external_embed"] = True
+                    b["service_name"] = b.get("service_name") or svc_name
+                    b["_unsupported_reason"] = "external_app_auth_required"
+                    logger.info(f"Skipped downloading external app link ({svc_name}) for page {page_id}: {file_url}")
                 else:
-                    logger.info(f"Downloading attachment for page {page_id}: {filename}")
-                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-                    try:
-                        resp = requests.get(file_url, headers=headers, timeout=30)
-                        if resp.status_code == 200:
-                            content_type = resp.headers.get("Content-Type", "application/octet-stream")
-                            upload_res = self.client.upload_attachment(
-                                page_id=page_id,
-                                filename=filename,
-                                file_bytes=resp.content,
-                                mime_type=content_type,
-                            )
-                            if upload_res is not None:
-                                uploaded_filenames.add(filename)
-                                b["_attachment_uploaded"] = True
-                                logger.info(f"Successfully uploaded attachment: {filename} ({len(resp.content)} bytes)")
+                    filename = unicodedata.normalize("NFC", self.converter._get_attachment_filename(b))
+                    b["_attachment_filename"] = filename
+
+                    if not _is_safe_external_url(file_url):
+                        logger.warning(f"Skipped unsafe or non-HTTP attachment URL for page {page_id}: {file_url}")
+                        b["_attachment_uploaded"] = False
+                    elif filename in uploaded_filenames:
+                        b["_attachment_uploaded"] = True
+                    else:
+                        logger.info(f"Downloading attachment for page {page_id}: {filename}")
+                        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                        try:
+                            resp = requests.get(file_url, headers=headers, timeout=30)
+                            if resp.status_code == 200:
+                                content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                                upload_res = self.client.upload_attachment(
+                                    page_id=page_id,
+                                    filename=filename,
+                                    file_bytes=resp.content,
+                                    mime_type=content_type,
+                                )
+                                if upload_res is not None:
+                                    uploaded_filenames.add(filename)
+                                    b["_attachment_uploaded"] = True
+                                    logger.info(f"Successfully uploaded attachment: {filename} ({len(resp.content)} bytes)")
+                                else:
+                                    b["_attachment_uploaded"] = False
+                                    logger.warning(f"Attachment upload returned no result for {filename}")
                             else:
                                 b["_attachment_uploaded"] = False
-                                logger.warning(f"Attachment upload returned no result for {filename}")
-                        else:
+                                logger.warning(f"Download failed for {filename}: HTTP {resp.status_code}")
+                        except Exception as e:
                             b["_attachment_uploaded"] = False
-                            logger.warning(f"Download failed for {filename}: HTTP {resp.status_code}")
-                    except Exception as e:
-                        b["_attachment_uploaded"] = False
-                        logger.warning(f"Failed to download/upload attachment {filename}: {e}")
+                            logger.warning(f"Failed to download/upload attachment {filename}: {e}")
+            elif b_type in ("image", "file", "pdf", "video", "audio") and not file_url:
+                b["_attachment_uploaded"] = False
 
             if b.get("children_blocks"):
                 self._process_attachments(b["children_blocks"], page_id, uploaded_filenames=uploaded_filenames)

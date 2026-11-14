@@ -16,7 +16,11 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from collections import Counter
 
-from src.extractor import get_node_external_synced_blocks
+from src.extractor import (
+    get_node_external_synced_blocks,
+    is_unsupported_page_element_block,
+    KNOWN_UNSUPPORTED_SERVICE_NAMES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,12 +128,29 @@ class SanitizedTelemetry:
             elif n.node_type == "database_row":
                 rows += 1
 
-            for b in getattr(n, "blocks", []):
-                b_type = b.get("type", "unknown")
-                self.block_types_counter[b_type] += 1
-                if b_type in ("breadcrumb", "unsupported", "button", "template"):
-                    if b_type not in self.unsupported_elements:
-                        self.unsupported_elements.append(b_type)
+            def _walk_blocks(blocks_list):
+                for b in blocks_list:
+                    if not isinstance(b, dict):
+                        continue
+                    b_type = b.get("type", "unknown")
+                    self.block_types_counter[b_type] += 1
+                    if is_unsupported_page_element_block(b):
+                        svc = b.get("service_name") or b.get("_unsupported_service_name")
+                        elem_label = (
+                            f"{b_type}:{svc}"
+                            if svc in KNOWN_UNSUPPORTED_SERVICE_NAMES
+                            else b_type
+                        )
+                        if elem_label not in self.unsupported_elements:
+                            self.unsupported_elements.append(elem_label)
+                        svc_info = f", service={svc}" if svc in KNOWN_UNSUPPORTED_SERVICE_NAMES else ""
+                        self.record_warning(
+                            f"Unsupported page element detected in {n.node_type} {n.id} (type={b_type}{svc_info})"
+                        )
+                    if b.get("children_blocks"):
+                        _walk_blocks(b["children_blocks"])
+
+            _walk_blocks(getattr(n, "blocks", []))
 
             ext_blocks = get_node_external_synced_blocks(n)
             if ext_blocks:

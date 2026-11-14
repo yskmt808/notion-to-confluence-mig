@@ -11,7 +11,12 @@ import unicodedata
 import urllib.parse
 import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
-from src.extractor import PageNode
+from src.extractor import (
+    PageNode,
+    classify_external_app_url,
+    extract_block_url,
+    is_broken_or_placeholder_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +217,73 @@ class NotionToConfluenceConverter:
                     clean_name = re.sub(r"[^\w\-_.]", "_", name)[:30]
                     return unicodedata.normalize("NFC", f"{clean_name}_{b_id_short}.{clean_ext}")
         return f"{b_type}_{b_id_short}.{default_ext}"
+
+    def _render_unsupported_external_embed_note(self, b: Dict[str, Any]) -> str:
+        """未対応外部アプリ連携・URL空・破損プレースホルダーURLブロックをConfluence noteマクロで安全にレンダリングする。"""
+        b_type = str(b.get("type") or "unsupported")
+        raw_url = extract_block_url(b)
+        is_broken = is_broken_or_placeholder_url(raw_url)
+        safe_url = "" if (is_broken or not raw_url.startswith(("http://", "https://"))) else raw_url
+
+        svc_name = b.get("service_name") or b.get("_unsupported_service_name") or ""
+        if not svc_name and safe_url:
+            app_info = classify_external_app_url(safe_url)
+            if app_info:
+                svc_name = app_info[0]
+        if not svc_name:
+            if b_type == "google_drive":
+                svc_name = "Google Drive"
+            elif b_type == "link_preview":
+                svc_name = "Link Preview"
+            elif b_type == "embed":
+                svc_name = "外部埋め込み (Embed)"
+            elif b_type == "miro":
+                svc_name = "Miro"
+            elif b_type == "trello":
+                svc_name = "Trello"
+            else:
+                svc_name = "外部埋め込み / 未対応リンク"
+
+        raw_label = str(b.get("raw_label") or b.get("_display_name") or "").strip()
+        data = b.get(b_type) if isinstance(b.get(b_type), dict) else {}
+        caption = self.convert_rich_text(data.get("caption", [])) if isinstance(data, dict) else ""
+        caption_html = f"<p><em>{caption}</em></p>" if caption else ""
+        children_html = ""
+        if b.get("children_blocks"):
+            children_html = self.blocks_to_storage_format(b["children_blocks"])
+
+        title_param = clean_parameter_text(f"⚠️ 未対応ページ要素: {svc_name}")
+        body_parts: List[str] = []
+        if safe_url:
+            body_parts.append(
+                f"<p>この要素（種別: <code>{html.escape(b_type)}</code> / サービス: <strong>{html.escape(svc_name)}</strong>）は"
+                f"認証・埋め込み制限によりConfluenceへ直接取り込めないため、フォールバック注記として保持されています。</p>"
+            )
+        else:
+            body_parts.append(
+                f"<p>この要素（種別: <code>{html.escape(b_type)}</code> / 対象: <strong>{html.escape(svc_name)}</strong>）は"
+                f"元のリンクURLがエクスポートデータ内に含まれていない（または無効・プレースホルダーURL）ため、フォールバック注記として保持されています。</p>"
+            )
+
+        if raw_label and raw_label != safe_url:
+            body_parts.append(f"<p>元ラベル: {html.escape(raw_label)}</p>")
+
+        if safe_url:
+            escaped_url = html.escape(safe_url)
+            body_parts.append(f'<p>🔗 元リンクを開く: <a href="{escaped_url}">{escaped_url}</a></p>')
+
+        body_parts.append("<p>💡 必要に応じてNotion元ページまたは外部サービス上で直接開いて内容をご確認ください。</p>")
+        if caption_html:
+            body_parts.append(caption_html)
+        if children_html:
+            body_parts.append(children_html)
+
+        return (
+            f'<ac:structured-macro ac:name="note">'
+            f'<ac:parameter ac:name="title">{title_param}</ac:parameter>'
+            f'<ac:rich-text-body>{"".join(body_parts)}</ac:rich-text-body>'
+            f'</ac:structured-macro>'
+        )
 
     def format_property_for_confluence(self, prop: Any) -> str:
         """Notionプロパティ辞書をConfluenceのXHTML表現にフォーマットする。"""
@@ -1351,11 +1423,19 @@ class NotionToConfluenceConverter:
                     )
 
             elif b_type in ("embed", "figma", "miro", "trello", "maps", "google_drive", "twitter", "gist", "codepen"):
-                embed_data = b.get(b_type, {})
-                url = embed_data.get("url", "")
+                embed_data = b.get(b_type, {}) if isinstance(b.get(b_type), dict) else {}
+                url = (embed_data.get("url") or "").strip()
                 caption = self.convert_rich_text(embed_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
-                if url:
+                if (
+                    b.get("_is_unsupported_external_embed")
+                    or b_type == "google_drive"
+                    or not url
+                    or is_broken_or_placeholder_url(url)
+                    or classify_external_app_url(url) is not None
+                ):
+                    output.append(self._render_unsupported_external_embed_note(b))
+                else:
                     # Confluenceのスマートリンク Embed カード + 直リンク
                     output.append(
                         f'<p><a href="{html.escape(url)}" data-card-appearance="embed">{html.escape(url)}</a></p>'
@@ -1364,38 +1444,54 @@ class NotionToConfluenceConverter:
                     )
 
             elif b_type == "link_preview":
-                lp_data = b.get("link_preview", {})
-                url = lp_data.get("url", "")
-                if url:
+                lp_data = b.get("link_preview", {}) if isinstance(b.get("link_preview"), dict) else {}
+                url = (lp_data.get("url") or "").strip()
+                if (
+                    b.get("_is_unsupported_external_embed")
+                    or not url
+                    or is_broken_or_placeholder_url(url)
+                    or classify_external_app_url(url) is not None
+                ):
+                    output.append(self._render_unsupported_external_embed_note(b))
+                else:
                     output.append(
                         f'<p><a href="{html.escape(url)}" data-card-appearance="block">{html.escape(url)}</a></p>'
                     )
 
             elif b_type in ("breadcrumb", "unsupported", "button", "template"):
-                # Notion固有・Confluence非対応ブロックのフォールバック表示
-                b_name_map = {
-                    "breadcrumb": "ページ内パンくず (Breadcrumb)",
-                    "button": "アクションボタン (Button)",
-                    "template": "テンプレートボタン (Template)",
-                    "unsupported": "未対応独自機能 (Unsupported)",
-                }
-                disp_name = b_name_map.get(b_type, f"Notionブロック ({b_type})")
-                children_html = ""
-                if b.get("children_blocks"):
-                    children_html = self.blocks_to_storage_format(b["children_blocks"])
-                output.append(
-                    f'<ac:structured-macro ac:name="note">'
-                    f'<ac:parameter ac:name="title">⚠️ Notion固有機能: {html.escape(disp_name)}</ac:parameter>'
-                    f'<ac:rich-text-body><p>この要素（種別: <code>{html.escape(b_type)}</code>）はConfluence側に同等の機能が存在しないため、フォールバック注記として保持されています。</p>{children_html}</ac:rich-text-body>'
-                    f'</ac:structured-macro>'
-                )
+                if b.get("_is_unsupported_external_embed"):
+                    output.append(self._render_unsupported_external_embed_note(b))
+                else:
+                    # Notion固有・Confluence非対応ブロックのフォールバック表示
+                    b_name_map = {
+                        "breadcrumb": "ページ内パンくず (Breadcrumb)",
+                        "button": "アクションボタン (Button)",
+                        "template": "テンプレートボタン (Template)",
+                        "unsupported": "未対応独自機能 (Unsupported)",
+                    }
+                    disp_name = b_name_map.get(b_type, f"Notionブロック ({b_type})")
+                    children_html = ""
+                    if b.get("children_blocks"):
+                        children_html = self.blocks_to_storage_format(b["children_blocks"])
+                    output.append(
+                        f'<ac:structured-macro ac:name="note">'
+                        f'<ac:parameter ac:name="title">⚠️ Notion固有機能: {html.escape(disp_name)}</ac:parameter>'
+                        f'<ac:rich-text-body><p>この要素（種別: <code>{html.escape(b_type)}</code>）はConfluence側に同等の機能が存在しないため、フォールバック注記として保持されています。</p>{children_html}</ac:rich-text-body>'
+                        f'</ac:structured-macro>'
+                    )
 
             elif b_type == "bookmark":
-                bm_data = b.get("bookmark", {})
-                url = bm_data.get("url", "")
+                bm_data = b.get("bookmark", {}) if isinstance(b.get("bookmark"), dict) else {}
+                url = (bm_data.get("url") or "").strip()
                 caption = self.convert_rich_text(bm_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
-                if url:
+                if (
+                    b.get("_is_unsupported_external_embed")
+                    or not url
+                    or is_broken_or_placeholder_url(url, allow_notion_page_url=True)
+                ):
+                    output.append(self._render_unsupported_external_embed_note(b))
+                else:
                     output.append(
                         f'<p><a href="{html.escape(url)}" data-card-appearance="block">{html.escape(url)}</a></p>{caption_html}'
                     )
@@ -1428,14 +1524,28 @@ class NotionToConfluenceConverter:
                     )
 
             elif b_type == "pdf":
-                pdf_data = b.get("pdf", {})
+                pdf_data = b.get("pdf", {}) if isinstance(b.get("pdf"), dict) else {}
                 pdf_file = pdf_data.get("file") or {}
                 pdf_ext = pdf_data.get("external") or {}
-                pdf_url = pdf_file.get("url") or pdf_ext.get("url", "")
+                pdf_url = (pdf_file.get("url") or pdf_ext.get("url") or "").strip()
                 filename = self._get_attachment_filename(b)
                 caption = self.convert_rich_text(pdf_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
-                if b.get("_attachment_uploaded", True):
+                has_local_attachment = bool(
+                    b.get("_attachment_bytes") or b.get("_attachment_zip_entry") or b.get("_attachment_filename")
+                )
+                if b.get("_is_unsupported_external_embed") or (
+                    not b.get("_attachment_uploaded", True)
+                    and not b.get("_attachment_bytes")
+                    and not b.get("_attachment_zip_entry")
+                    and (
+                        not pdf_url
+                        or is_broken_or_placeholder_url(pdf_url)
+                        or classify_external_app_url(pdf_url) is not None
+                    )
+                ):
+                    output.append(self._render_unsupported_external_embed_note(b))
+                elif b.get("_attachment_uploaded", True):
                     output.append(
                         f'<ac:structured-macro ac:name="viewpdf">'
                         f'<ac:parameter ac:name="name"><ri:attachment ri:filename="{html.escape(filename)}" /></ac:parameter>'
@@ -1445,21 +1555,34 @@ class NotionToConfluenceConverter:
                     output.append(
                         f'<p>📄 <a href="{html.escape(pdf_url)}">PDF文書を開く: {html.escape(filename)}</a></p>{caption_html}'
                     )
-                elif filename:
+                elif has_local_attachment and filename:
                     output.append(
                         f'<p>📄 {html.escape(filename)}</p>{caption_html}'
                     )
+                else:
+                    output.append(self._render_unsupported_external_embed_note(b))
 
             elif b_type == "file":
-                file_data = b.get("file", {})
+                file_data = b.get("file", {}) if isinstance(b.get("file"), dict) else {}
                 file_file = file_data.get("file") or {}
                 file_ext = file_data.get("external") or {}
-                file_url = file_file.get("url") or file_ext.get("url", "")
+                file_url = (file_file.get("url") or file_ext.get("url") or "").strip()
                 filename = self._get_attachment_filename(b)
                 display_label = unicodedata.normalize("NFC", str(b.get("_display_name") or filename))
                 caption = self.convert_rich_text(file_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
-                if b.get("_attachment_uploaded", True):
+                if b.get("_is_unsupported_external_embed") or (
+                    not b.get("_attachment_uploaded", True)
+                    and not b.get("_attachment_bytes")
+                    and not b.get("_attachment_zip_entry")
+                    and (
+                        not file_url
+                        or is_broken_or_placeholder_url(file_url)
+                        or classify_external_app_url(file_url) is not None
+                    )
+                ):
+                    output.append(self._render_unsupported_external_embed_note(b))
+                elif b.get("_attachment_uploaded", True):
                     safe_fn_cdata = display_label.replace("]]>", "]]]]><![CDATA[>")
                     output.append(
                         f'<p><ac:link>'
@@ -1467,16 +1590,18 @@ class NotionToConfluenceConverter:
                         f'<ac:plain-text-link-body><![CDATA[📎 {safe_fn_cdata} (添付ファイルをダウンロード)]]></ac:plain-text-link-body>'
                         f'</ac:link></p>{caption_html}'
                     )
-                elif file_url:
+                elif file_url and file_url.startswith(("http://", "https://")):
                     output.append(
                         f'<p>📎 <a href="{html.escape(file_url)}">添付ファイルを開く: {html.escape(display_label)}</a></p>{caption_html}'
                     )
+                else:
+                    output.append(self._render_unsupported_external_embed_note(b))
 
             elif b_type == "video":
-                video_data = b.get("video", {})
+                video_data = b.get("video", {}) if isinstance(b.get("video"), dict) else {}
                 video_file = video_data.get("file") or {}
                 video_ext = video_data.get("external") or {}
-                video_url = video_file.get("url") or video_ext.get("url", "")
+                video_url = (video_file.get("url") or video_ext.get("url") or "").strip()
                 caption = self.convert_rich_text(video_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
 
@@ -1492,6 +1617,13 @@ class NotionToConfluenceConverter:
                         f'</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
+                elif b.get("_is_unsupported_external_embed") or (
+                    not b.get("_attachment_uploaded", True)
+                    and not b.get("_attachment_bytes")
+                    and not b.get("_attachment_zip_entry")
+                    and (not video_url or is_broken_or_placeholder_url(video_url) or classify_external_app_url(video_url) is not None)
+                ):
+                    output.append(self._render_unsupported_external_embed_note(b))
                 else:
                     filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
                     if b.get("_attachment_uploaded", True):
@@ -1511,10 +1643,10 @@ class NotionToConfluenceConverter:
                         )
 
             elif b_type == "audio":
-                audio_data = b.get("audio", {})
+                audio_data = b.get("audio", {}) if isinstance(b.get("audio"), dict) else {}
                 audio_file = audio_data.get("file") or {}
                 audio_ext = audio_data.get("external") or {}
-                audio_url = audio_file.get("url") or audio_ext.get("url", "")
+                audio_url = (audio_file.get("url") or audio_ext.get("url") or "").strip()
                 caption = self.convert_rich_text(audio_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
 
@@ -1530,6 +1662,13 @@ class NotionToConfluenceConverter:
                         f'</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
+                elif b.get("_is_unsupported_external_embed") or (
+                    not b.get("_attachment_uploaded", True)
+                    and not b.get("_attachment_bytes")
+                    and not b.get("_attachment_zip_entry")
+                    and (not audio_url or is_broken_or_placeholder_url(audio_url) or classify_external_app_url(audio_url) is not None)
+                ):
+                    output.append(self._render_unsupported_external_embed_note(b))
                 else:
                     filename = b.get("_attachment_filename") or self._get_attachment_filename(b)
                     if b.get("_attachment_uploaded", True):
@@ -1549,17 +1688,20 @@ class NotionToConfluenceConverter:
                         )
 
             else:
-                # 未知・未対応のNotionブロック型
-                logger.warning(f"Unknown or unsupported Notion block type: {b_type}")
-                children_html = ""
-                if b.get("children_blocks"):
-                    children_html = self.blocks_to_storage_format(b["children_blocks"])
-                output.append(
-                    f'<ac:structured-macro ac:name="note">'
-                    f'<ac:parameter ac:name="title">⚠️ 未対応ブロック: {html.escape(str(b_type))}</ac:parameter>'
-                    f'<ac:rich-text-body><p>種別 <code>{html.escape(str(b_type))}</code> のNotionブロックが検出されました。</p>{children_html}</ac:rich-text-body>'
-                    f'</ac:structured-macro>'
-                )
+                if b.get("_is_unsupported_external_embed"):
+                    output.append(self._render_unsupported_external_embed_note(b))
+                else:
+                    # 未知・未対応のNotionブロック型
+                    logger.warning(f"Unknown or unsupported Notion block type: {b_type}")
+                    children_html = ""
+                    if b.get("children_blocks"):
+                        children_html = self.blocks_to_storage_format(b["children_blocks"])
+                    output.append(
+                        f'<ac:structured-macro ac:name="note">'
+                        f'<ac:parameter ac:name="title">⚠️ 未対応ブロック: {html.escape(str(b_type))}</ac:parameter>'
+                        f'<ac:rich-text-body><p>種別 <code>{html.escape(str(b_type))}</code> のNotionブロックが検出されました。</p>{children_html}</ac:rich-text-body>'
+                        f'</ac:structured-macro>'
+                    )
 
         flush_list()
         return "\n".join(output)

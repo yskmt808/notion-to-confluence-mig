@@ -12,7 +12,7 @@ import urllib.parse
 import requests
 from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
-from src.extractor import PageNode, get_node_external_synced_blocks
+from src.extractor import PageNode, get_node_external_synced_blocks, is_unsupported_page_element_block
 from src.importer import ConfluenceClient
 
 logger = logging.getLogger(__name__)
@@ -170,7 +170,7 @@ class MigrationVerifier:
         expected_attachment_filenames: List[str] = []
 
         for b in all_blocks:
-            if b.get("_attachment_uploaded") is False:
+            if b.get("_attachment_uploaded") is False or is_unsupported_page_element_block(b):
                 continue
             b_type = b.get("type", "")
             fn = b.get("_attachment_filename")
@@ -195,10 +195,13 @@ class MigrationVerifier:
                 else:
                     issues.append(f"Attachment file '{exp_fn}' is missing from Confluence page {confluence_page_id} attachments.")
 
-        if "pdf" in block_types:
-            pdf_blocks = [b for b in all_blocks if b.get("type") == "pdf"]
-            attached_pdf_blocks = [b for b in pdf_blocks if b.get("_attachment_uploaded", True)]
-            external_pdf_blocks = [b for b in pdf_blocks if not b.get("_attachment_uploaded", True)]
+        real_pdf_blocks = [
+            b for b in all_blocks
+            if b.get("type") == "pdf" and not is_unsupported_page_element_block(b)
+        ]
+        if real_pdf_blocks:
+            attached_pdf_blocks = [b for b in real_pdf_blocks if b.get("_attachment_uploaded", True)]
+            external_pdf_blocks = [b for b in real_pdf_blocks if not b.get("_attachment_uploaded", True)]
             if attached_pdf_blocks:
                 has_viewpdf = '<ac:structured-macro ac:name="viewpdf"' in storage_body
                 if has_viewpdf and ".pdf" in storage_body.lower():
@@ -213,11 +216,23 @@ class MigrationVerifier:
                 else:
                     issues.append("External PDF block detected in Notion, but PDF link/reference not found in Confluence.")
 
-        if "file" in block_types:
-            if "<ac:link" in storage_body and "<ri:attachment" in storage_body:
-                checks_passed.append("File attachment link present.")
-            else:
-                issues.append("File block detected in Notion, but attachment link not found in Confluence.")
+        real_file_blocks = [
+            b for b in all_blocks
+            if b.get("type") == "file" and not is_unsupported_page_element_block(b)
+        ]
+        if real_file_blocks:
+            attached_file_blocks = [b for b in real_file_blocks if b.get("_attachment_uploaded", True)]
+            external_file_blocks = [b for b in real_file_blocks if not b.get("_attachment_uploaded", True)]
+            if attached_file_blocks:
+                if "<ac:link" in storage_body and "<ri:attachment" in storage_body:
+                    checks_passed.append("File attachment link present.")
+                else:
+                    issues.append("File block detected in Notion, but attachment link not found in Confluence.")
+            if external_file_blocks:
+                if "<a " in storage_body or "📎 " in storage_body:
+                    checks_passed.append("External file link verified in Confluence body.")
+                else:
+                    issues.append("External file block detected in Notion, but link not found in Confluence.")
 
         if "video" in block_types:
             if ('data-card-appearance="embed"' in storage_body or '<ac:structured-macro ac:name="multimedia"' in storage_body or '<ac:structured-macro ac:name="widget"' in storage_body or '<ac:link' in storage_body):
@@ -231,7 +246,11 @@ class MigrationVerifier:
             else:
                 issues.append("Audio block detected in Notion, but audio player/link not found in Confluence.")
 
-        if "bookmark" in block_types:
+        real_bookmark_blocks = [
+            b for b in all_blocks
+            if b.get("type") == "bookmark" and not is_unsupported_page_element_block(b)
+        ]
+        if real_bookmark_blocks:
             if 'data-card-appearance="block"' in storage_body:
                 checks_passed.append("Bookmark block converted to Confluence smart card link (data-card-appearance='block').")
             else:
@@ -249,12 +268,22 @@ class MigrationVerifier:
             else:
                 issues.append("Column list block detected in Notion, but section/column macros not found in Confluence.")
 
-        # 5-b. Notion固有・未対応要素の検知とフォールバック記録
-        unsupported_blocks = [b for b in node.blocks if b.get("type") in ("breadcrumb", "unsupported", "button", "template")]
+        # 5-b. Notion固有・未対応要素（外部アプリ連携埋め込み・破損URLフォールバック含む）の検知と記録
+        unsupported_blocks = [b for b in all_blocks if is_unsupported_page_element_block(b)]
         if unsupported_blocks:
-            u_names = [b.get("type") for b in unsupported_blocks]
+            u_names = []
+            for ub in unsupported_blocks:
+                svc = ub.get("service_name") or ub.get("_unsupported_service_name")
+                b_t = ub.get("type", "unsupported")
+                u_names.append(f"{b_t} ({svc})" if svc else str(b_t))
             warnings.append(f"Notion固有の未対応要素を検出・フォールバック注記として保持しました ({len(u_names)} 件: {', '.join(u_names)})")
-            if "Notion固有機能" in storage_body or "未対応ブロック" in storage_body:
+            has_note_macro = '<ac:structured-macro ac:name="note"' in storage_body
+            has_fallback_text = (
+                "Notion固有機能" in storage_body
+                or "未対応ブロック" in storage_body
+                or "未対応ページ要素" in storage_body
+            )
+            if has_note_macro and has_fallback_text:
                 checks_passed.append(f"Unsupported block fallback note verified in Confluence body ({', '.join(u_names)}).")
             else:
                 issues.append(f"Unsupported Notion blocks detected ({', '.join(u_names)}), but fallback note was not found in Confluence body.")
