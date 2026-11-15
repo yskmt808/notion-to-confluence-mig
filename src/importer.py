@@ -855,7 +855,8 @@ class ConfluenceImporter:
                 field_vals.add(str(p_val).strip())
         return sorted(v for v in field_vals if v)
 
-    def _analyze_database_view_requirements(self, root_node: PageNode) -> Dict[str, Dict[str, Any]]:
+    @staticmethod
+    def _analyze_database_view_requirements(root_node: PageNode) -> Dict[str, Dict[str, Any]]:
         """ツリー全体を事前スキャンし、各データベースに対して他ページから参照されているビュー要件を収集する。"""
         db_by_norm_id: Dict[str, str] = {}
         db_by_title: Dict[str, str] = {}

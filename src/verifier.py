@@ -21,7 +21,8 @@ from src.extractor import (
     is_substanceless_unsupported_block,
     is_unsupported_page_element_block,
 )
-from src.importer import ConfluenceClient
+from src.converter import NotionToConfluenceConverter
+from src.importer import ConfluenceClient, ConfluenceImporter
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 class MigrationVerifier:
     def __init__(self, confluence_client: ConfluenceClient):
         self.client = confluence_client
+        self._db_view_requirements: Dict[str, Dict[str, Any]] = {}
 
     def verify_page_node(
         self,
@@ -584,29 +586,27 @@ class MigrationVerifier:
             else:
                 issues.append("Table view layout missing from Confluence database.")
 
+            expects_board, expects_gallery, expects_filtered = self._compute_expected_db_views(node)
+
             # 2-b. ボードビュー / カンバン (Board Layout)
             board_views = [name for name, t in view_types.items() if t == "board" or "ボード" in name]
-            has_select_status = any(
-                isinstance(p, dict) and p.get("type") in ("select", "status")
-                for p in (node.properties.get("schema") or {}).values()
-            )
             if board_views:
                 checks_passed.append(f"Board view layout present: {', '.join(board_views)}")
-            elif has_select_status:
+            elif expects_board:
                 warnings.append("Board view layout not found in Confluence database.")
 
             # 2-c. ギャラリービュー / カード (Gallery Layout)
             gallery_views = [name for name, t in view_types.items() if t == "gallery" or "ギャラリー" in name]
             if gallery_views:
                 checks_passed.append(f"Gallery view layout present: {', '.join(gallery_views)}")
-            elif len(node.children) > 5:
+            elif expects_gallery:
                 warnings.append("Gallery view layout not found in Confluence database.")
 
             # 2-d. Group by フィルタービュー (Filtered Views)
             filtered_views = [name for name in view_names if ": " in name or "ステータス" in name]
             if filtered_views:
                 checks_passed.append(f"Group by filtered views provisioned ({len(filtered_views)} views): {', '.join(filtered_views[:4])}")
-            elif has_select_status:
+            elif expects_filtered:
                 warnings.append("Group by filtered views not found in Confluence database.")
 
         # 3. エントリ（行レコード）件数・子ページ検証
@@ -695,13 +695,61 @@ class MigrationVerifier:
             "checks_passed": checks_passed,
         }
 
+    def _compute_expected_db_views(self, node: PageNode) -> tuple[bool, bool, bool]:
+        """importer.py のビュー自動生成条件と一致する (expects_board, expects_gallery, expects_filtered) を算出する。"""
+        props = getattr(node, "properties", None) or {}
+        confirmed_views = props.get("confirmed_views")
+        if confirmed_views:
+            expects_board = any(cv.get("layout") == "board" and cv.get("group_by") for cv in confirmed_views)
+            expects_gallery = any(cv.get("layout") == "gallery" for cv in confirmed_views)
+            return expects_board, expects_gallery, False
+
+        single_props, multi_props = NotionToConfluenceConverter().get_select_field_configurations(node)
+        norm_db_id = (getattr(node, "id", "") or "").replace("-", "").lower()
+        db_req = (self._db_view_requirements or {}).get(norm_db_id, {})
+
+        status_field_names = ("ステータス", "Status", "進捗", "状態", "優先度", "Priority")
+        primary_status_field = next((f for f in single_props if f in status_field_names), None)
+        primary_status_vals = (
+            ConfluenceImporter._extract_db_field_values(node, primary_status_field)
+            if primary_status_field
+            else []
+        )
+        is_smart_status = 2 <= len(primary_status_vals) <= 7
+
+        expects_board = bool(
+            any(bf in single_props for bf in db_req.get("board_fields", set()))
+            or (db_req.get("needs_board") and (primary_status_field or single_props))
+            or (is_smart_status and primary_status_field)
+        )
+        expects_gallery = bool(db_req.get("needs_gallery"))
+
+        has_group_by_req = any(
+            bool(ConfluenceImporter._extract_db_field_values(node, gb_field))
+            for gb_field in db_req.get("group_by_fields", set())
+        )
+        requested_contexts = db_req.get("requested_contexts", set())
+        has_context_match = False
+        if requested_contexts:
+            for prop_name in list(dict.fromkeys(single_props + multi_props)):
+                vals = ConfluenceImporter._extract_db_field_values(node, prop_name)
+                if any((v == ctx or (len(v) >= 2 and v in ctx)) for v in vals for ctx in requested_contexts):
+                    has_context_match = True
+                    break
+        expects_filtered = bool(has_group_by_req or has_context_match or (is_smart_status and primary_status_field))
+
+        return expects_board, expects_gallery, expects_filtered
+
     def verify_tree(
         self,
         node: PageNode,
         page_id_map: Dict[str, str],
         expected_parent_id: Optional[str] = None,
+        _analyze_root: bool = True,
     ) -> List[Dict[str, Any]]:
         """ツリー全体（通常ページおよびデータベース）を再帰的に検証する。"""
+        if _analyze_root:
+            self._db_view_requirements = ConfluenceImporter._analyze_database_view_requirements(node)
         results = []
         conf_id = page_id_map.get(node.id)
         if conf_id:
@@ -724,7 +772,7 @@ class MigrationVerifier:
 
         # 子ページの検証
         for child in node.children:
-            results.extend(self.verify_tree(child, page_id_map, this_parent_id))
+            results.extend(self.verify_tree(child, page_id_map, this_parent_id, _analyze_root=False))
 
         return results
 
