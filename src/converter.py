@@ -219,6 +219,17 @@ class NotionToConfluenceConverter:
                     return unicodedata.normalize("NFC", f"{clean_name}_{b_id_short}.{clean_ext}")
         return f"{b_type}_{b_id_short}.{default_ext}"
 
+    def _render_warning_note_macro(self, title: str, body_html: str) -> str:
+        """移行時の未対応・未展開・ZIP未収録要素を統一された簡潔な Confluence note マクロで描画する。"""
+        # noteマクロ自体がConfluence標準の「！」アイコンを描画するため、タイトル先頭に ⚠️ を付けない
+        title_param = clean_parameter_text(title)
+        return (
+            f'<ac:structured-macro ac:name="note">'
+            f'<ac:parameter ac:name="title">{title_param}</ac:parameter>'
+            f'<ac:rich-text-body>{body_html}</ac:rich-text-body>'
+            f'</ac:structured-macro>'
+        )
+
     def _render_unsupported_external_embed_note(self, b: Dict[str, Any]) -> str:
         """未対応外部アプリ連携・URL空・破損プレースホルダーURLブロックをConfluence noteマクロで安全にレンダリングする。
         実質的に無意味な空要素の場合は警告ブロックを出さず空文字列を返す。"""
@@ -261,8 +272,6 @@ class NotionToConfluenceConverter:
         if b.get("children_blocks"):
             children_html = self.blocks_to_storage_format(b["children_blocks"])
 
-        # noteマクロ自体がConfluence標準の「！」アイコンを描画するため、タイトル先頭に ⚠️ を付けない
-        title_param = clean_parameter_text(f"未対応ページ要素: {svc_name}")
         body_parts: List[str] = []
         if safe_url:
             body_parts.append(
@@ -288,12 +297,7 @@ class NotionToConfluenceConverter:
         if children_html:
             body_parts.append(children_html)
 
-        return (
-            f'<ac:structured-macro ac:name="note">'
-            f'<ac:parameter ac:name="title">{title_param}</ac:parameter>'
-            f'<ac:rich-text-body>{"".join(body_parts)}</ac:rich-text-body>'
-            f'</ac:structured-macro>'
-        )
+        return self._render_warning_note_macro(f"未対応ページ要素: {svc_name}", "".join(body_parts))
 
     def format_property_for_confluence(self, prop: Any) -> str:
         """Notionプロパティ辞書をConfluenceのXHTML表現にフォーマットする。"""
@@ -678,7 +682,7 @@ class NotionToConfluenceConverter:
                 if not target_title and not target_info and href and "#" in href:
                     base_href = href.split("#", 1)[0].strip()
                     if not base_href or getattr(self, "current_page_title", None):
-                        target_uuid = getattr(self, "current_node_id", "").replace("-", "").lower()
+                        target_uuid = (getattr(self, "current_node_id", None) or "").replace("-", "").lower()
                         target_title = getattr(self, "current_page_title", None)
 
                 if target_info and target_info.get("node_type") == "database":
@@ -757,6 +761,11 @@ class NotionToConfluenceConverter:
                         f'<ac:link-body>{escaped}</ac:link-body>'
                         f'</ac:link>'
                     )
+                elif item.get("_is_unresolved_external_page"):
+                    if href and href.startswith(("http://", "https://")):
+                        escaped = f'<a href="{html.escape(href)}">{escaped}</a>（⚠️ 移行対象外ページ）'
+                    else:
+                        escaped = f'<span>{escaped}（⚠️ 移行対象外ページ）</span>'
                 elif href:
                     escaped = f'<a href="{html.escape(href)}">{escaped}</a>'
 
@@ -1219,14 +1228,22 @@ class NotionToConfluenceConverter:
                                     target_info = m
                                     break
 
-                disp_title = (target_info.get("title") if target_info else None) or child_title
-                escaped_title = html.escape(disp_title)
-                output.append(
-                    f'<p><ac:link ac:card-appearance="inline">'
-                    f'<ri:page ri:content-title="{escaped_title}" />'
-                    f'<ac:link-body>{escaped_title}</ac:link-body>'
-                    f'</ac:link></p>'
-                )
+                if not target_info and b.get("_is_unresolved_external_page"):
+                    output.append(
+                        self._render_warning_note_macro(
+                            f"移行対象外の外部ページ: {child_title}",
+                            "<p>参照先ページがエクスポートZIPに含まれていないためリンクを解決できませんでした。</p>",
+                        )
+                    )
+                else:
+                    disp_title = (target_info.get("title") if target_info else None) or child_title
+                    escaped_title = html.escape(disp_title)
+                    output.append(
+                        f'<p><ac:link ac:card-appearance="inline">'
+                        f'<ri:page ri:content-title="{escaped_title}" />'
+                        f'<ac:link-body>{escaped_title}</ac:link-body>'
+                        f'</ac:link></p>'
+                    )
 
             elif b_type == "child_database":
                 if b.get("is_linked_database"):
@@ -1363,7 +1380,13 @@ class NotionToConfluenceConverter:
                         else:
                             output.append(embed_html)
                     else:
-                        output.append(f'<p>📊 <em>データベースビュー: {html.escape(source_name)}</em></p>')
+                        db_label = source_name or b.get("database_id") or b.get("id") or "外部データベース"
+                        output.append(
+                            self._render_warning_note_macro(
+                                f"未展開の外部データベース: {db_label}",
+                                "<p>移行対象外（エクスポートZIP未収録）の外部データベースのため展開できませんでした。</p>",
+                            )
+                        )
 
                 else:
                     db_title = b.get("database_title") or b.get("child_database", {}).get("title", "Untitled Database")
@@ -1457,6 +1480,20 @@ class NotionToConfluenceConverter:
                             f'<ac:link-body>{escaped_title}</ac:link-body>'
                             f'</ac:link></p>'
                         )
+                    elif b.get("_is_unresolved_external_db"):
+                        output.append(
+                            self._render_warning_note_macro(
+                                f"未展開の外部データベース: {target_page_id}",
+                                "<p>移行対象外（エクスポートZIP未収録）の外部データベースのため展開できませんでした。</p>",
+                            )
+                        )
+                    elif b.get("_is_unresolved_external_page"):
+                        output.append(
+                            self._render_warning_note_macro(
+                                f"移行対象外の外部ページ: {target_page_id}",
+                                "<p>参照先ページがエクスポートZIPに含まれていないためリンクを解決できませんでした。</p>",
+                            )
+                        )
                     else:
                         output.append(
                             f'<p>🔗 <em>Notionリンク: {target_page_id}</em></p>'
@@ -1484,11 +1521,17 @@ class NotionToConfluenceConverter:
                 elif synced_from:
                     sync_orig_id = synced_from.get("block_id", "")
                     output.append(
-                        f'<p>🔄 <em>同期ブロック（同期元: {html.escape(sync_orig_id)}）</em></p>'
+                        self._render_warning_note_macro(
+                            "未展開の外部同期ブロック",
+                            f"<p>同期元（<code>{html.escape(sync_orig_id)}</code>）がHTMLエクスポートに含まれていないため本文を展開できませんでした。</p>",
+                        )
                     )
                 elif b.get("_is_external_synced_block"):
                     output.append(
-                        '<p>⚠️ <em>外部同期ブロック（同期元がHTMLエクスポートに含まれていないため本文未展開）</em></p>'
+                        self._render_warning_note_macro(
+                            "未展開の外部同期ブロック",
+                            "<p>同期元がHTMLエクスポートに含まれていないため本文を展開できませんでした。</p>",
+                        )
                     )
 
             elif b_type in ("embed", "figma", "miro", "trello", "maps", "google_drive", "twitter", "gist", "codepen"):
@@ -1598,7 +1641,15 @@ class NotionToConfluenceConverter:
                             f'<ac:parameter ac:name="">{norm_id}</ac:parameter>'
                             f'</ac:structured-macro>'
                         )
-                if img_url or filename:
+                if b.get("_attachment_missing_in_zip"):
+                    disp = filename or b.get("_missing_attachment_src") or "画像ファイル"
+                    output.append(
+                        self._render_warning_note_macro(
+                            f"未収録の添付画像: {disp}",
+                            f"<p>{img_anchor}元画像（<code>{html.escape(disp)}</code>）がエクスポートZIP内に含まれていないため取り込めませんでした。</p>{caption_html}",
+                        )
+                    )
+                elif img_url or filename:
                     output.append(
                         f'<p>{img_anchor}<ac:image>'
                         f'<ri:attachment ri:filename="{html.escape(filename)}" />'
@@ -1616,7 +1667,15 @@ class NotionToConfluenceConverter:
                 has_local_attachment = bool(
                     b.get("_attachment_bytes") or b.get("_attachment_zip_entry") or b.get("_attachment_filename")
                 )
-                if b.get("_is_unsupported_external_embed") or (
+                if b.get("_attachment_missing_in_zip"):
+                    disp = str(b.get("_display_name") or filename or b.get("_missing_attachment_src") or "PDF文書")
+                    output.append(
+                        self._render_warning_note_macro(
+                            f"未収録のPDF: {disp}",
+                            f"<p>元ファイル（<code>{html.escape(disp)}</code>）がエクスポートZIP内に含まれていないため取り込めませんでした。</p>{caption_html}",
+                        )
+                    )
+                elif b.get("_is_unsupported_external_embed") or (
                     not b.get("_attachment_uploaded", True)
                     and not b.get("_attachment_bytes")
                     and not b.get("_attachment_zip_entry")
@@ -1657,7 +1716,15 @@ class NotionToConfluenceConverter:
                 display_label = unicodedata.normalize("NFC", str(b.get("_display_name") or filename))
                 caption = self.convert_rich_text(file_data.get("caption", []))
                 caption_html = f"<p><em>{caption}</em></p>" if caption else ""
-                if b.get("_is_unsupported_external_embed") or (
+                if b.get("_attachment_missing_in_zip"):
+                    disp = display_label or str(b.get("_missing_attachment_src") or "添付ファイル")
+                    output.append(
+                        self._render_warning_note_macro(
+                            f"未収録の添付ファイル: {disp}",
+                            f"<p>元ファイル（<code>{html.escape(disp)}</code>）がエクスポートZIP内に含まれていないため取り込めませんでした。</p>{caption_html}",
+                        )
+                    )
+                elif b.get("_is_unsupported_external_embed") or (
                     not b.get("_attachment_uploaded", True)
                     and not b.get("_attachment_bytes")
                     and not b.get("_attachment_zip_entry")
@@ -1707,6 +1774,14 @@ class NotionToConfluenceConverter:
                         f'</ac:rich-text-body>'
                         f'</ac:structured-macro>'
                     )
+                elif b.get("_attachment_missing_in_zip"):
+                    disp = str(b.get("_display_name") or b.get("_attachment_filename") or b.get("_missing_attachment_src") or "動画ファイル")
+                    output.append(
+                        self._render_warning_note_macro(
+                            f"未収録の動画ファイル: {disp}",
+                            f"<p>元ファイル（<code>{html.escape(disp)}</code>）がエクスポートZIP内に含まれていないため取り込めませんでした。</p>{caption_html}",
+                        )
+                    )
                 elif b.get("_is_unsupported_external_embed") or (
                     not b.get("_attachment_uploaded", True)
                     and not b.get("_attachment_bytes")
@@ -1753,6 +1828,14 @@ class NotionToConfluenceConverter:
                         f'{caption_html}'
                         f'</ac:rich-text-body>'
                         f'</ac:structured-macro>'
+                    )
+                elif b.get("_attachment_missing_in_zip"):
+                    disp = str(b.get("_display_name") or b.get("_attachment_filename") or b.get("_missing_attachment_src") or "音声ファイル")
+                    output.append(
+                        self._render_warning_note_macro(
+                            f"未収録の音声ファイル: {disp}",
+                            f"<p>元ファイル（<code>{html.escape(disp)}</code>）がエクスポートZIP内に含まれていないため取り込めませんでした。</p>{caption_html}",
+                        )
                     )
                 elif b.get("_is_unsupported_external_embed") or (
                     not b.get("_attachment_uploaded", True)

@@ -15,6 +15,9 @@ from bs4 import BeautifulSoup
 from src.extractor import (
     PageNode,
     get_node_external_synced_blocks,
+    get_node_missing_zip_attachments,
+    get_node_unresolved_external_dbs,
+    get_node_unresolved_external_pages,
     is_substanceless_unsupported_block,
     is_unsupported_page_element_block,
 )
@@ -175,7 +178,11 @@ class MigrationVerifier:
         expected_attachment_filenames: List[str] = []
 
         for b in all_blocks:
-            if b.get("_attachment_uploaded") is False or is_unsupported_page_element_block(b):
+            if (
+                b.get("_attachment_uploaded") is False
+                or b.get("_attachment_missing_in_zip")
+                or is_unsupported_page_element_block(b)
+            ):
                 continue
             b_type = b.get("type", "")
             fn = b.get("_attachment_filename")
@@ -202,7 +209,9 @@ class MigrationVerifier:
 
         real_pdf_blocks = [
             b for b in all_blocks
-            if b.get("type") == "pdf" and not is_unsupported_page_element_block(b)
+            if b.get("type") == "pdf"
+            and not is_unsupported_page_element_block(b)
+            and not b.get("_attachment_missing_in_zip")
         ]
         if real_pdf_blocks:
             attached_pdf_blocks = [b for b in real_pdf_blocks if b.get("_attachment_uploaded", True)]
@@ -223,7 +232,9 @@ class MigrationVerifier:
 
         real_file_blocks = [
             b for b in all_blocks
-            if b.get("type") == "file" and not is_unsupported_page_element_block(b)
+            if b.get("type") == "file"
+            and not is_unsupported_page_element_block(b)
+            and not b.get("_attachment_missing_in_zip")
         ]
         if real_file_blocks:
             attached_file_blocks = [b for b in real_file_blocks if b.get("_attachment_uploaded", True)]
@@ -241,7 +252,9 @@ class MigrationVerifier:
 
         real_video_blocks = [
             b for b in all_blocks
-            if b.get("type") == "video" and not is_unsupported_page_element_block(b)
+            if b.get("type") == "video"
+            and not is_unsupported_page_element_block(b)
+            and not b.get("_attachment_missing_in_zip")
         ]
         if real_video_blocks:
             if ('data-card-appearance="embed"' in storage_body or '<ac:structured-macro ac:name="multimedia"' in storage_body or '<ac:structured-macro ac:name="widget"' in storage_body or '<ac:link' in storage_body):
@@ -251,7 +264,9 @@ class MigrationVerifier:
 
         real_audio_blocks = [
             b for b in all_blocks
-            if b.get("type") == "audio" and not is_unsupported_page_element_block(b)
+            if b.get("type") == "audio"
+            and not is_unsupported_page_element_block(b)
+            and not b.get("_attachment_missing_in_zip")
         ]
         if real_audio_blocks:
             if ('data-card-appearance="embed"' in storage_body or '<ac:structured-macro ac:name="multimedia"' in storage_body or '<ac:link' in storage_body):
@@ -317,6 +332,108 @@ class MigrationVerifier:
             warnings.append(
                 f"HTMLエクスポート未収録・未展開の外部同期ブロックを検出しました ({len(ext_synced)} 件){ref_suffix}"
             )
+            if (
+                '<ac:structured-macro ac:name="note"' in storage_body
+                and "未展開の外部同期ブロック" in storage_body
+            ) or "同期ブロック（同期元" in storage_body:
+                checks_passed.append(
+                    f"External synced block fallback note verified in Confluence body ({len(ext_synced)} item(s))."
+                )
+
+        # 5-b3. 移行対象外（ZIP未収録）の外部データベース参照検知
+        ext_dbs = get_node_unresolved_external_dbs(node)
+        if not ext_dbs and (
+            "未展開の外部データベース" in storage_body
+            or "移行対象外のため未展開" in storage_body
+        ):
+            linked_db_blocks = [
+                b for b in all_blocks
+                if b.get("type") == "child_database" and b.get("is_linked_database")
+            ]
+            ext_dbs = [
+                {
+                    "database_name": (
+                        (b.get("data_sources") or [{}])[0].get("name")
+                        if isinstance((b.get("data_sources") or [{}])[0], dict)
+                        else ""
+                    )
+                    or b.get("database_id")
+                    or b.get("id")
+                    or "外部データベース"
+                }
+                for b in linked_db_blocks
+            ] or [{"database_name": "外部データベース"}]
+        if ext_dbs:
+            db_names = [str(item.get("database_name") or item.get("database_id") or "") for item in ext_dbs]
+            db_names = [n for n in db_names if n]
+            name_suffix = f" [参照先DB: {', '.join(db_names[:3])}]" if db_names else ""
+            warnings.append(
+                f"移行対象外（ZIP未収録）の外部データベース参照を検出しました ({len(ext_dbs)} 件){name_suffix}"
+            )
+            if (
+                '<ac:structured-macro ac:name="note"' in storage_body
+                and "未展開の外部データベース" in storage_body
+            ):
+                checks_passed.append(
+                    f"Unresolved external database fallback note verified in Confluence body ({len(ext_dbs)} item(s))."
+                )
+
+        # 5-b4. 移行対象外（ZIP未収録）の外部ページ参照検知
+        ext_pages = get_node_unresolved_external_pages(node)
+        if not ext_pages and (
+            "移行対象外の外部ページ" in storage_body
+            or "移行対象外ページ" in storage_body
+        ):
+            ext_pages = [{"target_title": "外部ページ", "kind": "fallback"}]
+        if ext_pages:
+            page_labels = [str(item.get("target_title") or item.get("target_id") or "") for item in ext_pages]
+            page_labels = [lbl for lbl in page_labels if lbl]
+            label_suffix = f" [参照先: {', '.join(page_labels[:3])}]" if page_labels else ""
+            warnings.append(
+                f"移行対象外（ZIP未収録）の外部ページ参照を検出しました ({len(ext_pages)} 件){label_suffix}"
+            )
+            has_block_fallback = (
+                '<ac:structured-macro ac:name="note"' in storage_body
+                and "移行対象外の外部ページ" in storage_body
+            )
+            has_inline_fallback = "移行対象外ページ" in storage_body
+            if has_block_fallback or has_inline_fallback:
+                checks_passed.append(
+                    f"Unresolved external page fallback verified in Confluence body ({len(ext_pages)} item(s))."
+                )
+
+        # 5-b5. ZIP未収録のローカル添付ファイル・画像・メディア検知
+        missing_atts = get_node_missing_zip_attachments(node)
+        if not missing_atts and any(
+            marker in storage_body
+            for marker in (
+                "未収録の添付画像",
+                "未収録のPDF",
+                "未収録の添付ファイル",
+                "未収録の動画ファイル",
+                "未収録の音声ファイル",
+            )
+        ):
+            missing_atts = [{"filename": "ZIP未収録ファイル", "type": "file"}]
+        if missing_atts:
+            att_names = [str(item.get("filename") or item.get("src") or "") for item in missing_atts]
+            att_names = [n for n in att_names if n]
+            att_suffix = f" [ファイル: {', '.join(att_names[:3])}]" if att_names else ""
+            warnings.append(
+                f"ZIP未収録の添付ファイル・メディアを検出しました ({len(missing_atts)} 件){att_suffix}"
+            )
+            has_att_fallback = (
+                '<ac:structured-macro ac:name="note"' in storage_body
+                and "エクスポートZIP内に含まれていないため取り込めませんでした" in storage_body
+            )
+            if has_att_fallback:
+                checks_passed.append(
+                    f"Missing ZIP attachment fallback note verified in Confluence body ({len(missing_atts)} item(s))."
+                )
+            else:
+                issues.append(
+                    f"Missing ZIP attachments detected ({len(missing_atts)} item(s)), but fallback note was not found in Confluence body."
+                )
 
         # 5-c. ページ内リンク（アンカー指定または自ページへのリンク）において、カスタムリンク名がページタイトルで上書きされる不正なインラインスマートカードの検知
         def _is_self_page_title(target_t: str, ref_t: str) -> bool:
@@ -374,6 +491,9 @@ class MigrationVerifier:
         node.properties = {}
         node.comments = []
         node.external_synced_blocks = []
+        node.unresolved_external_dbs = []
+        node.unresolved_external_pages = []
+        node.missing_zip_attachments = []
         return {
             "page_id": confluence_page_id,
             "title": node.title,
@@ -563,6 +683,9 @@ class MigrationVerifier:
         node.properties = {}
         node.comments = []
         node.external_synced_blocks = []
+        node.unresolved_external_dbs = []
+        node.unresolved_external_pages = []
+        node.missing_zip_attachments = []
         return {
             "page_id": confluence_db_id,
             "title": node.title,

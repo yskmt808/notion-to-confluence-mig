@@ -433,6 +433,316 @@ class TestExternalSyncedBlockCliIntegration(unittest.TestCase):
         self.assertIn("HTMLエクスポート未収録・未展開の外部同期ブロックを検出しました", out)
         self.assertIn("orig-outside-777", out)
 
+    def _create_synced_external_db_zip(self, zip_path: str):
+        root_id = "11111111-1111-1111-1111-111111111111"
+        child_id = "22222222-2222-2222-2222-222222222222"
+        ext_db_id = "4187be77-284d-80fc-8b42-f0957d728070"
+
+        root_html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Root</title></head>
+<body>
+  <article id="{root_id}" class="page sans">
+    <div class="page-body">
+      <p>ルート本文</p>
+      <figure id="{child_id}" class="link-to-page"><a href="Root/Child {child_id.replace('-', '')}.html">Child</a></figure>
+    </div>
+  </article>
+</body></html>"""
+
+        child_html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Child</title></head>
+<body>
+  <article id="{child_id}" class="page sans">
+    <div class="page-body">
+      <div dir="auto">
+        <div class="collection-content" dir="ltr" id="{ext_db_id}">
+          <h4 class="collection-title">外部DB</h4>
+          <div class="collection-content-wrapper">
+            <table class="collection-content"><tbody></tbody></table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </article>
+</body></html>"""
+
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr(f"Root {root_id.replace('-', '')}.html", root_html)
+            zf.writestr(f"Root/Child {child_id.replace('-', '')}.html", child_html)
+
+    def test_synced_external_db_dry_run_converter_and_verifier_warnings(self):
+        """同期ブロック経由の外部DB参照時にdry-run WARNING・本文警告・検証WARNが出力されること"""
+        zpath = os.path.join(self.tmpdir, "synced_ext_db.zip")
+        self._create_synced_external_db_zip(zpath)
+        cp_path = os.path.join(self.tmpdir, "cp_ext_db.json")
+        report_dir = os.path.join(self.tmpdir, "reports_ext_db")
+
+        # 1. Extractor + Converter 単体確認
+        tree = HtmlZipExtractor(zpath).extract_tree()
+        child_node = tree.children[0]
+        self.assertEqual(len(child_node.unresolved_external_dbs), 1)
+        self.assertEqual(child_node.unresolved_external_dbs[0]["database_name"], "外部DB")
+        self.assertEqual(child_node.unresolved_external_dbs[0]["database_id"], "4187be77-284d-80fc-8b42-f0957d728070")
+        self.assertTrue(child_node.unresolved_external_dbs[0]["via_synced_block"])
+
+        storage = NotionToConfluenceConverter().blocks_to_storage_format(child_node.blocks)
+        assert_valid_storage_xml(self, storage)
+        self.assertEqual(
+            storage,
+            '<ac:structured-macro ac:name="note"><ac:parameter ac:name="title">未展開の外部データベース: 外部DB</ac:parameter><ac:rich-text-body><p>移行対象外（エクスポートZIP未収録）の外部データベースのため展開できませんでした。</p></ac:rich-text-body></ac:structured-macro>',
+        )
+
+        # 2. dry-run サマリー・テレメトリ確認
+        os.makedirs(report_dir, exist_ok=True)
+        with patch("migrate.ConfluenceImporter") as mock_imp_cls:
+            out, _ = self._run_main([
+                "--zip", zpath,
+                "--dry-run",
+                "--no-dashboard",
+                "--checkpoint", cp_path,
+                "--generate-debug-report",
+                "--debug-report-dir", report_dir,
+            ])
+
+        mock_imp_cls.assert_not_called()
+        self.assertIn("ドライラン結果サマリー: WARNING 1 件", out)
+        self.assertIn("移行対象外（ZIP未収録）の外部データベース参照を 1 件検出しました（対象ページ: 1 件）", out)
+        self.assertIn("[HTML] Child", out)
+        self.assertIn("外部DB", out)
+
+        with open(os.path.join(report_dir, "debug_report.json"), "r", encoding="utf-8") as f:
+            report_data = json.load(f)
+        self.assertEqual(report_data["warnings_count"], 1)
+        self.assertEqual(report_data["diagnostics"]["unresolved_external_dbs_count"], 1)
+
+        # 3. Verifier が WARN を返すこと
+        mock_client = MagicMock()
+        mock_client.get_page_attachments.return_value = []
+        mock_client.get_page_by_id.return_value = {
+            "id": "6002",
+            "title": "Child",
+            "ancestors": [{"id": "6001"}],
+            "body": {"storage": {"value": storage}, "view": {"value": storage}},
+        }
+        res = MigrationVerifier(mock_client).verify_page_node(child_node, "6002")
+        self.assertEqual(res["status"], "WARN")
+        self.assertTrue(any("外部データベース参照を検出しました" in w and "外部DB" in w for w in res["warnings"]))
+
+    def test_error_pattern_zip_detects_unresolved_external_db_warning(self):
+        """更新された error_pattern_ExportBlock.zip で外部DB参照がWARNINGとして検出されること"""
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+        zip_path = os.path.join(repo_root, "error_pattern_ExportBlock.zip")
+        if not os.path.exists(zip_path):
+            self.skipTest("error_pattern_ExportBlock.zip not found")
+
+        tree = HtmlZipExtractor(zip_path).extract_tree()
+        telemetry = SanitizedTelemetry()
+        telemetry.record_tree(tree)
+        self.assertGreaterEqual(telemetry.unresolved_external_dbs_count, 1)
+        self.assertGreaterEqual(telemetry.total_warnings_count, 1)
+
+
+class TestUnifiedMissingAndUnsupportedWarningsPlanA(unittest.TestCase):
+    """案A: 5カテゴリ統一WARNING検知・noteマクロ変換・dry-run・Verifier(WARN)の統合テスト。"""
+
+    def setUp(self):
+        self._orig_cwd = os.getcwd()
+        self._tmpdir_obj = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmpdir_obj.name
+        os.chdir(self.tmpdir)
+        root_logger = logging.getLogger()
+        self._orig_handlers = list(root_logger.handlers)
+        self._orig_level = root_logger.level
+
+    def tearDown(self):
+        root_logger = logging.getLogger()
+        for h in list(root_logger.handlers):
+            if h not in self._orig_handlers:
+                try:
+                    h.close()
+                except Exception:
+                    pass
+        root_logger.handlers = self._orig_handlers
+        root_logger.setLevel(self._orig_level)
+        os.chdir(self._orig_cwd)
+        self._tmpdir_obj.cleanup()
+
+    def _run_main(self, argv):
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with patch.object(sys, "argv", ["migrate.py"] + argv), \
+             contextlib.redirect_stdout(stdout_buf), \
+             contextlib.redirect_stderr(stderr_buf):
+            migrate.main()
+        return stdout_buf.getvalue(), stderr_buf.getvalue()
+
+    def test_missing_external_pages_and_attachments_across_pipeline(self):
+        """ZIP未収録の外部ページ参照・ローカル添付(画像/PDF/音声/動画/ファイル)・通常リンクの境界を全段検証する。"""
+        root_id = "aaaa1111-1111-1111-1111-111111111111"
+        missing_child_id = "bbbb2222-2222-2222-2222-222222222222"
+        missing_inline_id = "cccc3333333333333333333333333333"
+        present_child_id = "dddd4444-4444-4444-4444-444444444444"
+
+        root_html = _build_html_doc(
+            "Secret Hub Page",
+            f"""
+            <p>通常のテキスト段落</p>
+            <p><a href="#local-anchor">ページ内アンカー</a> と <a href="https://example.com/public">通常のWebリンク</a> と <a href="Root/PresentChild {present_child_id.replace('-', '')}.html">収録済み子ページ</a></p>
+            <figure id="{missing_child_id}" class="link-to-page"><a href="MissingChild {missing_child_id.replace('-', '')}.html">未収録子ページ</a></figure>
+            <div dir="auto">
+              <p>同期ブロック内の <a href="https://www.notion.so/org/Outside-{missing_inline_id}">外部Notionリンク</a></p>
+              <figure class="image"><img src="assets/missing_photo.png" /></figure>
+            </div>
+            <figure class="pdf"><div class="source"><a href="assets/missing_spec.pdf">missing_spec.pdf</a></div></figure>
+            <figure><div class="source"><a href="assets/missing_audio.mp3">missing_audio.mp3</a></div></figure>
+            <figure><div class="source"><a href="assets/missing_video.mp4">missing_video.mp4</a></div></figure>
+            <figure><div class="source"><a href="assets/missing_sheet.xlsx">missing_sheet.xlsx</a></div></figure>
+            <figure><a href="https://drive.google.com/file/d/xyz/view">極秘仕様書.gdoc</a></figure>
+            """,
+            page_id=root_id,
+        )
+        present_child_html = _build_html_doc(
+            "PresentChild",
+            "<p>収録済み子ページの本文</p>",
+            page_id=present_child_id,
+        )
+
+        zpath = os.path.join(self.tmpdir, "plan_a_missing.zip")
+        with zipfile.ZipFile(zpath, "w") as zf:
+            zf.writestr(f"Secret Hub Page {root_id.replace('-', '')}.html", root_html)
+            zf.writestr(f"Secret Hub Page/PresentChild {present_child_id.replace('-', '')}.html", present_child_html)
+
+        tree = HtmlZipExtractor(zpath).extract_tree()
+
+        # 1. Extractor: 外部ページ(未収録child_page + 同期ブロック内inline)、ZIP未収録添付5種が検出され、通常リンク・収録済みページは誤検知されないこと
+        self.assertEqual(len(tree.unresolved_external_pages), 2)
+        kinds = {p["kind"] for p in tree.unresolved_external_pages}
+        self.assertEqual(kinds, {"child_page", "inline_link"})
+        inline_entry = next(p for p in tree.unresolved_external_pages if p["kind"] == "inline_link")
+        self.assertTrue(inline_entry["via_synced_block"])
+
+        self.assertEqual(len(tree.missing_zip_attachments), 5)
+        att_types = {a["type"] for a in tree.missing_zip_attachments}
+        self.assertEqual(att_types, {"image", "pdf", "audio", "video", "file"})
+        img_entry = next(a for a in tree.missing_zip_attachments if a["type"] == "image")
+        self.assertTrue(img_entry["via_synced_block"])
+
+        # 2. Importer._process_attachments: missing_in_zip はクラッシュせずアップロード対象外のままスキップされること
+        from src.importer import ConfluenceImporter
+        mock_client = MagicMock()
+        mock_client.get_page_attachments.return_value = []
+        importer = ConfluenceImporter("https://example.invalid/wiki", "u", "t", "SPACE")
+        importer.client = mock_client
+        importer._process_attachments(tree.blocks, "9001")
+        mock_client.upload_attachment.assert_not_called()
+
+        # 3. Converter: 統一 note マクロとインラインフォールバックが生成され、<ri:attachment> や ⚠️タイトル絵文字が混入しないこと
+        conv = NotionToConfluenceConverter(id_to_title_map={present_child_id: "PresentChild"})
+        storage = conv.blocks_to_storage_format(tree.blocks)
+        assert_valid_storage_xml(self, storage)
+        self.assertNotIn("<ri:attachment", storage)
+        self.assertIn("移行対象外の外部ページ: 未収録子ページ", storage)
+        self.assertIn("（⚠️ 移行対象外ページ）", storage)
+        self.assertIn("未収録の添付画像: missing_photo.png", storage)
+        self.assertIn("未収録のPDF: missing_spec.pdf", storage)
+        self.assertIn("未収録の音声ファイル: missing_audio.mp3", storage)
+        self.assertIn("未収録の動画ファイル: missing_video.mp4", storage)
+        self.assertIn("未収録の添付ファイル: missing_sheet.xlsx", storage)
+        self.assertIn("未対応ページ要素: Google Drive", storage)
+        # note マクロの title パラメータには ⚠️ を含めない (TCK_00012 準拠)
+        import re as _re
+        note_titles = _re.findall(r'<ac:parameter ac:name="title">(.*?)</ac:parameter>', storage)
+        self.assertTrue(len(note_titles) >= 7)
+        self.assertTrue(all("⚠️" not in t for t in note_titles), f"Unexpected emoji in note title: {note_titles}")
+
+        # 4. Telemetry: 件数集計が一致しページタイトル等PIIが漏洩しないこと
+        telemetry = SanitizedTelemetry()
+        telemetry.record_tree(tree)
+        report = telemetry.generate_report()
+        self.assertEqual(report["diagnostics"]["unresolved_external_pages_count"], 2)
+        self.assertEqual(report["diagnostics"]["missing_zip_attachments_count"], 5)
+        self.assertGreaterEqual(len(report["diagnostics"]["unsupported_elements_detected"]), 1)
+        self.assertEqual(report["warnings_count"], 8)  # 2 ext_pages + 5 missing_atts + 1 unsupported
+        self.assertNotIn("Secret Hub Page", json.dumps(report, ensure_ascii=False))
+
+        # 5. CLI --dry-run: 全カテゴリの WARNING が整理されたサマリーで表示されること
+        report_dir = os.path.join(self.tmpdir, "reports_plan_a")
+        os.makedirs(report_dir, exist_ok=True)
+        cp_path = os.path.join(self.tmpdir, "cp_plan_a.json")
+        with patch("migrate.ConfluenceImporter") as mock_imp_cls:
+            out, _ = self._run_main([
+                "--zip", zpath,
+                "--dry-run",
+                "--no-dashboard",
+                "--checkpoint", cp_path,
+                "--generate-debug-report",
+                "--debug-report-dir", report_dir,
+            ])
+        mock_imp_cls.assert_not_called()
+        self.assertIn("ドライラン結果サマリー: WARNING 8 件", out)
+        self.assertIn("未対応要素・外部アプリ埋め込み（フォールバック注記対象）を 1 件検出しました", out)
+        self.assertIn("移行対象外（ZIP未収録）の外部ページ参照を 2 件検出しました", out)
+        self.assertIn("ZIP未収録の添付ファイル・メディアを 5 件検出しました", out)
+        self.assertIn("[同期ブロック経由]", out)
+
+        # 6. Verifier: 添付・メディア欠落で FAIL にならず、WARN と checks_passed が記録されること
+        mock_client.get_page_by_id.return_value = {
+            "id": "9001",
+            "title": "Secret Hub Page",
+            "ancestors": [{"id": "9000"}],
+            "body": {"storage": {"value": storage}, "view": {"value": storage}},
+        }
+        vres = MigrationVerifier(mock_client).verify_page_node(tree, "9001", expected_parent_id="9000")
+        self.assertEqual(vres["status"], "WARN", f"Expected WARN, got issues={vres['issues']}, warnings={vres['warnings']}")
+        self.assertEqual(vres["issues"], [])
+        self.assertTrue(any("外部ページ参照を検出しました (2 件)" in w for w in vres["warnings"]))
+        self.assertTrue(any("ZIP未収録の添付ファイル・メディアを検出しました (5 件)" in w for w in vres["warnings"]))
+        self.assertTrue(any("Unresolved external page fallback verified" in c for c in vres["checks_passed"]))
+        self.assertTrue(any("Missing ZIP attachment fallback note verified" in c for c in vres["checks_passed"]))
+
+    def test_multizip_cross_zip_resolution_clears_external_page_and_db_warnings(self):
+        """マルチZIP分割エクスポート時に別ZIP収録のページ・DBは警告対象から自動解消されること。"""
+        from src.html_extractor import MultiZipExtractor
+
+        root1_id = "11111111-1111-1111-1111-111111111111"
+        page2_id = "22222222-2222-2222-2222-222222222222"
+        db2_id = "33333333-3333-3333-3333-333333333333"
+
+        zip1_html = _build_html_doc(
+            "Workspace A",
+            f"""
+            <p><a href="Workspace B/Page Two {page2_id.replace('-', '')}.html">Page Two</a></p>
+            <div class="collection-content" id="{db2_id}">
+              <h4 class="collection-title">Shared DB</h4>
+            </div>
+            """,
+            page_id=root1_id,
+        )
+        zip2_html = _build_html_doc(
+            "Workspace B",
+            f"""
+            <figure id="{page2_id}" class="link-to-page"><a href="Workspace B/Page Two {page2_id.replace('-', '')}.html">Page Two</a></figure>
+            """,
+            page_id="44444444-4444-4444-4444-444444444444",
+        )
+        page2_html = _build_html_doc("Page Two", "<p>Body in Zip2</p>", page_id=page2_id)
+
+        z1 = os.path.join(self.tmpdir, "part1.zip")
+        z2 = os.path.join(self.tmpdir, "part2.zip")
+        with zipfile.ZipFile(z1, "w") as zf1:
+            zf1.writestr(f"Workspace A {root1_id.replace('-', '')}.html", zip1_html)
+        with zipfile.ZipFile(z2, "w") as zf2:
+            zf2.writestr("Workspace B 44444444444444444444444444444444.html", zip2_html)
+            zf2.writestr(f"Workspace B/Page Two {page2_id.replace('-', '')}.html", page2_html)
+            zf2.writestr(f"Workspace B/Shared DB {db2_id.replace('-', '')}.csv", "Name,Status\nItem1,Open\n")
+
+        root = MultiZipExtractor([z1, z2]).extract_tree()
+        telemetry = SanitizedTelemetry()
+        telemetry.record_tree(root)
+        self.assertEqual(telemetry.unresolved_external_dbs_count, 0)
+        self.assertEqual(telemetry.unresolved_external_pages_count, 0)
+        self.assertEqual(telemetry.total_warnings_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

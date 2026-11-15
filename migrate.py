@@ -19,7 +19,15 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import glob
 import zipfile
-from src.extractor import NotionExtractor, PageNode, get_node_external_synced_blocks
+from src.extractor import (
+    NotionExtractor,
+    PageNode,
+    get_node_external_synced_blocks,
+    get_node_missing_zip_attachments,
+    get_node_unresolved_external_dbs,
+    get_node_unresolved_external_pages,
+    get_node_unsupported_page_elements,
+)
 from src.html_extractor import HtmlZipExtractor, MultiZipExtractor
 from src.importer import ConfluenceImporter
 from src.verifier import MigrationVerifier
@@ -174,17 +182,17 @@ def print_tree_summary(root: PageNode, verbose: bool = False, show_all: bool = F
     print("")
 
 
-def collect_external_synced_pages(root: PageNode) -> Tuple[int, List[Tuple[PageNode, List[Dict[str, Any]]]]]:
-    """ツリー全体からHTML未収録の外部同期ブロックを含むページ一覧と総件数を収集する。"""
+def _collect_warning_pages(root: PageNode, getter) -> Tuple[int, List[Tuple[PageNode, List[Dict[str, Any]]]]]:
+    """ツリー全体から指定の警告コレクタに該当するページ一覧と総件数を収集する。"""
     total_count = 0
     affected_pages: List[Tuple[PageNode, List[Dict[str, Any]]]] = []
 
     def _traverse(n: PageNode):
         nonlocal total_count
-        ext_blocks = get_node_external_synced_blocks(n)
-        if ext_blocks:
-            total_count += len(ext_blocks)
-            affected_pages.append((n, ext_blocks))
+        items = getter(n)
+        if items:
+            total_count += len(items)
+            affected_pages.append((n, items))
         for c in n.children:
             _traverse(c)
 
@@ -192,24 +200,66 @@ def collect_external_synced_pages(root: PageNode) -> Tuple[int, List[Tuple[PageN
     return total_count, affected_pages
 
 
+def collect_external_synced_pages(root: PageNode) -> Tuple[int, List[Tuple[PageNode, List[Dict[str, Any]]]]]:
+    """ツリー全体からHTML未収録の外部同期ブロックを含むページ一覧と総件数を収集する。"""
+    return _collect_warning_pages(root, get_node_external_synced_blocks)
+
+
+def collect_unresolved_external_db_pages(root: PageNode) -> Tuple[int, List[Tuple[PageNode, List[Dict[str, Any]]]]]:
+    """ツリー全体から移行対象外（ZIP未収録）の外部データベース参照を含むページ一覧と総件数を収集する。"""
+    return _collect_warning_pages(root, get_node_unresolved_external_dbs)
+
+
+def collect_unresolved_external_page_refs(root: PageNode) -> Tuple[int, List[Tuple[PageNode, List[Dict[str, Any]]]]]:
+    """ツリー全体から移行対象外（ZIP未収録）の外部ページ参照を含むページ一覧と総件数を収集する。"""
+    return _collect_warning_pages(root, get_node_unresolved_external_pages)
+
+
+def collect_missing_zip_attachment_pages(root: PageNode) -> Tuple[int, List[Tuple[PageNode, List[Dict[str, Any]]]]]:
+    """ツリー全体からZIP未収録の添付ファイル・メディアを含むページ一覧と総件数を収集する。"""
+    return _collect_warning_pages(root, get_node_missing_zip_attachments)
+
+
+def collect_unsupported_element_pages(root: PageNode) -> Tuple[int, List[Tuple[PageNode, List[Dict[str, Any]]]]]:
+    """ツリー全体から未対応要素・外部アプリ埋め込みを含むページ一覧と総件数を収集する。"""
+    return _collect_warning_pages(root, get_node_unsupported_page_elements)
+
+
+def _print_dry_run_warning_section(
+    header_label: str,
+    total_count: int,
+    affected_pages: List[Tuple[PageNode, List[Dict[str, Any]]]],
+):
+    if total_count <= 0:
+        return
+    print(
+        f"⚠️ {header_label}を {total_count} 件検出しました"
+        f"（対象ページ: {len(affected_pages)} 件）:"
+    )
+    for node, items in affected_pages:
+        print(f"  - [{node.node_type}] {node.title} (ID: {node.id}): {len(items)} 件")
+        for item in items:
+            msg = item.get("message")
+            if msg:
+                print(f"      ⚠️ {msg}")
+
+
 def print_dry_run_summary(tree: PageNode, telemetry: SanitizedTelemetry):
-    """ドライラン結果サマリー（WARNING件数・外部同期ブロック検出ページ一覧）を表示する。"""
+    """ドライラン結果サマリー（WARNING件数・5カテゴリの警告検出ページ一覧）を表示する。"""
     ext_total, affected_pages = collect_external_synced_pages(tree)
+    ext_db_total, affected_db_pages = collect_unresolved_external_db_pages(tree)
+    ext_page_total, affected_page_refs = collect_unresolved_external_page_refs(tree)
+    missing_att_total, affected_att_pages = collect_missing_zip_attachment_pages(tree)
+    unsup_total, affected_unsup_pages = collect_unsupported_element_pages(tree)
     warning_count = telemetry.total_warnings_count
 
     print("--------------------------------------------------")
     print(f"ドライラン結果サマリー: WARNING {warning_count} 件")
-    if ext_total > 0:
-        print(
-            f"⚠️ HTMLエクスポート未収録の外部同期ブロックを {ext_total} 件検出しました"
-            f"（対象ページ: {len(affected_pages)} 件）:"
-        )
-        for node, ext_blocks in affected_pages:
-            print(f"  - [{node.node_type}] {node.title} (ID: {node.id}): {len(ext_blocks)} 件")
-            for item in ext_blocks:
-                msg = item.get("message")
-                if msg:
-                    print(f"      ⚠️ {msg}")
+    _print_dry_run_warning_section("HTMLエクスポート未収録の外部同期ブロック", ext_total, affected_pages)
+    _print_dry_run_warning_section("移行対象外（ZIP未収録）の外部データベース参照", ext_db_total, affected_db_pages)
+    _print_dry_run_warning_section("移行対象外（ZIP未収録）の外部ページ参照", ext_page_total, affected_page_refs)
+    _print_dry_run_warning_section("ZIP未収録の添付ファイル・メディア", missing_att_total, affected_att_pages)
+    _print_dry_run_warning_section("未対応要素・外部アプリ埋め込み（フォールバック注記対象）", unsup_total, affected_unsup_pages)
 
 
 def print_verification_results(verify_results: List[Dict[str, Any]], verbose: bool = False, show_all: bool = False):
