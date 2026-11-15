@@ -68,46 +68,111 @@ class TestOutputSummarizer(unittest.TestCase):
         self.assertIn("抽出されたNotionツリー構造:", out_all)
         self.assertIn("ページ 49", out_all)
 
-    def test_verification_summary_switches_on_threshold(self):
-        # 100件の検証結果を作成（98件PASS, 1件WARN, 1件FAIL）
-        results = []
-        for i in range(98):
-            results.append({
-                "title": f"Page {i}",
-                "page_id": f"id_{i}",
+    def test_verification_summary_default_suppresses_pass_and_shows_abnormal(self):
+        # 小規模（3件）でもデフォルトで PASS 個別行は非表示となり、WARN/FAIL のみ表示されること
+        results = [
+            {
+                "title": "Pass Page 1",
+                "page_id": "p1",
                 "status": "PASS",
                 "checks_passed": ["title_match"],
                 "warnings": [],
                 "issues": [],
-            })
-        results.append({
-            "title": "Warning Page",
-            "page_id": "id_warn",
-            "status": "WARN",
-            "checks_passed": [],
-            "warnings": ["Missing image attachment"],
-            "issues": [],
-        })
-        results.append({
-            "title": "Failed Page",
-            "page_id": "id_fail",
-            "status": "FAIL",
-            "checks_passed": [],
-            "warnings": [],
-            "issues": ["Content body mismatch"],
-        })
+            },
+            {
+                "title": "Warning Page",
+                "page_id": "p2",
+                "status": "WARN",
+                "checks_passed": [],
+                "warnings": ["Missing image attachment"],
+                "issues": [],
+            },
+            {
+                "title": "Failed Page",
+                "page_id": "p3",
+                "status": "FAIL",
+                "checks_passed": [],
+                "warnings": [],
+                "issues": ["Content body mismatch"],
+            },
+        ]
 
-        # 1. サマライズ表示 (問題のある2件のみ表示され、98件のPASSは抑制される)
         f = io.StringIO()
         with redirect_stdout(f):
             print_verification_results(results, verbose=False, show_all=False)
         out = f.getvalue()
 
-        self.assertIn("検証サマリー: 合計 100 ページ | 正常: 98 | 警告: 1 | 失敗: 1", out)
+        self.assertIn("検証サマリー: 合計 3 ページ | 正常: 1 | 警告: 1 | 失敗: 1", out)
         self.assertIn("確認・対応が必要なページ (2 件):", out)
         self.assertIn("Warning Page", out)
         self.assertIn("Failed Page", out)
-        self.assertNotIn("Page 50", out)  # 正常ページは出力されない
+        self.assertNotIn("Pass Page 1", out)
+        self.assertIn("💡 全ページの個別検証項目を表示するには `--verbose` または `--show-all-pages` を指定してください。", out)
+
+    def test_verification_summary_all_pass_message(self):
+        # 全件PASSの場合、合格メッセージが表示され、個別行は表示されないこと
+        results = [
+            {
+                "title": f"Pass Page {i}",
+                "page_id": f"p_{i}",
+                "status": "PASS",
+                "checks_passed": ["title_match"],
+                "warnings": [],
+                "issues": [],
+            }
+            for i in range(5)
+        ]
+
+        f = io.StringIO()
+        with redirect_stdout(f):
+            print_verification_results(results, verbose=False, show_all=False)
+        out = f.getvalue()
+
+        self.assertIn("検証サマリー: 合計 5 ページ | 正常: 5 | 警告: 0 | 失敗: 0", out)
+        self.assertIn("✅ 全ページが整合性検証に完全合格しました（警告・エラーなし）。", out)
+        self.assertNotIn("Pass Page 0", out)
+        self.assertIn("💡 全ページの個別検証項目を表示するには `--verbose` または `--show-all-pages` を指定してください。", out)
+
+    def test_verification_summary_verbose_and_show_all(self):
+        # verbose=True または show_all=True で PASS を含む全件が表示されること
+        results = [
+            {
+                "title": "Pass Page 1",
+                "page_id": "p1",
+                "status": "PASS",
+                "checks_passed": ["title_match"],
+                "warnings": [],
+                "issues": [],
+            },
+            {
+                "title": "Warning Page",
+                "page_id": "p2",
+                "status": "WARN",
+                "checks_passed": [],
+                "warnings": ["Missing image attachment"],
+                "issues": [],
+            },
+        ]
+
+        # 1. show_all=True
+        f_show_all = io.StringIO()
+        with redirect_stdout(f_show_all):
+            print_verification_results(results, verbose=False, show_all=True)
+        out_show_all = f_show_all.getvalue()
+
+        self.assertIn("✅ [PASS] Pass Page 1 (ID: p1)", out_show_all)
+        self.assertIn("⚠️ [WARN] Warning Page (ID: p2)", out_show_all)
+        self.assertNotIn("✓ title_match", out_show_all)  # verboseでないためcheck詳細は出ない
+
+        # 2. verbose=True
+        f_verbose = io.StringIO()
+        with redirect_stdout(f_verbose):
+            print_verification_results(results, verbose=True, show_all=False)
+        out_verbose = f_verbose.getvalue()
+
+        self.assertIn("✅ [PASS] Pass Page 1 (ID: p1)", out_verbose)
+        self.assertIn("✓ title_match", out_verbose)
+        self.assertIn("⚠️ [WARN] Warning Page (ID: p2)", out_verbose)
 
     def test_result_summary_switches_on_threshold(self):
         # 40件の移行結果マッピング

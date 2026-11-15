@@ -274,8 +274,7 @@ def print_verification_results(verify_results: List[Dict[str, Any]], verbose: bo
     if total_warning_items > 0:
         print(f"  ⚠️ 検出された警告詳細: {total_warning_items} 件")
 
-    threshold = 25
-    if len(verify_results) <= threshold or verbose or show_all:
+    if verbose or show_all:
         for r in verify_results:
             icon = "✅" if r["status"] == "PASS" else ("⚠️" if r["status"] == "WARN" else "❌")
             print(f"{icon} [{r['status']}] {r['title']} (ID: {r['page_id']})")
@@ -287,7 +286,7 @@ def print_verification_results(verify_results: List[Dict[str, Any]], verbose: bo
             for iss in r["issues"]:
                 print(f"     ❌ {iss}")
     else:
-        # 大規模時は問題（警告・失敗）のあるページのみを抽出して報告
+        # デフォルトは問題（警告・失敗）のあるページのみを抽出して報告し、PASS個別行は非表示
         abnormal_results = [r for r in verify_results if r["status"] != "PASS"]
         if abnormal_results:
             print(f"\n⚠️ 確認・対応が必要なページ ({len(abnormal_results)} 件):")
@@ -300,7 +299,7 @@ def print_verification_results(verify_results: List[Dict[str, Any]], verbose: bo
                     print(f"     ❌ {iss}")
         else:
             print("✅ 全ページが整合性検証に完全合格しました（警告・エラーなし）。")
-        print("💡 全ページの個別検証項目を表示するには `--verbose` を指定してください。")
+        print("💡 全ページの個別検証項目を表示するには `--verbose` または `--show-all-pages` を指定してください。")
 
 
 def print_result_summary(mapping: Dict[str, Dict[str, Any]], result_path: str, show_all: bool = False, verbose: bool = False):

@@ -429,7 +429,7 @@ class TestExternalSyncedBlockCliIntegration(unittest.TestCase):
         self.assertIn("検証サマリー: 合計 3 ページ | 正常: 1 | 警告: 2 | 失敗: 0", out)
         self.assertIn("⚠️ [WARN] [HTML] Root Hub (ID: 5001)", out)
         self.assertIn("⚠️ [WARN] [HTML] External Ref Child (ID: 5002)", out)
-        self.assertIn("✅ [PASS] [HTML] Internal Sync Child (ID: 5003)", out)
+        self.assertNotIn("✅ [PASS] [HTML] Internal Sync Child (ID: 5003)", out)
         self.assertIn("HTMLエクスポート未収録・未展開の外部同期ブロックを検出しました", out)
         self.assertIn("orig-outside-777", out)
 
