@@ -1551,7 +1551,11 @@ class ConfluenceImporter:
 
         for b in blocks:
             b_type = b.get("type")
-            if b.get("_is_unsupported_external_embed") or is_unsupported_page_element_block(b):
+            if (
+                b.get("_is_unsupported_external_embed")
+                or b.get("_attachment_missing_in_zip")
+                or is_unsupported_page_element_block(b)
+            ):
                 b["_attachment_uploaded"] = False
                 if b.get("children_blocks"):
                     self._process_attachments(b["children_blocks"], page_id, uploaded_filenames=uploaded_filenames)

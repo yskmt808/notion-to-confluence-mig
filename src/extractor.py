@@ -343,6 +343,9 @@ class PageNode:
     last_edited_by: Optional[Dict[str, Any]] = None
     _cover_filename: Optional[str] = None
     external_synced_blocks: List[Dict[str, Any]] = field(default_factory=list)
+    unresolved_external_dbs: List[Dict[str, Any]] = field(default_factory=list)
+    unresolved_external_pages: List[Dict[str, Any]] = field(default_factory=list)
+    missing_zip_attachments: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def collect_external_synced_blocks_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -378,6 +381,553 @@ def get_node_external_synced_blocks(node: Any) -> List[Dict[str, Any]]:
     if recorded:
         return list(recorded)
     return collect_external_synced_blocks_from_blocks(getattr(node, "blocks", None) or [])
+
+
+def collect_unsupported_page_elements_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """ブロックツリーから実質情報を含む未対応要素・外部アプリ埋め込みを収集する。"""
+    found: List[Dict[str, Any]] = []
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        if is_unsupported_page_element_block(b) and not is_substanceless_unsupported_block(b):
+            b_type = str(b.get("type") or "unsupported")
+            svc = str(b.get("service_name") or b.get("_unsupported_service_name") or "").strip()
+            raw_label = str(b.get("raw_label") or b.get("_display_name") or "").strip()
+            via_sync = bool(b.get("_via_synced_block"))
+            via_suffix = " [同期ブロック経由]" if via_sync else ""
+            label_parts = [p for p in (svc, raw_label) if p]
+            target_label = " / ".join(label_parts) if label_parts else b_type
+            found.append({
+                "block_id": str(b.get("id", "")),
+                "type": b_type,
+                "service_name": svc,
+                "via_synced_block": via_sync,
+                "message": f"未対応要素・外部埋め込み '{target_label}' ({b_type}) をフォールバック注記に変換します{via_suffix}",
+            })
+        children = b.get("children_blocks") or []
+        if children:
+            found.extend(collect_unsupported_page_elements_from_blocks(children))
+    return found
+
+
+def get_node_unsupported_page_elements(node: Any) -> List[Dict[str, Any]]:
+    """PageNode内の実質情報を含む未対応要素一覧を取得する。"""
+    return collect_unsupported_page_elements_from_blocks(getattr(node, "blocks", None) or [])
+
+
+def collect_missing_zip_attachments_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """ブロックツリーからZIP内に実体ファイルが見つからなかったローカル添付/メディアを収集する。"""
+    found: List[Dict[str, Any]] = []
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("_attachment_missing_in_zip"):
+            b_type = str(b.get("type") or "file")
+            filename = str(
+                b.get("_display_name")
+                or b.get("_attachment_filename")
+                or b.get("_missing_attachment_src")
+                or "不明ファイル"
+            ).strip()
+            via_sync = bool(b.get("_via_synced_block"))
+            via_suffix = " [同期ブロック経由]" if via_sync else ""
+            default_msg = (
+                f"ZIP未収録の添付ファイル・メディア '{filename}' ({b_type}) を検出しました{via_suffix}"
+            )
+            found.append({
+                "block_id": str(b.get("id", "")),
+                "type": b_type,
+                "filename": filename,
+                "src": str(b.get("_missing_attachment_src") or ""),
+                "via_synced_block": via_sync,
+                "message": b.get("_missing_attachment_warning") or default_msg,
+            })
+        children = b.get("children_blocks") or []
+        if children:
+            found.extend(collect_missing_zip_attachments_from_blocks(children))
+    return found
+
+
+def get_node_missing_zip_attachments(node: Any) -> List[Dict[str, Any]]:
+    """PageNodeに記録されたZIP未収録添付ファイル・メディア一覧を取得する。"""
+    recorded = getattr(node, "missing_zip_attachments", None)
+    if recorded:
+        return list(recorded)
+    return collect_missing_zip_attachments_from_blocks(getattr(node, "blocks", None) or [])
+
+
+_ATTACHMENT_LINK_EXTENSIONS = (
+    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico",
+    ".mp4", ".mov", ".webm", ".mp3", ".wav", ".m4a", ".aac",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".csv", ".txt",
+)
+_INLINE_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
+)
+
+
+def is_notion_page_link_target(href: Optional[str], page_id: Optional[str] = None) -> bool:
+    """リンク先がNotionの内部ページ参照（ローカル .html または notion.so/site ページURL）かを判定する。"""
+    clean_href = (href or "").strip()
+    if clean_href.startswith("#"):
+        return False
+    if clean_href.lower().startswith(("mailto:", "tel:", "javascript:", "attachment:")):
+        return False
+    if page_id:
+        return True
+    if not clean_href:
+        return False
+    parsed = urllib.parse.urlparse(clean_href)
+    path_lower = urllib.parse.unquote(parsed.path or "").strip().lower()
+    if path_lower.endswith(_ATTACHMENT_LINK_EXTENSIONS):
+        return False
+    is_http = parsed.scheme.lower() in ("http", "https")
+    if not is_http:
+        return path_lower.endswith(".html") or bool(_INLINE_UUID_RE.search(clean_href))
+    host = (parsed.hostname or "").lower()
+    if any(h in host for h in ("notion.so", "notion.site")):
+        return bool(_INLINE_UUID_RE.search(clean_href))
+    return False
+
+
+def _iter_block_rich_text_lists(block: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+    """ブロック内の rich_text 配列群（table_row の cells 含む）を取得する。"""
+    lists: List[List[Dict[str, Any]]] = []
+    b_type = block.get("type")
+    if isinstance(b_type, str) and isinstance(block.get(b_type), dict):
+        rt = block[b_type].get("rich_text")
+        if isinstance(rt, list):
+            lists.append(rt)
+        if b_type == "table_row":
+            cells = block[b_type].get("cells")
+            if isinstance(cells, list):
+                for cell in cells:
+                    if isinstance(cell, list):
+                        lists.append(cell)
+    return lists
+
+
+def _match_node_ref(
+    candidate_ids: List[str],
+    title: str,
+    known_node_ids: set,
+    known_node_titles: set,
+    allow_substring_title: bool = True,
+) -> bool:
+    if any(cid in known_node_ids for cid in candidate_ids):
+        return True
+    clean_t = (title or "").strip()
+    if not clean_t or clean_t in ("Untitled Page", "Subpage"):
+        return False
+    for kt in known_node_titles:
+        if kt == clean_t:
+            return True
+        if allow_substring_title and (kt.endswith(clean_t) or kt.startswith(clean_t)):
+            return True
+    return False
+
+
+def collect_unresolved_external_pages_from_blocks(
+    blocks: List[Dict[str, Any]],
+    known_node_ids: Optional[set] = None,
+    known_node_titles: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """ブロックツリーから移行対象外（ZIP/ツリー未収録）の外部ページ参照を再帰的に収集する。"""
+    found: List[Dict[str, Any]] = []
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        b_type = b.get("type")
+        children = b.get("children_blocks") or []
+        via_sync = bool(b.get("_via_synced_block"))
+        via_suffix = " [同期ブロック経由]" if via_sync else ""
+
+        if b_type == "child_page":
+            title = str((b.get("child_page") or {}).get("title") or "").strip()
+            raw_id = str(b.get("id") or "")
+            c_ids = [raw_id.replace("-", "").lower()] if _INLINE_UUID_RE.search(raw_id) else []
+            if known_node_ids is not None or known_node_titles is not None:
+                is_unresolved = not _match_node_ref(
+                    c_ids, title, known_node_ids or set(), known_node_titles or set()
+                )
+            else:
+                is_unresolved = bool(b.get("_is_unresolved_external_page"))
+            if is_unresolved:
+                label = title or raw_id or "外部ページ"
+                found.append({
+                    "block_id": raw_id,
+                    "target_id": raw_id,
+                    "target_title": label,
+                    "kind": "child_page",
+                    "via_synced_block": via_sync,
+                    "message": b.get("_external_page_warning")
+                    or f"移行対象外（ZIP未収録）の外部ページ '{label}' を参照しています{via_suffix}",
+                })
+
+        elif b_type == "link_to_page":
+            link_data = b.get("link_to_page") or {}
+            page_id = str(link_data.get("page_id") or "")
+            if page_id:
+                c_ids = [page_id.replace("-", "").lower()]
+                if known_node_ids is not None or known_node_titles is not None:
+                    is_unresolved = not _match_node_ref(
+                        c_ids, "", known_node_ids or set(), known_node_titles or set(), allow_substring_title=False
+                    )
+                else:
+                    is_unresolved = bool(b.get("_is_unresolved_external_page"))
+                if is_unresolved:
+                    found.append({
+                        "block_id": str(b.get("id", "")),
+                        "target_id": page_id,
+                        "target_title": page_id,
+                        "kind": "link_to_page",
+                        "via_synced_block": via_sync,
+                        "message": b.get("_external_page_warning")
+                        or f"移行対象外（ZIP未収録）の外部ページリンク (ID: {page_id}) を参照しています{via_suffix}",
+                    })
+
+        # インラインリンク (rich_text) の未収録ページ参照
+        for rt_list in _iter_block_rich_text_lists(b):
+            for rt in rt_list:
+                if not isinstance(rt, dict):
+                    continue
+                link_obj = (rt.get("text") or {}).get("link") if isinstance(rt.get("text"), dict) else None
+                href = (link_obj.get("url") if isinstance(link_obj, dict) else None) or rt.get("href") or ""
+                item_page_id = rt.get("page_id")
+                plain = str(rt.get("plain_text") or (rt.get("text") or {}).get("content", "") or "").strip()
+
+                if known_node_ids is not None or known_node_titles is not None:
+                    if not is_notion_page_link_target(href, item_page_id):
+                        continue
+                    c_ids = []
+                    if item_page_id:
+                        c_ids.append(str(item_page_id).replace("-", "").lower())
+                    if href:
+                        for m in _INLINE_UUID_RE.findall(href):
+                            c_ids.append(m.replace("-", "").lower())
+                    is_unresolved = not _match_node_ref(
+                        c_ids,
+                        plain if not c_ids else "",
+                        known_node_ids or set(),
+                        known_node_titles or set(),
+                        allow_substring_title=False,
+                    )
+                else:
+                    is_unresolved = bool(rt.get("_is_unresolved_external_page"))
+
+                if is_unresolved:
+                    rt_via_sync = bool(rt.get("_via_synced_block") or via_sync)
+                    rt_via_suffix = " [同期ブロック経由]" if rt_via_sync else ""
+                    label = plain or href or str(item_page_id or "外部ページ")
+                    found.append({
+                        "block_id": str(b.get("id", "")),
+                        "target_id": str(item_page_id or ""),
+                        "target_title": label,
+                        "href": href,
+                        "kind": "inline_link",
+                        "via_synced_block": rt_via_sync,
+                        "message": rt.get("_external_page_warning")
+                        or f"移行対象外（ZIP未収録）の外部ページ '{label}' への文中リンクを含んでいます{rt_via_suffix}",
+                    })
+
+        if children:
+            found.extend(
+                collect_unresolved_external_pages_from_blocks(
+                    children, known_node_ids=known_node_ids, known_node_titles=known_node_titles
+                )
+            )
+    return found
+
+
+def get_node_unresolved_external_pages(node: Any) -> List[Dict[str, Any]]:
+    """PageNodeに記録された未解決の外部ページ参照一覧を取得する。"""
+    recorded = getattr(node, "unresolved_external_pages", None)
+    if recorded:
+        return list(recorded)
+    return collect_unresolved_external_pages_from_blocks(getattr(node, "blocks", None) or [])
+
+
+def collect_unresolved_external_dbs_from_blocks(
+    blocks: List[Dict[str, Any]],
+    known_db_ids: Optional[set] = None,
+    known_db_titles: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """ブロックツリーから移行対象外（ZIP/ツリー未収録）の外部データベース参照を再帰的に収集する。"""
+    found: List[Dict[str, Any]] = []
+    for b in blocks or []:
+        if not isinstance(b, dict):
+            continue
+        b_type = b.get("type")
+        children = b.get("children_blocks") or []
+        if b_type == "child_database" and b.get("is_linked_database"):
+            data_sources = b.get("data_sources") or []
+            source_name = ""
+            if data_sources and isinstance(data_sources[0], dict):
+                source_name = str(data_sources[0].get("name") or "").strip()
+            candidate_ids = []
+            for cid in (
+                b.get("database_id"),
+                b.get("id"),
+                data_sources[0].get("id") if data_sources and isinstance(data_sources[0], dict) else None,
+            ):
+                if cid:
+                    candidate_ids.append(str(cid).replace("-", "").lower())
+
+            is_unresolved = False
+            if known_db_ids is not None or known_db_titles is not None:
+                id_matched = any(cid in (known_db_ids or set()) for cid in candidate_ids)
+                title_matched = bool(
+                    source_name
+                    and any(
+                        t == source_name or t.endswith(source_name)
+                        for t in (known_db_titles or set())
+                    )
+                )
+                is_unresolved = not (id_matched or title_matched)
+            else:
+                is_unresolved = bool(b.get("_is_unresolved_external_db"))
+
+            if is_unresolved:
+                db_id = str(b.get("database_id") or b.get("id") or "")
+                db_label = source_name or db_id or "Unknown DB"
+                via_sync = bool(b.get("_via_synced_block"))
+                via_suffix = " [同期ブロック経由]" if via_sync else ""
+                default_msg = (
+                    f"移行対象外（ZIP未収録）の外部データベース '{db_label}' を参照しています"
+                    f"{via_suffix}"
+                    + (f" (ID: {db_id})" if db_id else "")
+                )
+                found.append({
+                    "block_id": str(b.get("id", "")),
+                    "database_id": db_id,
+                    "database_name": db_label,
+                    "via_synced_block": via_sync,
+                    "message": b.get("_external_db_warning") or default_msg,
+                })
+        elif b_type == "link_to_page" and (b.get("link_to_page") or {}).get("database_id"):
+            db_id = str((b.get("link_to_page") or {}).get("database_id") or "")
+            norm_db_id = db_id.replace("-", "").lower()
+            if known_db_ids is not None:
+                is_unresolved = norm_db_id not in known_db_ids
+            else:
+                is_unresolved = bool(b.get("_is_unresolved_external_db"))
+            if is_unresolved:
+                via_sync = bool(b.get("_via_synced_block"))
+                via_suffix = " [同期ブロック経由]" if via_sync else ""
+                found.append({
+                    "block_id": str(b.get("id", "")),
+                    "database_id": db_id,
+                    "database_name": db_id,
+                    "via_synced_block": via_sync,
+                    "message": b.get("_external_db_warning")
+                    or f"移行対象外（ZIP未収録）の外部データベース (ID: {db_id}) を参照しています{via_suffix}",
+                })
+        if children:
+            found.extend(
+                collect_unresolved_external_dbs_from_blocks(
+                    children, known_db_ids=known_db_ids, known_db_titles=known_db_titles
+                )
+            )
+    return found
+
+
+def mark_unresolved_external_references(root_node: Any) -> int:
+    """PageNodeツリー全体を走査し、未解決の外部DB・外部ページ・ZIP未収録添付を統一マーキングする。"""
+    if not root_node:
+        return 0
+
+    known_db_ids = set()
+    known_db_titles = set()
+    known_node_ids = set()
+    known_node_titles = set()
+
+    def _collect_nodes(node: Any) -> None:
+        nid = getattr(node, "id", None)
+        ntitle = getattr(node, "title", None)
+        ntype = getattr(node, "node_type", None)
+        if nid:
+            known_node_ids.add(str(nid).replace("-", "").lower())
+        if ntitle:
+            known_node_titles.add(str(ntitle).strip())
+        if ntype == "database":
+            if nid:
+                known_db_ids.add(str(nid).replace("-", "").lower())
+            if ntitle:
+                known_db_titles.add(str(ntitle).strip())
+        for c in getattr(node, "children", None) or []:
+            _collect_nodes(c)
+
+    _collect_nodes(root_node)
+
+    total_unresolved = 0
+
+    def _mark_node(node: Any) -> None:
+        nonlocal total_unresolved
+        blocks = getattr(node, "blocks", None) or []
+
+        def _update_flags(blks: List[Dict[str, Any]]) -> None:
+            for b in blks:
+                if not isinstance(b, dict):
+                    continue
+                b_type = b.get("type")
+                via_sync = bool(b.get("_via_synced_block"))
+                via_suffix = " [同期ブロック経由]" if via_sync else ""
+
+                # 1. 外部DB参照フラグの更新
+                if b_type == "child_database" and b.get("is_linked_database"):
+                    data_sources = b.get("data_sources") or []
+                    source_name = ""
+                    if data_sources and isinstance(data_sources[0], dict):
+                        source_name = str(data_sources[0].get("name") or "").strip()
+                    candidate_ids = []
+                    for cid in (
+                        b.get("database_id"),
+                        b.get("id"),
+                        data_sources[0].get("id") if data_sources and isinstance(data_sources[0], dict) else None,
+                    ):
+                        if cid:
+                            candidate_ids.append(str(cid).replace("-", "").lower())
+                    id_matched = any(cid in known_db_ids for cid in candidate_ids)
+                    title_matched = bool(
+                        source_name and any(t == source_name or t.endswith(source_name) for t in known_db_titles)
+                    )
+                    if id_matched or title_matched:
+                        b.pop("_is_unresolved_external_db", None)
+                        b.pop("_external_db_warning", None)
+                    else:
+                        db_id = str(b.get("database_id") or b.get("id") or "")
+                        db_label = source_name or db_id or "Unknown DB"
+                        b["_is_unresolved_external_db"] = True
+                        b["_external_db_warning"] = (
+                            f"移行対象外（ZIP未収録）の外部データベース '{db_label}' を参照しています"
+                            f"{via_suffix}"
+                            + (f" (ID: {db_id})" if db_id else "")
+                        )
+                elif b_type == "link_to_page" and (b.get("link_to_page") or {}).get("database_id"):
+                    db_id = str((b.get("link_to_page") or {}).get("database_id") or "")
+                    if db_id.replace("-", "").lower() in known_db_ids:
+                        b.pop("_is_unresolved_external_db", None)
+                        b.pop("_external_db_warning", None)
+                    else:
+                        b["_is_unresolved_external_db"] = True
+                        b["_external_db_warning"] = (
+                            f"移行対象外（ZIP未収録）の外部データベース (ID: {db_id}) を参照しています{via_suffix}"
+                        )
+
+                # 2. 外部ページ参照フラグの更新 (ブロック型: child_page / link_to_page)
+                if b_type == "child_page":
+                    title = str((b.get("child_page") or {}).get("title") or "").strip()
+                    raw_id = str(b.get("id") or "")
+                    c_ids = [raw_id.replace("-", "").lower()] if _INLINE_UUID_RE.search(raw_id) else []
+                    if _match_node_ref(c_ids, title, known_node_ids, known_node_titles):
+                        b.pop("_is_unresolved_external_page", None)
+                        b.pop("_external_page_warning", None)
+                    else:
+                        label = title or raw_id or "外部ページ"
+                        b["_is_unresolved_external_page"] = True
+                        b["_external_page_warning"] = (
+                            f"移行対象外（ZIP未収録）の外部ページ '{label}' を参照しています{via_suffix}"
+                        )
+                elif b_type == "link_to_page" and (b.get("link_to_page") or {}).get("page_id"):
+                    page_id = str((b.get("link_to_page") or {}).get("page_id") or "")
+                    if page_id.replace("-", "").lower() in known_node_ids:
+                        b.pop("_is_unresolved_external_page", None)
+                        b.pop("_external_page_warning", None)
+                    else:
+                        b["_is_unresolved_external_page"] = True
+                        b["_external_page_warning"] = (
+                            f"移行対象外（ZIP未収録）の外部ページリンク (ID: {page_id}) を参照しています{via_suffix}"
+                        )
+
+                # 3. 外部ページ参照フラグの更新 (文中インラインリンク)
+                for rt_list in _iter_block_rich_text_lists(b):
+                    for rt in rt_list:
+                        if not isinstance(rt, dict):
+                            continue
+                        link_obj = (rt.get("text") or {}).get("link") if isinstance(rt.get("text"), dict) else None
+                        href = (link_obj.get("url") if isinstance(link_obj, dict) else None) or rt.get("href") or ""
+                        item_page_id = rt.get("page_id")
+                        if not is_notion_page_link_target(href, item_page_id):
+                            rt.pop("_is_unresolved_external_page", None)
+                            rt.pop("_external_page_warning", None)
+                            continue
+                        c_ids = []
+                        if item_page_id:
+                            c_ids.append(str(item_page_id).replace("-", "").lower())
+                        if href:
+                            for m in _INLINE_UUID_RE.findall(href):
+                                c_ids.append(m.replace("-", "").lower())
+                        plain = str(rt.get("plain_text") or (rt.get("text") or {}).get("content", "") or "").strip()
+                        if _match_node_ref(
+                            c_ids,
+                            plain if not c_ids else "",
+                            known_node_ids,
+                            known_node_titles,
+                            allow_substring_title=False,
+                        ):
+                            rt.pop("_is_unresolved_external_page", None)
+                            rt.pop("_external_page_warning", None)
+                        else:
+                            rt_via_sync = bool(rt.get("_via_synced_block") or via_sync)
+                            rt_via_suffix = " [同期ブロック経由]" if rt_via_sync else ""
+                            label = plain or href or str(item_page_id or "外部ページ")
+                            rt["_is_unresolved_external_page"] = True
+                            if rt_via_sync:
+                                rt["_via_synced_block"] = True
+                            rt["_external_page_warning"] = (
+                                f"移行対象外（ZIP未収録）の外部ページ '{label}' への文中リンクを含んでいます{rt_via_suffix}"
+                            )
+
+                if b.get("children_blocks"):
+                    _update_flags(b["children_blocks"])
+
+        _update_flags(blocks)
+        ext_dbs = collect_unresolved_external_dbs_from_blocks(
+            blocks, known_db_ids=known_db_ids, known_db_titles=known_db_titles
+        )
+        ext_pages = collect_unresolved_external_pages_from_blocks(
+            blocks, known_node_ids=known_node_ids, known_node_titles=known_node_titles
+        )
+        missing_atts = collect_missing_zip_attachments_from_blocks(blocks)
+        node.unresolved_external_dbs = ext_dbs
+        node.unresolved_external_pages = ext_pages
+        node.missing_zip_attachments = missing_atts
+        node_total = len(ext_dbs) + len(ext_pages) + len(missing_atts)
+        if node_total > 0:
+            total_unresolved += node_total
+            if ext_dbs:
+                logger.warning(
+                    f"Unresolved external database reference detected in [{getattr(node, 'title', '')}] "
+                    f"({getattr(node, 'id', '')}): {len(ext_dbs)} item(s)"
+                )
+            if ext_pages:
+                logger.warning(
+                    f"Unresolved external page reference detected in [{getattr(node, 'title', '')}] "
+                    f"({getattr(node, 'id', '')}): {len(ext_pages)} item(s)"
+                )
+            if missing_atts:
+                logger.warning(
+                    f"Missing ZIP attachment detected in [{getattr(node, 'title', '')}] "
+                    f"({getattr(node, 'id', '')}): {len(missing_atts)} item(s)"
+                )
+        for c in getattr(node, "children", None) or []:
+            _mark_node(c)
+
+    _mark_node(root_node)
+    return total_unresolved
+
+
+def mark_unresolved_external_dbs(root_node: Any) -> int:
+    """後方互換エイリアス: PageNodeツリー全体の未解決参照（外部DB/外部ページ/ZIP欠落添付）を走査・マーキングする。"""
+    return mark_unresolved_external_references(root_node)
+
+
+def get_node_unresolved_external_dbs(node: Any) -> List[Dict[str, Any]]:
+    """PageNodeに記録された未解決の外部データベース参照一覧を取得する。"""
+    recorded = getattr(node, "unresolved_external_dbs", None)
+    if recorded:
+        return list(recorded)
+    return collect_unresolved_external_dbs_from_blocks(getattr(node, "blocks", None) or [])
 
 
 class NotionExtractor:

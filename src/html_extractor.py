@@ -26,6 +26,7 @@ from src.extractor import (
     classify_external_app_url,
     collect_external_synced_blocks_from_blocks,
     is_broken_or_placeholder_url,
+    mark_unresolved_external_references,
 )
 
 logger = logging.getLogger(__name__)
@@ -406,6 +407,7 @@ class HtmlZipExtractor:
 
             # 4. 全ファイルからPageNodeを再帰的に構築
             root_node = self._build_page_node(zf, root_file, db_csv_map)
+            mark_unresolved_external_references(root_node)
             return root_node
 
     def _extract_icon_from_soup(self, soup: BeautifulSoup) -> Optional[str]:
@@ -1572,10 +1574,30 @@ class HtmlZipExtractor:
         zf: zipfile.ZipFile,
         current_dir: str,
         db_csv_map: Optional[Dict[str, str]] = None,
+        in_synced_wrapper: bool = False,
     ) -> List[Dict[str, Any]]:
         """HTMLコンテナ配下の要素をNotion互換のブロック辞書リストに変換する。"""
         db_csv_map = db_csv_map or {}
         blocks = []
+
+        def _mark_missing_zip_attachment(obj: Dict[str, Any], raw_src: str, filename_label: str) -> None:
+            obj["_attachment_missing_in_zip"] = True
+            obj["_attachment_uploaded"] = False
+            obj["_missing_attachment_src"] = raw_src
+            label = filename_label or raw_src or "不明ファイル"
+            obj["_missing_attachment_warning"] = (
+                f"ZIP未収録の添付ファイル・メディア '{label}' ({obj.get('type', 'file')}) を検出しました"
+            )
+
+        def _tag_synced_blocks(blk_list: List[Dict[str, Any]]) -> None:
+            for b in blk_list:
+                if not isinstance(b, dict):
+                    continue
+                b["_via_synced_block"] = True
+                if b.get("_missing_attachment_warning") and "[同期ブロック経由]" not in b["_missing_attachment_warning"]:
+                    b["_missing_attachment_warning"] += " [同期ブロック経由]"
+                if b.get("children_blocks"):
+                    _tag_synced_blocks(b["children_blocks"])
 
         def _normalize_extracted_color(col: Optional[str]) -> str:
             if not col:
@@ -1872,6 +1894,18 @@ class HtmlZipExtractor:
 
             # 13. データベースビュー (collection-content)
             elif "collection-content" in classes or el.find(class_="collection-title"):
+                collection_el = el if "collection-content" in classes else el.find(class_="collection-content")
+                db_el_id = (
+                    collection_el.get("id")
+                    if isinstance(collection_el, Tag) and collection_el.get("id")
+                    else None
+                ) or el_id
+                via_synced_wrapper = bool(
+                    collection_el is not None
+                    and collection_el is not el
+                    and tag == "div"
+                    and el.get("dir") == "auto"
+                )
                 db_title = "Untitled Database"
                 title_el = el.find(class_="collection-title")
                 if title_el:
@@ -1902,14 +1936,17 @@ class HtmlZipExtractor:
                     "configuration": {"group_by": {"property_name": group_field} if group_field else None},
                 }
 
-                blocks.append({
-                    "id": el_id,
+                db_block: Dict[str, Any] = {
+                    "id": db_el_id,
                     "type": "child_database",
                     "is_linked_database": True,
-                    "data_sources": [{"name": db_title, "id": el_id}],
-                    "database_id": el_id,
+                    "data_sources": [{"name": db_title, "id": db_el_id}],
+                    "database_id": db_el_id,
                     "views": [view_info],
-                })
+                }
+                if via_synced_wrapper:
+                    db_block["_via_synced_block"] = True
+                blocks.append(db_block)
 
             # 14. 画像 / 子ページリンク / 外部ファイル・動画・音声・埋め込み
             elif (
@@ -2050,10 +2087,10 @@ class HtmlZipExtractor:
                                 "id": el_id,
                                 "type": "image",
                                 "image": {
-                                    "type": "external" if is_external or not resolved_path else "file",
+                                    "type": "external" if is_external else "file",
                                     "caption": caption_rich,
-                                    "external": {"url": src} if is_external or not resolved_path else None,
-                                    "file": {"url": src} if resolved_path else None,
+                                    "external": {"url": src} if is_external else None,
+                                    "file": {"url": src} if (resolved_path or not is_external) else None,
                                 },
                                 "_attachment_filename": img_filename,
                             })
@@ -2063,6 +2100,7 @@ class HtmlZipExtractor:
                                 logger.info(f"Resolved inline image attachment in ZIP: {resolved_path}")
                             elif not is_external:
                                 logger.warning(f"Image attachment not found in ZIP: src='{src}'")
+                                _mark_missing_zip_attachment(block_obj, src, img_filename)
                             blocks.append(block_obj)
                 else:
                     clean_href = href.strip() if href else ""
@@ -2186,6 +2224,7 @@ class HtmlZipExtractor:
                                 logger.info(f"Resolved inline PDF attachment in ZIP: {resolved_path}")
                             elif not is_external:
                                 logger.warning(f"PDF attachment not found in ZIP: href='{clean_href}', filename='{att_filename}'")
+                                _mark_missing_zip_attachment(pdf_obj, clean_href, display_name or att_filename)
                             blocks.append(pdf_obj)
                         elif href_path_lower.endswith((".mp3", ".wav", ".m4a", ".aac")) or att_filename.lower().endswith((".mp3", ".wav", ".m4a", ".aac")):
                             audio_obj = AttachmentBlockDict({
@@ -2203,6 +2242,9 @@ class HtmlZipExtractor:
                                 audio_obj["_attachment_zip_path"] = self.zip_path
                                 audio_obj["_attachment_zip_entry"] = resolved_path
                                 logger.info(f"Resolved inline audio attachment in ZIP: {resolved_path}")
+                            elif not is_external:
+                                logger.warning(f"Audio attachment not found in ZIP: href='{clean_href}', filename='{att_filename}'")
+                                _mark_missing_zip_attachment(audio_obj, clean_href, display_name or att_filename)
                             blocks.append(audio_obj)
                         elif (
                             href_path_lower.endswith((".mp4", ".mov", ".webm"))
@@ -2225,6 +2267,9 @@ class HtmlZipExtractor:
                                 video_obj["_attachment_zip_path"] = self.zip_path
                                 video_obj["_attachment_zip_entry"] = resolved_path
                                 logger.info(f"Resolved inline video attachment in ZIP: {resolved_path}")
+                            elif not is_external:
+                                logger.warning(f"Video attachment not found in ZIP: href='{clean_href}', filename='{att_filename}'")
+                                _mark_missing_zip_attachment(video_obj, clean_href, display_name or att_filename)
                             blocks.append(video_obj)
                         elif media_tag_present and not resolved_path and not is_attachment_uri:
                             parsed_host = (urllib.parse.urlparse(clean_href).hostname or "") if is_external else ""
@@ -2257,6 +2302,9 @@ class HtmlZipExtractor:
                                 file_obj["_attachment_zip_path"] = self.zip_path
                                 file_obj["_attachment_zip_entry"] = resolved_path
                                 logger.info(f"Resolved inline file attachment in ZIP: {resolved_path}")
+                            elif not is_external:
+                                logger.warning(f"File attachment not found in ZIP: href='{clean_href}', filename='{att_filename}'")
+                                _mark_missing_zip_attachment(file_obj, clean_href, display_name or att_filename)
                             blocks.append(file_obj)
 
             # 15. 単独のimgタグ
@@ -2290,10 +2338,10 @@ class HtmlZipExtractor:
                             "id": el_id,
                             "type": "image",
                             "image": {
-                                "type": "external" if is_external or not resolved_path else "file",
+                                "type": "external" if is_external else "file",
                                 "caption": [],
-                                "external": {"url": src} if is_external or not resolved_path else None,
-                                "file": {"url": src} if resolved_path else None,
+                                "external": {"url": src} if is_external else None,
+                                "file": {"url": src} if (resolved_path or not is_external) else None,
                             },
                             "_attachment_filename": img_filename,
                         })
@@ -2303,6 +2351,7 @@ class HtmlZipExtractor:
                             logger.info(f"Resolved inline image attachment in ZIP: {resolved_path}")
                         elif not is_external:
                             logger.warning(f"Image attachment not found in ZIP: src='{src}'")
+                            _mark_missing_zip_attachment(block_obj, src, img_filename)
                         blocks.append(block_obj)
 
             # 16. 同期ブロック（内容欠落・外部参照のみの未収録検知）およびネストされたラッパー
@@ -2322,7 +2371,18 @@ class HtmlZipExtractor:
                     )
                 )
             ):
-                sub_blocks = self._parse_elements_to_blocks(el, zf, current_dir, db_csv_map=db_csv_map)
+                is_synced_wrapper_el = (
+                    tag in ("div", "section")
+                    and not any(c in self._STRUCTURAL_DIV_CLASSES for c in classes)
+                    and (el.get("dir") == "auto" or self._has_synced_marker(el))
+                )
+                sub_blocks = self._parse_elements_to_blocks(
+                    el,
+                    zf,
+                    current_dir,
+                    db_csv_map=db_csv_map,
+                    in_synced_wrapper=(in_synced_wrapper or is_synced_wrapper_el),
+                )
                 blocks.extend(sub_blocks)
 
             # 17. その他・未知のNotion固有要素 (例: breadcrumb 等)
@@ -2336,6 +2396,8 @@ class HtmlZipExtractor:
                         "paragraph": {"rich_text": self._parse_inline_rich_text(el)},
                     })
 
+        if in_synced_wrapper:
+            _tag_synced_blocks(blocks)
         return blocks
 
     _STRUCTURAL_DIV_CLASSES = frozenset({
@@ -2907,5 +2969,6 @@ class MultiZipExtractor:
             blocks=summary_blocks,
             children=block_nodes,
         )
+        mark_unresolved_external_references(combined_root)
 
         return combined_root
