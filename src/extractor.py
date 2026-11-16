@@ -2,11 +2,13 @@
 Notion からページ、ブロック階層、データベースおよびレコードを再帰的に抽出するモジュール。
 """
 
+import hashlib
 import logging
 import re
 import time
 import unicodedata
 import urllib.parse
+import uuid
 import requests
 from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
@@ -85,6 +87,180 @@ def analyze_database_child_page_stats(db_node: Any) -> Dict[str, Any]:
         "body_ratio_pct": body_ratio_pct,
         "skip_child_pages": body_rows == 0,
     }
+
+
+_SYNC_BLOCK_UUID_TOKEN_RE = re.compile(
+    r"([0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}(?:_\d+)?)"
+)
+
+# Confluence Cloud 実機検証で bodied-sync-block 内に安全配置（UnsupportedContent 非発生）を
+# 確認済みのブロック種別のみを許可する。
+NATIVE_SYNC_BLOCK_ALLOWLIST_TYPES = frozenset({
+    "heading_1",
+    "heading_2",
+    "heading_3",
+    "paragraph",
+    "bulleted_list_item",
+    "numbered_list_item",
+    "to_do",
+    "quote",
+    "code",
+    "callout",
+    "toggle",
+    "table",
+    "table_row",
+    "divider",
+})
+
+
+def is_sync_block_allowlisted_block(block: Any) -> bool:
+    """Confluence の bodied-sync-block 内に安全に配置できる許可リスト対象ブロックか再帰判定する。"""
+    if not isinstance(block, dict):
+        return False
+    if (
+        block.get("_is_external_synced_block")
+        or block.get("_is_unsupported_external_embed")
+        or block.get("_is_unresolved_external_db")
+        or block.get("_is_unresolved_external_page")
+    ):
+        return False
+    b_type = block.get("type")
+    if b_type not in NATIVE_SYNC_BLOCK_ALLOWLIST_TYPES:
+        return False
+    for child in (block.get("children_blocks") or []):
+        if not is_sync_block_allowlisted_block(child):
+            return False
+    return True
+
+
+def _extract_sync_block_token(block: Dict[str, Any]) -> str:
+    """同期ブロック内の単一ブロックについて、HTMLエクスポート間で一致する決定論的トークンを生成する。"""
+    b_type = str(block.get("type") or "")
+    b_id = str(block.get("id") or "")
+    m = _SYNC_BLOCK_UUID_TOKEN_RE.search(b_id)
+    if m:
+        id_tok = m.group(1).replace("-", "").lower()
+    else:
+        data = block.get(b_type) if isinstance(block.get(b_type), dict) else {}
+        rt_text = "".join(
+            str(rt.get("plain_text") or (rt.get("text") or {}).get("content") or "")
+            for rt in (data.get("rich_text") or [])
+            if isinstance(rt, dict)
+        ).strip()
+        id_tok = f"text:{rt_text}"
+    child_tokens = [_extract_sync_block_token(c) for c in (block.get("children_blocks") or []) if isinstance(c, dict)]
+    if child_tokens:
+        return f"{b_type}:{id_tok}[{','.join(child_tokens)}]"
+    return f"{b_type}:{id_tok}"
+
+
+def compute_sync_block_signature(blocks_run: List[Dict[str, Any]]) -> str:
+    """同期ブロック連続スライスの決定論的 SHA-1 シグネチャを生成する。"""
+    tokens = [_extract_sync_block_token(b) for b in blocks_run if isinstance(b, dict)]
+    return hashlib.sha1("|".join(tokens).encode("utf-8")).hexdigest()
+
+
+def group_and_tag_native_synced_blocks(root_node: Any) -> Dict[str, Dict[str, Any]]:
+    """HTMLエクスポートの同期ラッパー (_synced_wrapper_id) 由来の許可ブロック群を
+    ツリー全体でグルーピングし、2箇所以上で共有されている組にのみ Confluence ネイティブ
+    同期ブロック（bodied-sync-block / sync-block）メタデータを付与する。
+    """
+    if not root_node:
+        return {}
+
+    occurrences_by_sig: Dict[str, List[Tuple[int, int, Any, int, int]]] = {}
+    doc_order = 0
+
+    def _collect(node: Any, depth: int) -> None:
+        nonlocal doc_order
+        if not node:
+            return
+        cur_order = doc_order
+        doc_order += 1
+
+        blocks = getattr(node, "blocks", None) or []
+        idx = 0
+        n_blocks = len(blocks)
+        while idx < n_blocks:
+            b = blocks[idx]
+            wrap_id = b.get("_synced_wrapper_id") if isinstance(b, dict) else None
+            if wrap_id and is_sync_block_allowlisted_block(b):
+                end = idx + 1
+                while end < n_blocks:
+                    nb = blocks[end]
+                    if (
+                        isinstance(nb, dict)
+                        and nb.get("_synced_wrapper_id") == wrap_id
+                        and is_sync_block_allowlisted_block(nb)
+                    ):
+                        end += 1
+                    else:
+                        break
+                run_blocks = blocks[idx:end]
+                sig = compute_sync_block_signature(run_blocks)
+                occurrences_by_sig.setdefault(sig, []).append((depth, cur_order, node, idx, end))
+                idx = end
+            else:
+                idx += 1
+
+        # 本文スキップ対象のDB配下子ページは移行対象外のため走査しない
+        if getattr(node, "node_type", "") == "database":
+            stats = analyze_database_child_page_stats(node)
+            if stats["skip_child_pages"]:
+                return
+        for c in (getattr(node, "children", None) or []):
+            if getattr(node, "node_type", "") == "database" and is_empty_database_row(c):
+                continue
+            _collect(c, depth + 1)
+
+    _collect(root_node, 0)
+
+    sync_registry: Dict[str, Dict[str, Any]] = {}
+    node_replacements: Dict[int, Tuple[Any, List[Tuple[int, int, Dict[str, Any]]]]] = {}
+
+    for sig, occs in occurrences_by_sig.items():
+        if len(occs) < 2:
+            continue
+        sorted_occs = sorted(occs, key=lambda x: (x[0], x[1], x[3]))
+        resource_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"notion-sync:{sig}"))
+        orig_node = sorted_occs[0][2]
+        sync_registry[sig] = {
+            "resource_id": resource_id,
+            "source_node_id": getattr(orig_node, "id", ""),
+            "source_confluence_id": None,
+            "occurrence_count": len(sorted_occs),
+        }
+
+        for occ_idx, (_d, _o, target_node, start, end) in enumerate(sorted_occs):
+            role = "original" if occ_idx == 0 else "reference"
+            run_slice = list(target_node.blocks[start:end])
+            wrapped = {
+                "id": f"native_sync_{sig[:12]}_{occ_idx}",
+                "type": "synced_block",
+                "_native_sync": {
+                    "role": role,
+                    "signature": sig,
+                    "resource_id": resource_id,
+                },
+                "synced_block": {
+                    "synced_from": None if role == "original" else {"type": "native_sync", "signature": sig},
+                },
+                "children_blocks": run_slice,
+                "has_children": True,
+            }
+            key = id(target_node)
+            if key not in node_replacements:
+                node_replacements[key] = (target_node, [])
+            node_replacements[key][1].append((start, end, wrapped))
+
+    # 同一ページ内のインデックスずれを防ぐため、後ろのスライスから順に置換する
+    for target_node, reps in node_replacements.values():
+        new_blocks = list(target_node.blocks)
+        for start, end, wrapped in sorted(reps, key=lambda x: x[0], reverse=True):
+            new_blocks[start:end] = [wrapped]
+        target_node.blocks = new_blocks
+
+    return sync_registry
 
 
 def format_low_child_rate_warning(stat: Dict[str, Any]) -> str:
