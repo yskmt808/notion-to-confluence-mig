@@ -82,6 +82,113 @@ class TestTimezoneAndCalendar(unittest.TestCase):
         v_board = next(v for v in views if v["view_name"] == "進行中ボード")
         self.assertEqual(v_board["inferred_layout"], "board")
 
+    def test_telemetry_respects_tz_env(self):
+        """TZ環境変数設定時に SanitizedTelemetry の session_id, started_at, finished_at, error timestamp が反映されること"""
+        import os
+        import time
+        from unittest.mock import patch
+        from src.telemetry import SanitizedTelemetry
+
+        orig_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "Asia/Tokyo"
+            if hasattr(time, "tzset"):
+                time.tzset()
+
+            telemetry = SanitizedTelemetry()
+            self.assertIn("+09:00", telemetry.started_at)
+
+            telemetry.record_error(RuntimeError("test error"), context="testing")
+            report = telemetry.generate_report()
+            self.assertIn("+09:00", report["timestamps"]["started_at"])
+            self.assertIn("+09:00", report["timestamps"]["finished_at"])
+            self.assertIn("+09:00", report["errors"][0]["timestamp"])
+        finally:
+            if orig_tz is not None:
+                os.environ["TZ"] = orig_tz
+            else:
+                os.environ.pop("TZ", None)
+            if hasattr(time, "tzset"):
+                time.tzset()
+
+    def test_checkpoint_respects_tz_env(self):
+        """TZ環境変数設定時に MigrationCheckpoint の started_at, last_updated_at, pass1/pass2 timestamp が反映されること"""
+        import os
+        import time
+        import tempfile
+        from src.checkpoint import MigrationCheckpoint
+
+        orig_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "Asia/Tokyo"
+            if hasattr(time, "tzset"):
+                time.tzset()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cp_file = os.path.join(tmpdir, "checkpoint.json")
+                cp = MigrationCheckpoint(checkpoint_path=cp_file)
+                self.assertIn("+09:00", cp.started_at)
+                self.assertIn("+09:00", cp.last_updated_at)
+
+                cp.record_pass1("node-1", "101", "Page 1", "https://example.com/1", "page")
+                self.assertIn("+09:00", cp.nodes["node-1"]["pass1_timestamp"])
+
+                cp.record_pass2("node-1")
+                self.assertIn("+09:00", cp.nodes["node-1"]["pass2_timestamp"])
+                self.assertIn("+09:00", cp.last_updated_at)
+        finally:
+            if orig_tz is not None:
+                os.environ["TZ"] = orig_tz
+            else:
+                os.environ.pop("TZ", None)
+            if hasattr(time, "tzset"):
+                time.tzset()
+
+    def test_migrate_cli_respects_tz_and_custom_tz(self):
+        """migrate.py CLI 実行時の Start Timestamp とステップ開始時刻に TZ (Asia/Tokyo) および --tz 指定が反映されること"""
+        import os
+        import io
+        import sys
+        import time
+        import zipfile
+        import tempfile
+        import contextlib
+        from unittest.mock import patch
+        import migrate
+
+        orig_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "Asia/Tokyo"
+            if hasattr(time, "tzset"):
+                time.tzset()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = os.path.join(tmpdir, "test.zip")
+                with zipfile.ZipFile(zip_path, "w") as zf:
+                    zf.writestr(
+                        "Test 11111111111111111111111111111111.html",
+                        "<html><head><title>Test</title></head><body><h1>Test</h1></body></html>".encode("utf-8"),
+                    )
+
+                stdout_buf = io.StringIO()
+                with patch.object(sys, "argv", ["migrate.py", "--zip", zip_path, "--dry-run", "--checkpoint", os.path.join(tmpdir, "cp.json")]), \
+                     contextlib.redirect_stdout(stdout_buf), \
+                     patch("migrate.setup_logger"):
+                    migrate.main()
+
+                output = stdout_buf.getvalue()
+                self.assertIn("Start Timestamp      :", output)
+                self.assertIn("+09:00", output)
+                self.assertIn("Timezone             : Asia/Tokyo", output)
+        finally:
+            if orig_tz is not None:
+                os.environ["TZ"] = orig_tz
+            else:
+                os.environ.pop("TZ", None)
+            if hasattr(time, "tzset"):
+                time.tzset()
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -10,6 +10,7 @@ import json
 import logging
 import argparse
 import warnings
+import time
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -39,11 +40,18 @@ from src.worksheet import WorksheetManager
 from src.dashboard import MigrationDashboard
 from src.user_mapper import UserMappingManager
 from src.logger_util import setup_notice_log_level, setup_uncaught_exception_handler
+from src.timezone_util import get_local_timezone
 
 setup_notice_log_level()
 setup_uncaught_exception_handler()
 
 load_dotenv()
+if hasattr(time, "tzset"):
+    try:
+        time.tzset()
+    except Exception:
+        pass
+
 
 
 def setup_logger(verbose: bool = False, dashboard_mode: bool = False, log_file: str = "migration.log"):
@@ -684,7 +692,7 @@ def main():
 
     print("==================================================")
     print("🚀 Notion to Confluence Migration Start")
-    start_time = datetime.now(timezone.utc)
+    start_time = datetime.now(resolved_tz)
     print(f"Start Timestamp      : {start_time.isoformat()}")
     print(f"Timezone             : {tz_display}")
     if use_zip:
@@ -702,7 +710,7 @@ def main():
     print("==================================================\n")
 
     # Step 1: Notionデータ抽出 (ZIP or REST API)
-    step1_start = datetime.now(timezone.utc)
+    step1_start = datetime.now(resolved_tz)
     if use_zip:
         print(f"📥 [Step 1/3] Notion HTMLエクスポートZIP（{len(zip_files)}ファイル）から並行解析中... (開始: {step1_start.strftime('%H:%M:%S')})")
         try:
@@ -729,7 +737,7 @@ def main():
                 _apply_prefix(child)
         _apply_prefix(tree)
 
-    step1_end = datetime.now(timezone.utc)
+    step1_end = datetime.now(resolved_tz)
     step1_elapsed = (step1_end - step1_start).total_seconds()
     print(f"✓ Step 1 完了: 所要時間 {step1_elapsed:.2f} 秒\n")
 
@@ -845,7 +853,7 @@ def main():
         return
 
     # Step 2: Confluenceへインポート
-    step2_start = datetime.now(timezone.utc)
+    step2_start = datetime.now(resolved_tz)
     print(f"📤 [Step 2/3] Confluenceへ階層ツリーを移行中... (開始: {step2_start.strftime('%H:%M:%S')})")
     dashboard = MigrationDashboard(
         enabled=not args.no_dashboard,
@@ -967,7 +975,7 @@ def main():
             print(f"🚨 開発者報告用のサニタイズド診断レポートを出力しました: {json_p}, {md_p}")
         sys.exit(1)
 
-    step2_end = datetime.now(timezone.utc)
+    step2_end = datetime.now(resolved_tz)
     step2_elapsed = (step2_end - step2_start).total_seconds()
     print(f"✓ Step 2 完了: 所要時間 {step2_elapsed:.2f} 秒\n")
 
@@ -987,19 +995,19 @@ def main():
     step3_elapsed = 0.0
     verify_results = []
     if not args.no_verify:
-        step3_start = datetime.now(timezone.utc)
+        step3_start = datetime.now(resolved_tz)
         print(f"🔍 [Step 3/3] テキストベース移行整合性を自動検証中... (開始: {step3_start.strftime('%H:%M:%S')})")
         verifier = MigrationVerifier(importer.client)
         page_id_map = {nid: item["confluence_id"] for nid, item in mapping.items()}
         verify_results = verifier.verify_tree(tree, page_id_map, conf_parent_id)
 
-        step3_end = datetime.now(timezone.utc)
+        step3_end = datetime.now(resolved_tz)
         step3_elapsed = (step3_end - step3_start).total_seconds()
         print(f"✓ Step 3 完了: 所要時間 {step3_elapsed:.2f} 秒\n")
 
         print_verification_results(verify_results, verbose=args.verbose, show_all=args.show_all_pages)
 
-    end_time = datetime.now(timezone.utc)
+    end_time = datetime.now(resolved_tz)
     total_elapsed = (end_time - start_time).total_seconds()
 
     # テレメトリとチェックポイントの完了状態更新 (Task B.5, B.6)
@@ -1055,8 +1063,8 @@ def main():
 
     print("\n==================================================")
     print("🎉 移行が正常に完了しました！")
-    print(f"開始時刻: {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"終了時刻: {end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"開始時刻: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"終了時刻: {end_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     print(f"総所要時間: {total_elapsed:.2f} 秒 (抽出: {step1_elapsed:.2f}s | 移行: {step2_elapsed:.2f}s | 検証: {step3_elapsed:.2f}s)")
     print(f"移行済みページ数: {len(mapping)} 件")
     print(f"結果ログファイル: {result_path}")

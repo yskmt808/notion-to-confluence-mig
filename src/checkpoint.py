@@ -12,9 +12,10 @@ import random
 import tempfile
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Any, Optional, List
 import src.logger_util
+from src.timezone_util import get_local_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +60,9 @@ class MigrationCheckpoint:
         self._pending_changes: int = 0
         self.write_failed: bool = False
         self._lock = threading.RLock()
-        self.session_id: str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        self.started_at: str = datetime.now(timezone.utc).isoformat()
+        local_tz = get_local_timezone()
+        self.session_id: str = datetime.now(local_tz).strftime("%Y%m%d_%H%M%S")
+        self.started_at: str = datetime.now(local_tz).isoformat()
         self.last_updated_at: str = self.started_at
         self.status: str = "IN_PROGRESS"  # "IN_PROGRESS", "INTERRUPTED", "COMPLETED"
         self.source_info: Dict[str, Any] = {}
@@ -108,7 +110,7 @@ class MigrationCheckpoint:
                     self._pending_changes += 1
                     return
 
-            self.last_updated_at = datetime.now(timezone.utc).isoformat()
+            self.last_updated_at = datetime.now(get_local_timezone()).isoformat()
             data = {
                 "version": "1.0",
                 "session_id": self.session_id,
@@ -245,7 +247,7 @@ class MigrationCheckpoint:
                 "url": url,
                 "node_type": node_type,
                 "pass1_done": True,
-                "pass1_timestamp": datetime.now(timezone.utc).isoformat(),
+                "pass1_timestamp": datetime.now(get_local_timezone()).isoformat(),
             })
             if views:
                 existing["views"] = views
@@ -261,7 +263,7 @@ class MigrationCheckpoint:
         with self._lock:
             if node_id in self.nodes:
                 self.nodes[node_id]["pass2_done"] = True
-                self.nodes[node_id]["pass2_timestamp"] = datetime.now(timezone.utc).isoformat()
+                self.nodes[node_id]["pass2_timestamp"] = datetime.now(get_local_timezone()).isoformat()
                 self.save()
 
     def record_pending_row_views(self, node_id: str, pending_child_ids: List[str]):

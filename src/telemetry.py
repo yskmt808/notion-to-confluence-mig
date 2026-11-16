@@ -12,7 +12,7 @@ import hashlib
 import platform
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from collections import Counter
 
@@ -25,6 +25,7 @@ from src.extractor import (
     is_unsupported_page_element_block,
     KNOWN_UNSUPPORTED_SERVICE_NAMES,
 )
+from src.timezone_util import get_local_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,9 @@ class SanitizedTelemetry:
 
     def __init__(self):
         self._lock = threading.RLock()
-        self.session_id: str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        self.started_at: str = datetime.now(timezone.utc).isoformat()
+        local_tz = get_local_timezone()
+        self.session_id: str = datetime.now(local_tz).strftime("%Y%m%d_%H%M%S")
+        self.started_at: str = datetime.now(local_tz).isoformat()
         self.finished_at: Optional[str] = None
         self.environment: Dict[str, Any] = self._collect_environment()
 
@@ -281,12 +283,12 @@ class SanitizedTelemetry:
                 "error_type": err_type,
                 "message": err_msg,
                 "context": self.sanitize_string(context),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(get_local_timezone()).isoformat(),
             })
 
     def generate_report(self) -> Dict[str, Any]:
         """サニタイズされた診断レポートオブジェクトを生成する。"""
-        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.finished_at = datetime.now(get_local_timezone()).isoformat()
         http_summary = {
             "total_requests": self.total_http_requests,
             "status_distribution": dict(self.http_status_counter),
