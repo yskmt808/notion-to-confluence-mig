@@ -17,6 +17,7 @@ from src.extractor import (
     extract_block_url,
     is_broken_or_placeholder_url,
     is_substanceless_unsupported_block,
+    normalize_db_title,
 )
 
 logger = logging.getLogger(__name__)
@@ -1275,10 +1276,16 @@ class NotionToConfluenceConverter:
 
                         # 2. 見つからない場合はタイトルによるフォールバック
                         if not db_info and source_name:
+                            norm_source = normalize_db_title(source_name)
                             for mid, minfo in self.migration_map.items():
                                 if minfo.get("node_type") == "database":
                                     m_title = minfo.get("title", "")
-                                    if m_title == source_name or m_title.endswith(source_name):
+                                    norm_m_title = normalize_db_title(m_title)
+                                    if (
+                                        m_title == source_name
+                                        or m_title.endswith(source_name)
+                                        or (norm_source and (norm_m_title == norm_source or norm_m_title.endswith(norm_source) or norm_source.endswith(norm_m_title)))
+                                    ):
                                         db_info = minfo
                                         break
 
@@ -1398,10 +1405,16 @@ class NotionToConfluenceConverter:
                         if m_entry and m_entry.get("node_type") == "database":
                             db_url = m_entry.get("url")
                         if not db_url:
+                            norm_db_t = normalize_db_title(db_title)
                             for m in self.migration_map.values():
                                 if m.get("node_type") == "database":
                                     m_title = m.get("title", "")
-                                    if m_title == db_title or m_title.endswith(db_title):
+                                    norm_m_t = normalize_db_title(m_title)
+                                    if (
+                                        m_title == db_title
+                                        or m_title.endswith(db_title)
+                                        or (norm_db_t and (norm_m_t == norm_db_t or norm_m_t.endswith(norm_db_t) or norm_db_t.endswith(norm_m_t)))
+                                    ):
                                         db_url = m.get("url")
                                         break
 

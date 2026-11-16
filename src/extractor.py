@@ -5,6 +5,7 @@ Notion からページ、ブロック階層、データベースおよびレコ�
 import logging
 import re
 import time
+import unicodedata
 import urllib.parse
 import requests
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -12,6 +13,17 @@ from dataclasses import dataclass, field
 from notion_client import Client
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_db_title(title: Optional[str]) -> str:
+    """データベースタイトルやコレクション名の記号・OS禁止文字・空白差分を正規化して比較可能にする。"""
+    if not title:
+        return ""
+    t = unicodedata.normalize("NFC", str(title).strip())
+    # ファイル名禁止文字 (: / \ ? * " < > | 等) や全角コロン等を空白に置換
+    t = re.sub(r"[:：/\\?*\"<>|]+", " ", t)
+    # 連続空白を単一スペースにして前後の空白を除去し、小文字化
+    return re.sub(r"\s+", " ", t).strip().lower()
 
 # 認証必須・直接ダウンロード不可の外部アプリ連携ドメイン定義
 # (ドメイン群, サービス表示名, 正規化後のブロック種別)
@@ -654,6 +666,7 @@ def collect_unresolved_external_dbs_from_blocks(
 ) -> List[Dict[str, Any]]:
     """ブロックツリーから移行対象外（ZIP/ツリー未収録）の外部データベース参照を再帰的に収集する。"""
     found: List[Dict[str, Any]] = []
+    norm_known_titles = {normalize_db_title(t) for t in (known_db_titles or set()) if t}
     for b in blocks or []:
         if not isinstance(b, dict):
             continue
@@ -676,11 +689,12 @@ def collect_unresolved_external_dbs_from_blocks(
             is_unresolved = False
             if known_db_ids is not None or known_db_titles is not None:
                 id_matched = any(cid in (known_db_ids or set()) for cid in candidate_ids)
+                norm_source = normalize_db_title(source_name)
                 title_matched = bool(
-                    source_name
+                    norm_source
                     and any(
-                        t == source_name or t.endswith(source_name)
-                        for t in (known_db_titles or set())
+                        kt == norm_source or kt.endswith(norm_source) or norm_source.endswith(kt)
+                        for kt in norm_known_titles
                     )
                 )
                 is_unresolved = not (id_matched or title_matched)
@@ -738,6 +752,7 @@ def mark_unresolved_external_references(root_node: Any) -> int:
 
     known_db_ids = set()
     known_db_titles = set()
+    db_title_to_id: Dict[str, str] = {}
     known_node_ids = set()
     known_node_titles = set()
 
@@ -753,7 +768,11 @@ def mark_unresolved_external_references(root_node: Any) -> int:
             if nid:
                 known_db_ids.add(str(nid).replace("-", "").lower())
             if ntitle:
-                known_db_titles.add(str(ntitle).strip())
+                s_title = str(ntitle).strip()
+                known_db_titles.add(s_title)
+                norm_t = normalize_db_title(s_title)
+                if norm_t and nid and norm_t not in db_title_to_id:
+                    db_title_to_id[norm_t] = str(nid)
         for c in getattr(node, "children", None) or []:
             _collect_nodes(c)
 
@@ -788,12 +807,26 @@ def mark_unresolved_external_references(root_node: Any) -> int:
                         if cid:
                             candidate_ids.append(str(cid).replace("-", "").lower())
                     id_matched = any(cid in known_db_ids for cid in candidate_ids)
-                    title_matched = bool(
-                        source_name and any(t == source_name or t.endswith(source_name) for t in known_db_titles)
-                    )
+                    norm_src = normalize_db_title(source_name)
+                    matched_db_id = None
+                    if norm_src in db_title_to_id:
+                        matched_db_id = db_title_to_id[norm_src]
+                    else:
+                        for kt, k_id in db_title_to_id.items():
+                            if kt.endswith(norm_src) or norm_src.endswith(kt):
+                                matched_db_id = k_id
+                                break
+
+                    title_matched = matched_db_id is not None
                     if id_matched or title_matched:
                         b.pop("_is_unresolved_external_db", None)
                         b.pop("_external_db_warning", None)
+                        # 実DB IDが特定できた場合は database_id / data_sources に補完
+                        if matched_db_id:
+                            if not b.get("database_id") or b.get("database_id") not in known_db_ids:
+                                b["database_id"] = matched_db_id
+                            if data_sources and isinstance(data_sources[0], dict):
+                                data_sources[0]["id"] = matched_db_id
                     else:
                         db_id = str(b.get("database_id") or b.get("id") or "")
                         db_label = source_name or db_id or "Unknown DB"
