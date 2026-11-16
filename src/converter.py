@@ -6,7 +6,6 @@ Confluence Storage Format (XHTML) に変換するモジュール。
 import os
 import re
 import html
-import uuid
 import logging
 import unicodedata
 import urllib.parse
@@ -18,7 +17,6 @@ from src.extractor import (
     extract_block_url,
     is_broken_or_placeholder_url,
     is_substanceless_unsupported_block,
-    is_sync_block_allowlisted_block,
     normalize_db_title,
 )
 
@@ -156,7 +154,6 @@ class NotionToConfluenceConverter:
         self.id_to_title_map = id_to_title_map or {}
         self.migration_map: Dict[str, Dict[str, Any]] = {}
         self.skipped_db_rows: Dict[str, Dict[str, Any]] = {}
-        self.sync_block_registry: Dict[str, Dict[str, Any]] = {}
         self.confluence_base_url: str = ""
         self.space_key: str = ""
         self.user_mapper = user_mapper
@@ -1553,49 +1550,6 @@ class NotionToConfluenceConverter:
                 synced_data = b.get("synced_block", {})
                 synced_from = synced_data.get("synced_from")
                 children_blocks = b.get("children_blocks", [])
-                native_sync = b.get("_native_sync") if isinstance(b.get("_native_sync"), dict) else None
-                if native_sync:
-                    sig = str(native_sync.get("signature") or "")
-                    role = native_sync.get("role")
-                    reg_entry = (self.sync_block_registry.get(sig) or {}) if getattr(self, "sync_block_registry", None) else {}
-                    resource_id = native_sync.get("resource_id") or reg_entry.get("resource_id") or ""
-                    local_id = str(
-                        uuid.uuid5(
-                            uuid.NAMESPACE_URL,
-                            f"notion-sync-local:{sig}:{getattr(self, 'current_node_id', '')}:{b.get('id', '')}",
-                        )
-                    )
-                    if (
-                        role == "original"
-                        and resource_id
-                        and children_blocks
-                        and all(is_sync_block_allowlisted_block(cb) for cb in children_blocks)
-                    ):
-                        children_html = self.blocks_to_storage_format(children_blocks)
-                        output.append(
-                            f'<ac:adf-extension>'
-                            f'<ac:adf-node type="bodied-sync-block">'
-                            f'<ac:adf-attribute key="resource-id">{html.escape(resource_id)}</ac:adf-attribute>'
-                            f'<ac:adf-attribute key="local-id">{html.escape(local_id)}</ac:adf-attribute>'
-                            f'<ac:adf-content>{children_html}</ac:adf-content>'
-                            f'</ac:adf-node>'
-                            f'</ac:adf-extension>'
-                        )
-                        continue
-                    elif role == "reference" and resource_id:
-                        source_conf_id = reg_entry.get("source_confluence_id") or native_sync.get("source_confluence_id")
-                        if source_conf_id:
-                            ref_resource = f"confluence-page/{source_conf_id}/{resource_id}"
-                            output.append(
-                                f'<ac:adf-extension>'
-                                f'<ac:adf-node type="sync-block">'
-                                f'<ac:adf-attribute key="resource-id">{html.escape(ref_resource)}</ac:adf-attribute>'
-                                f'<ac:adf-attribute key="local-id">{html.escape(local_id)}</ac:adf-attribute>'
-                                f'</ac:adf-node>'
-                                f'<ac:adf-fallback><p>Sync Block</p></ac:adf-fallback>'
-                                f'</ac:adf-extension>'
-                            )
-                            continue
                 if children_blocks:
                     # 子ブロックが単一の synced_block の場合は多重枠線を避けてアンラップ
                     while (

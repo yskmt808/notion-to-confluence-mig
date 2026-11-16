@@ -2430,11 +2430,6 @@ class HtmlZipExtractor:
                     db_csv_map=db_csv_map,
                     in_synced_wrapper=(in_synced_wrapper or is_synced_wrapper_el),
                 )
-                if is_synced_wrapper_el and not in_synced_wrapper and sub_blocks:
-                    sync_wrapper_uid = f"syncwrap_{uuid.uuid4().hex[:12]}"
-                    for sb in sub_blocks:
-                        if isinstance(sb, dict):
-                            sb.setdefault("_synced_wrapper_id", sync_wrapper_uid)
                 blocks.extend(sub_blocks)
 
             # 17. その他・未知のNotion固有要素 (例: breadcrumb 等)

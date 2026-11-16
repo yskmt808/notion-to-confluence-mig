@@ -117,35 +117,16 @@ class MigrationVerifier:
                 issues.append(f"Cover image detected in Notion, but <ac:image> with {cover_prefix} not found in Confluence.")
 
         # ブロック別の固有要素チェック（カラム・トグル等のネスト配下も含めて再帰収集）
-        # ただしネイティブ sync-block 参照ノードの子要素は同期元ページ側に保持されるため展開検証対象外とする
         all_blocks: List[Dict[str, Any]] = []
-        native_sync_originals: List[Dict[str, Any]] = []
-        native_sync_references: List[Dict[str, Any]] = []
 
         def _collect_all_blocks(blocks_list: List[Dict[str, Any]]):
             for b in blocks_list:
                 if isinstance(b, dict):
                     all_blocks.append(b)
-                    native_sync = b.get("_native_sync") if isinstance(b.get("_native_sync"), dict) else None
-                    if native_sync and native_sync.get("role") == "original":
-                        native_sync_originals.append(b)
-                    elif native_sync and native_sync.get("role") == "reference":
-                        native_sync_references.append(b)
-                        continue
                     if b.get("children_blocks"):
                         _collect_all_blocks(b["children_blocks"])
 
         _collect_all_blocks(node.blocks)
-        if native_sync_originals:
-            if 'type="bodied-sync-block"' in storage_body:
-                checks_passed.append(f"Native Confluence bodied-sync-block verified ({len(native_sync_originals)} block(s)).")
-            else:
-                issues.append("Native bodied-sync-block expected in Confluence body, but not found.")
-        if native_sync_references:
-            if 'type="sync-block"' in storage_body:
-                checks_passed.append(f"Native Confluence sync-block reference verified ({len(native_sync_references)} block(s)).")
-            else:
-                issues.append("Native sync-block reference expected in Confluence body, but not found.")
         block_types = [b.get("type") for b in all_blocks]
         if "equation" in block_types:
             # 数式添付ファイルが存在するか

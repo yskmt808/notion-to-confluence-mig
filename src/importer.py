@@ -27,7 +27,6 @@ from src.extractor import (
     PageNode,
     analyze_database_child_page_stats,
     classify_external_app_url,
-    group_and_tag_native_synced_blocks,
     is_broken_or_placeholder_url,
     is_empty_database_row as _shared_is_empty_database_row,
     is_unsupported_page_element_block,
@@ -1447,10 +1446,6 @@ class ConfluenceImporter:
         # 未解決の外部参照・クロスZIP参照についてConfluenceリモートリソースを動的解決
         self._resolve_external_and_remote_references(root_node)
 
-        # HTMLエクスポートの同期ブロックを最小API（シグネチャ一致）でグルーピングしネイティブ同期化準備
-        self.sync_block_registry = group_and_tag_native_synced_blocks(root_node)
-        self.converter.sync_block_registry = self.sync_block_registry
-
         # ツリー全体を事前スキャンし、他ページから参照されているDBビュー要件（ボード/ギャラリー/カテゴリ等）を収集
         self._db_view_requirements = self._analyze_database_view_requirements(root_node)
 
@@ -1511,11 +1506,6 @@ class ConfluenceImporter:
                 logger.info(f"Refreshed views for database [{ninfo['title']}]: {list(ninfo['views'].keys())}")
 
             self.converter.migration_map = self.migration_map
-            for reg in (getattr(self, "sync_block_registry", None) or {}).values():
-                src_nid = reg.get("source_node_id")
-                if src_nid and src_nid in self.migration_map:
-                    reg["source_confluence_id"] = self.migration_map[src_nid].get("confluence_id")
-            self.converter.sync_block_registry = getattr(self, "sync_block_registry", {})
 
             if self.dashboard:
                 self.dashboard.set_main_task("Pass 2: 相互リンク・バックリンク構造を解析中...")
