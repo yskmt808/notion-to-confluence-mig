@@ -25,8 +25,10 @@ import matplotlib.pyplot as plt
 import requests
 from src.extractor import (
     PageNode,
+    analyze_database_child_page_stats,
     classify_external_app_url,
     is_broken_or_placeholder_url,
+    is_empty_database_row as _shared_is_empty_database_row,
     is_unsupported_page_element_block,
     normalize_db_title,
 )
@@ -2295,27 +2297,23 @@ class ConfluenceImporter:
     @staticmethod
     def is_empty_database_row(row_node: PageNode) -> bool:
         """データベース行が完全に空レコード（タイトル無題、本文なし、プロパティ値なし）であるかを判定する。"""
-        if getattr(row_node, "node_type", "") != "database_row":
-            return False
-        title_clean = (row_node.title or "").strip()
-        is_untitled = not title_clean or title_clean in ("Untitled Page", "無題", "Untitled")
-        has_body = False
-        for b in (row_node.blocks or []):
-            if b.get("type") != "paragraph":
-                has_body = True
-                break
-            p_text = "".join(rt.get("plain_text", "") for rt in b.get("paragraph", {}).get("rich_text", [])).strip()
-            if p_text:
-                has_body = True
-                break
-        has_props = False
-        for k, v in (row_node.properties or {}).items():
-            if k in ("schema", "title"):
-                continue
-            if v not in (None, "", [], {}):
-                has_props = True
-                break
-        return is_untitled and not has_body and not has_props
+        return _shared_is_empty_database_row(row_node)
+
+    def _register_skipped_db_rows(self, db_node: PageNode, db_url: str) -> None:
+        """子ページ作成をスキップしたDB行の参照フォールバック情報を converter へ登録する。"""
+        if not hasattr(self, "converter") or not hasattr(self.converter, "skipped_db_rows"):
+            return
+        with self._lock:
+            for child in (db_node.children or []):
+                info = {
+                    "title": child.title,
+                    "db_id": db_node.id,
+                    "db_title": db_node.title,
+                    "url": db_url,
+                }
+                self.converter.skipped_db_rows[child.id] = info
+                norm_id = str(child.id).replace("-", "").lower()
+                self.converter.skipped_db_rows[norm_id] = info
 
     def _apply_root_private_restriction(self, node: PageNode, confluence_page_id: str) -> None:
         """private_mode 有効かつルートノードの場合、作成直後にプライベート閲覧・編集制限を適用する。"""
@@ -2388,7 +2386,10 @@ class ConfluenceImporter:
                 if "views_info" in cached:
                     self.migration_map[node.id]["views_info"] = cached["views_info"]
 
-                if node.children:
+                if node.node_type == "database" and analyze_database_child_page_stats(node)["skip_child_pages"]:
+                    node._skipped_row_child_pages = True
+                    self._register_skipped_db_rows(node, confluence_url)
+                elif node.children:
                     self._import_children_concurrently(
                         parent_node=node,
                         children=node.children,
@@ -2438,29 +2439,39 @@ class ConfluenceImporter:
                 if existing_db else None
             )
 
+            db_stats = analyze_database_child_page_stats(node)
+            skip_row_pages = bool(db_stats["skip_child_pages"])
+            node._skipped_row_child_pages = skip_row_pages
+
             # 1. 先に子ページ（各行レコード詳細）を作成してリンクURLとIDを確定
             child_link_map = {}
             unmigrated_children = []
-            for child in node.children:
-                child.parent_db_title = node.title
-                if existing_db_url:
-                    child.parent_db_url = existing_db_url
-                if self.is_empty_database_row(child):
-                    logger.info(f"Skipping empty database row child page: [{child.title}] (ID: {child.id})")
-                    continue
-                if self.checkpoint and self.checkpoint.is_pass1_done(child.id):
-                    cached = self.checkpoint.get_node_info(child.id)
-                    cid = cached["confluence_id"]
-                    with self._lock:
-                        self.migration_map[child.id] = {
-                            "confluence_id": cid,
-                            "title": child.title,
-                            "url": cached.get("url", f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"),
-                            "node_type": child.node_type,
-                        }
-                    child_link_map[child.id] = f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"
-                else:
-                    unmigrated_children.append(child)
+            if skip_row_pages:
+                logger.info(
+                    f"Skipping row child page creation for database [{node.title}] "
+                    f"(0/{db_stats['total_rows']} rows have substantive body -> title column uses 'text')."
+                )
+            else:
+                for child in node.children:
+                    child.parent_db_title = node.title
+                    if existing_db_url:
+                        child.parent_db_url = existing_db_url
+                    if self.is_empty_database_row(child):
+                        logger.info(f"Skipping empty database row child page: [{child.title}] (ID: {child.id})")
+                        continue
+                    if self.checkpoint and self.checkpoint.is_pass1_done(child.id):
+                        cached = self.checkpoint.get_node_info(child.id)
+                        cid = cached["confluence_id"]
+                        with self._lock:
+                            self.migration_map[child.id] = {
+                                "confluence_id": cid,
+                                "title": child.title,
+                                "url": cached.get("url", f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"),
+                                "node_type": child.node_type,
+                            }
+                        child_link_map[child.id] = f"{self.client.base_url}/spaces/{self.space_key}/pages/{cid}"
+                    else:
+                        unmigrated_children.append(child)
 
             if unmigrated_children:
                 def _migrate_child_task(child_node):
@@ -2503,7 +2514,11 @@ class ConfluenceImporter:
                 confluence_url = f"{self.client.base_url}{webui}"
             else:
                 # 2. Confluence Database 用の構造化CSVを生成
-                csv_body = self.converter.generate_database_csv(node, child_link_map)
+                csv_body = self.converter.generate_database_csv(
+                    node,
+                    child_link_map,
+                    use_text_title=skip_row_pages,
+                )
 
                 # 3. Confluence Database を新規作成
                 space_id = self.client.get_space_id(self.space_key)
@@ -2533,6 +2548,9 @@ class ConfluenceImporter:
                     confluence_page_id = res["id"]
                     webui = res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{confluence_page_id}")
                     confluence_url = f"{self.client.base_url}{webui}"
+
+            if skip_row_pages:
+                self._register_skipped_db_rows(node, confluence_url)
 
             # プライベート移行モード（DBルート作成直後の即時ロック）
             self._apply_root_private_restriction(node, confluence_page_id)

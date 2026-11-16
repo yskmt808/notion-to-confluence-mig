@@ -63,7 +63,12 @@ class TestDatabaseConcurrencyAndResume(unittest.TestCase):
         """--page-workers に基づいて子ページが並行作成されることを検証"""
         db_node = PageNode(id="db_root", title="マスタータスクDB", node_type="database")
         for i in range(4):
-            child = PageNode(id=f"task_{i+1}", title=f"タスク {i+1}", node_type="database_row")
+            child = PageNode(
+                id=f"task_{i+1}",
+                title=f"タスク {i+1}",
+                node_type="database_row",
+                blocks=[{"id": f"b_{i+1}", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "plain_text": f"タスク詳細 {i+1}"}]}}],
+            )
             db_node.children.append(child)
 
         importer = ConfluenceImporter(
@@ -121,8 +126,18 @@ class TestDatabaseConcurrencyAndResume(unittest.TestCase):
         2. --resume (resolve_pending_database_row_views) でインデックス完了エントリを検知し行ビューを埋め込む
         """
         db_node = PageNode(id="db_root", title="案件管理DB", node_type="database")
-        c1 = PageNode(id="row_1", title="案件A", node_type="database_row")
-        c2 = PageNode(id="row_2", title="案件B", node_type="database_row")
+        c1 = PageNode(
+            id="row_1",
+            title="案件A",
+            node_type="database_row",
+            blocks=[{"id": "b_r1", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "plain_text": "案件A詳細"}]}}],
+        )
+        c2 = PageNode(
+            id="row_2",
+            title="案件B",
+            node_type="database_row",
+            blocks=[{"id": "b_r2", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "plain_text": "案件B詳細"}]}}],
+        )
         db_node.children = [c1, c2]
 
         importer = ConfluenceImporter(
