@@ -25,6 +25,100 @@ def normalize_db_title(title: Optional[str]) -> str:
     # 連続空白を単一スペースにして前後の空白を除去し、小文字化
     return re.sub(r"\s+", " ", t).strip().lower()
 
+
+DEFAULT_DB_CHILD_RATE_THRESHOLD: float = 20.0
+
+
+def database_row_has_substantive_body(row_node: Any) -> bool:
+    """データベース行が実質的な本文コンテンツまたは配下の子ページを持つか判定する。"""
+    if getattr(row_node, "children", None):
+        return True
+    for b in (getattr(row_node, "blocks", None) or []):
+        if not isinstance(b, dict):
+            continue
+        b_type = b.get("type")
+        if b_type != "paragraph":
+            return True
+        if b.get("children_blocks"):
+            return True
+        for rt in (b.get("paragraph") or {}).get("rich_text", []):
+            if not isinstance(rt, dict):
+                continue
+            if (rt.get("plain_text") or "").strip():
+                return True
+            if rt.get("href") or rt.get("type") == "mention":
+                return True
+            link_obj = (rt.get("text") or {}).get("link") or {}
+            if isinstance(link_obj, dict) and link_obj.get("url"):
+                return True
+    return False
+
+
+def is_empty_database_row(row_node: Any) -> bool:
+    """データベース行が完全に空レコード（タイトル無題、本文なし、プロパティ値なし）であるかを判定する。"""
+    if getattr(row_node, "node_type", "") != "database_row":
+        return False
+    title_clean = (getattr(row_node, "title", None) or "").strip()
+    is_untitled = not title_clean or title_clean in ("Untitled Page", "無題", "Untitled")
+    if not is_untitled or database_row_has_substantive_body(row_node):
+        return False
+    for k, v in (getattr(row_node, "properties", None) or {}).items():
+        if k in ("schema", "title"):
+            continue
+        if v not in (None, "", [], {}):
+            return False
+    return True
+
+
+def analyze_database_child_page_stats(db_node: Any) -> Dict[str, Any]:
+    """データベース配下の行レコードについて、本文/子ページ存在数・存在率・子ページスキップ可否を集計する。"""
+    children = getattr(db_node, "children", None) or []
+    active_rows = [c for c in children if not is_empty_database_row(c)]
+    total_rows = len(active_rows)
+    body_rows = sum(1 for c in active_rows if database_row_has_substantive_body(c))
+    body_ratio_pct = (body_rows / total_rows * 100.0) if total_rows > 0 else 0.0
+    return {
+        "database_id": str(getattr(db_node, "id", "") or ""),
+        "database_title": str(getattr(db_node, "title", "") or ""),
+        "total_rows": total_rows,
+        "body_rows": body_rows,
+        "body_ratio_pct": body_ratio_pct,
+        "skip_child_pages": body_rows == 0,
+    }
+
+
+def format_low_child_rate_warning(stat: Dict[str, Any]) -> str:
+    """低子ページ存在率データベース向けの統一WARNINGメッセージを生成する。"""
+    return (
+        f"子ページ存在率が低いデータベースを検出しました "
+        f"[{stat['database_title']}] ({stat['body_rows']}/{stat['total_rows']}件, "
+        f"{stat['body_ratio_pct']:.1f}% < {stat['threshold_pct']:.1f}%)。"
+        f"不要な行本文/子ページがある場合は移行前にNotion側で削除してください。"
+    )
+
+
+def collect_low_child_rate_databases(
+    root_node: Any,
+    threshold_pct: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
+) -> List[Dict[str, Any]]:
+    """ツリー内のデータベースのうち、0%超かつ閾値(%)未満の子ページ存在率のものを収集する。"""
+    if not root_node or threshold_pct is None or threshold_pct <= 0:
+        return []
+    found: List[Dict[str, Any]] = []
+
+    def _walk(node: Any) -> None:
+        if getattr(node, "node_type", "") == "database":
+            stats = analyze_database_child_page_stats(node)
+            if stats["body_rows"] > 0 and stats["body_ratio_pct"] < threshold_pct:
+                stats["threshold_pct"] = float(threshold_pct)
+                stats["message"] = format_low_child_rate_warning(stats)
+                found.append(stats)
+        for c in (getattr(node, "children", None) or []):
+            _walk(c)
+
+    _walk(root_node)
+    return found
+
 # 認証必須・直接ダウンロード不可の外部アプリ連携ドメイン定義
 # (ドメイン群, サービス表示名, 正規化後のブロック種別)
 EXTERNAL_APP_SERVICE_RULES: Tuple[Tuple[Tuple[str, ...], str, str], ...] = (

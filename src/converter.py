@@ -153,6 +153,7 @@ class NotionToConfluenceConverter:
     ):
         self.id_to_title_map = id_to_title_map or {}
         self.migration_map: Dict[str, Dict[str, Any]] = {}
+        self.skipped_db_rows: Dict[str, Dict[str, Any]] = {}
         self.confluence_base_url: str = ""
         self.space_key: str = ""
         self.user_mapper = user_mapper
@@ -177,6 +178,22 @@ class NotionToConfluenceConverter:
                 self.metadata_template = metadata_template
         else:
             self.metadata_template = metadata_template
+
+    def _lookup_skipped_db_row(self, target_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """子ページ作成をスキップしたDB行IDかどうかを判定し、スキップメタ情報を返す。"""
+        if not target_id or not getattr(self, "skipped_db_rows", None):
+            return None
+        norm_id = str(target_id).replace("-", "").lower()
+        return self.skipped_db_rows.get(target_id) or self.skipped_db_rows.get(norm_id)
+
+    def _render_skipped_db_row_link(self, skipped_info: Dict[str, Any], label: Optional[str] = None) -> str:
+        """子ページ未作成のDB行への参照を、親DBリンクまたはテキストへ安全にフォールバック変換する。"""
+        disp = label or skipped_info.get("title") or "Page"
+        escaped_disp = html.escape(disp)
+        db_url = skipped_info.get("url")
+        if db_url:
+            return f'<a href="{html.escape(db_url)}">{escaped_disp}</a>'
+        return f'<span>{escaped_disp}</span>'
 
     def _get_attachment_filename(self, block: Dict[str, Any]) -> str:
         """ブロック情報からConfluence用の一意で分かりやすい添付ファイル名を導出する。"""
@@ -416,6 +433,8 @@ class NotionToConfluenceConverter:
                 if target_info and target_info.get("node_type") == "database":
                     db_url = target_info.get("url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
                     links.append(f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(db_url)}</a>')
+                elif (skipped_info := self._lookup_skipped_db_row(target_id)):
+                    links.append(self._render_skipped_db_row_link(skipped_info, label=disp_title or skipped_info.get("title")))
                 elif disp_title:
                     escaped_title = html.escape(disp_title)
                     links.append(
@@ -518,6 +537,11 @@ class NotionToConfluenceConverter:
                         target_title = self.id_to_title_map.get(target_page_id) or self.id_to_title_map.get(norm_id)
                     if not target_title:
                         target_title = item.get("plain_text", "").replace("@", "").strip() or "Page"
+
+                    skipped_info = self._lookup_skipped_db_row(target_page_id) if not target_info else None
+                    if skipped_info:
+                        result.append(self._render_skipped_db_row_link(skipped_info, label=target_title))
+                        continue
 
                     escaped_title = html.escape(target_title)
                     link_html = (
@@ -689,6 +713,9 @@ class NotionToConfluenceConverter:
                 if target_info and target_info.get("node_type") == "database":
                     db_url = target_info.get("web_url") or target_info.get("url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
                     escaped = f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(db_url)}</a>'
+                elif not target_info and (skipped_info := self._lookup_skipped_db_row(target_uuid)):
+                    raw_label = re.sub(r"<[^>]+>", "", (item.get("plain_text") or (item.get("text") or {}).get("content", ""))).strip()
+                    escaped = self._render_skipped_db_row_link(skipped_info, label=raw_label or target_title)
                 elif target_info or target_title or (href and href.startswith("#")):
                     disp_title = (target_info.get("title") if target_info else None) or target_title or getattr(self, "current_page_title", "") or escaped
                     escaped_title = html.escape(disp_title)
@@ -1490,7 +1517,9 @@ class NotionToConfluenceConverter:
                         m_entry = self.migration_map.get(target_page_id) or self.migration_map.get(norm_id)
                         if m_entry:
                             target_title = m_entry.get("title")
-                    if target_title:
+                    if target_page_id and not db_info and (skipped_info := self._lookup_skipped_db_row(target_page_id)):
+                        output.append(f"<p>{self._render_skipped_db_row_link(skipped_info, label=target_title)}</p>")
+                    elif target_title:
                         escaped_title = html.escape(target_title)
                         output.append(
                             f'<p><ac:link ac:card-appearance="inline">'
@@ -2198,7 +2227,12 @@ class NotionToConfluenceConverter:
 
         return single_select, multi_select
 
-    def generate_database_csv(self, db_node: PageNode, page_link_map: Dict[str, str]) -> str:
+    def generate_database_csv(
+        self,
+        db_node: PageNode,
+        page_link_map: Dict[str, str],
+        use_text_title: bool = False,
+    ) -> str:
         """Confluence Databases (type: database) 用の構造化CSV (<fields>, <views>, <data>) を生成する。"""
         schema = db_node.properties.get("schema", {})
         key_col_name = db_node.properties.get("title_column")
@@ -2218,7 +2252,8 @@ class NotionToConfluenceConverter:
         if not key_col_name:
             key_col_name = "リンク"
 
-        fields: List[Tuple[str, str, str]] = [(key_col_name, "confluence-page-link", "")]
+        key_col_type = "text" if use_text_title else "confluence-page-link"
+        fields: List[Tuple[str, str, str]] = [(key_col_name, key_col_type, "")]
 
         prop_names = []
         if schema:
@@ -2323,13 +2358,20 @@ class NotionToConfluenceConverter:
 
         for child in db_node.children:
             row_cells = []
-            child_link = str(page_link_map.get(child.id, "")).strip()
-            # confluence-page-link は有効なURLまたは数値Content IDのみ許容される。
-            # ページ未作成時などに文字列タイトルを入れるとConfluenceがContent ID解決に失敗し
-            # 「Could not create database entity in Handling Service: CANVAS / Content ID not found for page link value」
-            # で500/400エラーとなるため、有効なURLまたは数値ID以外は必ず空文字とする。
-            safe_link_val = child_link if (child_link and (child_link.startswith("http://") or child_link.startswith("https://") or child_link.isdigit())) else ""
-            row_cells.append(self._escape_csv_cell(safe_link_val))
+            if use_text_title:
+                row_title_val = (child.title or "").strip()
+                if not row_title_val:
+                    title_prop = child.properties.get(key_col_name)
+                    row_title_val = self._format_prop_for_csv(title_prop, key_col_name, child.title)
+                row_cells.append(self._escape_csv_cell(row_title_val))
+            else:
+                child_link = str(page_link_map.get(child.id, "")).strip()
+                # confluence-page-link は有効なURLまたは数値Content IDのみ許容される。
+                # ページ未作成時などに文字列タイトルを入れるとConfluenceがContent ID解決に失敗し
+                # 「Could not create database entity in Handling Service: CANVAS / Content ID not found for page link value」
+                # で500/400エラーとなるため、有効なURLまたは数値ID以外は必ず空文字とする。
+                safe_link_val = child_link if (child_link and (child_link.startswith("http://") or child_link.startswith("https://") or child_link.isdigit())) else ""
+                row_cells.append(self._escape_csv_cell(safe_link_val))
 
             for p_name in prop_names:
                 prop = child.properties.get(p_name)

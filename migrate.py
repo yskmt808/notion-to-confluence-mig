@@ -21,8 +21,10 @@ warnings.filterwarnings("ignore", category=UserWarning)
 import glob
 import zipfile
 from src.extractor import (
+    DEFAULT_DB_CHILD_RATE_THRESHOLD,
     NotionExtractor,
     PageNode,
+    collect_low_child_rate_databases,
     get_node_external_synced_blocks,
     get_node_missing_zip_attachments,
     get_node_unresolved_external_dbs,
@@ -252,13 +254,18 @@ def _print_dry_run_warning_section(
                 print(f"      ⚠️ {msg}")
 
 
-def print_dry_run_summary(tree: PageNode, telemetry: SanitizedTelemetry):
-    """ドライラン結果サマリー（WARNING件数・5カテゴリの警告検出ページ一覧）を表示する。"""
+def print_dry_run_summary(
+    tree: PageNode,
+    telemetry: SanitizedTelemetry,
+    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
+):
+    """ドライラン結果サマリー（WARNING件数・各種警告検出ページ一覧）を表示する。"""
     ext_total, affected_pages = collect_external_synced_pages(tree)
     ext_db_total, affected_db_pages = collect_unresolved_external_db_pages(tree)
     ext_page_total, affected_page_refs = collect_unresolved_external_page_refs(tree)
     missing_att_total, affected_att_pages = collect_missing_zip_attachment_pages(tree)
     unsup_total, affected_unsup_pages = collect_unsupported_element_pages(tree)
+    low_child_dbs = collect_low_child_rate_databases(tree, threshold_pct=db_child_rate_threshold)
     warning_count = telemetry.total_warnings_count
 
     print("--------------------------------------------------")
@@ -268,6 +275,13 @@ def print_dry_run_summary(tree: PageNode, telemetry: SanitizedTelemetry):
     _print_dry_run_warning_section("移行対象外（ZIP未収録）の外部ページ参照", ext_page_total, affected_page_refs)
     _print_dry_run_warning_section("ZIP未収録の添付ファイル・メディア", missing_att_total, affected_att_pages)
     _print_dry_run_warning_section("未対応要素・外部アプリ埋め込み（フォールバック注記対象）", unsup_total, affected_unsup_pages)
+    if low_child_dbs:
+        print(
+            f"⚠️ 子ページ存在率が閾値 ({db_child_rate_threshold:.1f}%) 未満のデータベースを "
+            f"{len(low_child_dbs)} 件検出しました:"
+        )
+        for st in low_child_dbs:
+            print(f"  - [database] {st['database_title']} (ID: {st['database_id']}): ⚠️ {st['message']}")
 
 
 def print_verification_results(verify_results: List[Dict[str, Any]], verbose: bool = False, show_all: bool = False):
@@ -548,6 +562,12 @@ def main():
         help="ページ内リンク修復用の Notion インテグレーション・トークン (環境変数 NOTION_TOKEN または NOTION_API_KEY も利用可能)",
     )
     parser.add_argument(
+        "--db-child-rate-threshold",
+        type=float,
+        default=DEFAULT_DB_CHILD_RATE_THRESHOLD,
+        help="DB行レコードの本文/子ページ存在率がこの値(%%)未満の場合にWARNINGを表示する閾値 (0で無効, デフォルト: 20.0)",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="詳細ログを出力する",
@@ -820,7 +840,7 @@ def main():
     )
 
     # テレメトリとチェックポイントにツリー情報を記録
-    telemetry.record_tree(tree)
+    telemetry.record_tree(tree, db_child_rate_threshold=args.db_child_rate_threshold)
     checkpoint.source_info = {
         "use_zip": use_zip,
         "zip_paths": zip_files,
@@ -851,7 +871,7 @@ def main():
     if args.dry_run:
         if homonym_warnings:
             print_homonym_warnings(homonym_warnings)
-        print_dry_run_summary(tree, telemetry)
+        print_dry_run_summary(tree, telemetry, db_child_rate_threshold=args.db_child_rate_threshold)
         print("💡 DRY RUN モードのため、Confluence への移行はスキップされました。")
         if args.generate_debug_report:
             json_p = os.path.join(args.debug_report_dir, "debug_report.json")
@@ -1007,7 +1027,11 @@ def main():
     if not args.no_verify:
         step3_start = datetime.now(resolved_tz)
         print(f"🔍 [Step 3/3] テキストベース移行整合性を自動検証中... (開始: {step3_start.strftime('%H:%M:%S')})")
-        verifier = MigrationVerifier(importer.client)
+        verifier = (
+            MigrationVerifier(importer.client)
+            if args.db_child_rate_threshold == DEFAULT_DB_CHILD_RATE_THRESHOLD
+            else MigrationVerifier(importer.client, db_child_rate_threshold=args.db_child_rate_threshold)
+        )
         page_id_map = {nid: item["confluence_id"] for nid, item in mapping.items()}
         verify_results = verifier.verify_tree(tree, page_id_map, conf_parent_id)
 

@@ -17,6 +17,8 @@ from typing import Dict, Any, List, Optional
 from collections import Counter
 
 from src.extractor import (
+    DEFAULT_DB_CHILD_RATE_THRESHOLD,
+    analyze_database_child_page_stats,
     get_node_external_synced_blocks,
     get_node_missing_zip_attachments,
     get_node_unresolved_external_dbs,
@@ -64,6 +66,8 @@ class SanitizedTelemetry:
         self.unresolved_external_dbs_count: int = 0
         self.unresolved_external_pages_count: int = 0
         self.missing_zip_attachments_count: int = 0
+        self.skipped_bodyless_dbs_count: int = 0
+        self.low_child_rate_databases_count: int = 0
 
         # ノード構造の抽象化サマリー（タイトル等の機密を含まない）
         self.tree_summary: Dict[str, Any] = {
@@ -119,7 +123,11 @@ class SanitizedTelemetry:
         text = re.sub(r'\b[0-9a-fA-F]{32}\b', '[UUID32]', text)
         return text
 
-    def record_tree(self, root_node):
+    def record_tree(
+        self,
+        root_node,
+        db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
+    ):
         """ノードツリーの構造統計を収集する（タイトル・本文は除外）。"""
         total = 0
         pages = 0
@@ -135,6 +143,21 @@ class SanitizedTelemetry:
                 pages += 1
             elif n.node_type == "database":
                 dbs += 1
+                db_stats = analyze_database_child_page_stats(n)
+                if db_stats["skip_child_pages"]:
+                    self.skipped_bodyless_dbs_count += 1
+                elif (
+                    db_child_rate_threshold is not None
+                    and db_child_rate_threshold > 0
+                    and db_stats["body_rows"] > 0
+                    and db_stats["body_ratio_pct"] < db_child_rate_threshold
+                ):
+                    self.low_child_rate_databases_count += 1
+                    self.record_warning(
+                        f"Low child-page ratio database detected: {n.id} "
+                        f"({db_stats['body_rows']}/{db_stats['total_rows']} rows, "
+                        f"{db_stats['body_ratio_pct']:.1f}% < {float(db_child_rate_threshold):.1f}%)"
+                    )
             elif n.node_type == "database_row":
                 rows += 1
 
@@ -320,6 +343,8 @@ class SanitizedTelemetry:
                 "unresolved_external_dbs_count": self.unresolved_external_dbs_count,
                 "unresolved_external_pages_count": self.unresolved_external_pages_count,
                 "missing_zip_attachments_count": self.missing_zip_attachments_count,
+                "skipped_bodyless_dbs_count": self.skipped_bodyless_dbs_count,
+                "low_child_rate_databases_count": self.low_child_rate_databases_count,
                 "http_summary": http_summary,
             },
             "warnings_count": self.total_warnings_count,
@@ -427,6 +452,9 @@ class SanitizedTelemetry:
             missing_att_cnt = diag.get("missing_zip_attachments_count", 0)
             if missing_att_cnt > 0:
                 md.append(f"- **ZIP未収録の添付ファイル・メディア**: {missing_att_cnt} 件")
+            low_db_cnt = diag.get("low_child_rate_databases_count", 0)
+            if low_db_cnt > 0:
+                md.append(f"- **子ページ存在率が閾値未満のデータベース**: {low_db_cnt} 件")
             for w in data["warnings_sample"]:
                 md.append(f"- {w}")
             md.append("")
