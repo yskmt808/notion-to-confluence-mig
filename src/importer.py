@@ -28,6 +28,7 @@ from src.extractor import (
     classify_external_app_url,
     is_broken_or_placeholder_url,
     is_unsupported_page_element_block,
+    normalize_db_title,
 )
 from src.converter import NotionToConfluenceConverter
 from src.checkpoint import CheckpointWriteError
@@ -866,7 +867,11 @@ class ConfluenceImporter:
                 norm_id = n.id.replace("-", "").lower()
                 db_by_norm_id[norm_id] = norm_id
                 if n.title:
-                    db_by_title[n.title] = norm_id
+                    s_title = str(n.title).strip()
+                    db_by_title[s_title] = norm_id
+                    norm_t = normalize_db_title(s_title)
+                    if norm_t and norm_t not in db_by_title:
+                        db_by_title[norm_t] = norm_id
             for c in n.children:
                 _collect_dbs(c)
 
@@ -896,8 +901,12 @@ class ConfluenceImporter:
             if candidate_title:
                 if candidate_title in db_by_title:
                     return db_by_title[candidate_title]
+                norm_c = normalize_db_title(candidate_title)
+                if norm_c and norm_c in db_by_title:
+                    return db_by_title[norm_c]
                 for m_title, nid in db_by_title.items():
-                    if m_title.endswith(candidate_title):
+                    norm_m = normalize_db_title(m_title)
+                    if norm_m and (norm_m.endswith(norm_c) or norm_c.endswith(norm_m)):
                         return nid
             return None
 

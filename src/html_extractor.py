@@ -27,6 +27,7 @@ from src.extractor import (
     collect_external_synced_blocks_from_blocks,
     is_broken_or_placeholder_url,
     mark_unresolved_external_references,
+    normalize_db_title,
 )
 
 logger = logging.getLogger(__name__)
@@ -338,9 +339,15 @@ class AttachmentBlockDict(dict):
 class HtmlZipExtractor:
     """NotionのHTMLエクスポートZIPファイルを解析してPageNodeツリーを構築するクラス。"""
 
-    def __init__(self, zip_path: str, global_db_csv_map: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        zip_path: str,
+        global_db_csv_map: Optional[Dict[str, str]] = None,
+        mark_unresolved: bool = True,
+    ):
         self.zip_path = os.path.abspath(zip_path)
         self.global_db_csv_map = global_db_csv_map or {}
+        self.mark_unresolved = mark_unresolved
         if not os.path.exists(self.zip_path):
             raise FileNotFoundError(f"Export zip file not found: {self.zip_path}")
         if not os.path.isfile(self.zip_path):
@@ -407,7 +414,8 @@ class HtmlZipExtractor:
 
             # 4. 全ファイルからPageNodeを再帰的に構築
             root_node = self._build_page_node(zf, root_file, db_csv_map)
-            mark_unresolved_external_references(root_node)
+            if self.mark_unresolved:
+                mark_unresolved_external_references(root_node)
             return root_node
 
     def _extract_icon_from_soup(self, soup: BeautifulSoup) -> Optional[str]:
@@ -619,20 +627,34 @@ class HtmlZipExtractor:
                 if f.startswith(sub_dir) and f != html_file and len(f[len(sub_dir):].split("/")) == 1
             ]
 
+        # .html ファイルを優先して処理し、同一DBに対する単独CSVノードの重複生成を防止する
+        sorted_dir_children = sorted(dir_children, key=lambda x: (0 if x.endswith(".html") else 1, x))
         processed_bases = set()
-        for f in dir_children:
+        processed_uuids = set()
+        for f in sorted_dir_children:
             if f != html_file:
                 base_f = os.path.splitext(f)[0]
+                f_uids = UUID_PATTERN.findall(os.path.basename(f))
+                f_norm_id = normalize_id(f_uids[-1]) if f_uids else None
                 if f.endswith(".html"):
                     child_node = self._build_page_node(zf, f, db_csv_map, parent_dir=sub_dir)
                     node.children.append(child_node)
                     processed_bases.add(base_f)
+                    if f_norm_id:
+                        processed_uuids.add(f_norm_id)
+                    if getattr(child_node, "id", None):
+                        processed_uuids.add(normalize_id(child_node.id))
                 elif f.endswith(".csv"):
                     # 対応するHTMLが存在しない単独CSVデータベースの場合
-                    if base_f not in processed_bases:
+                    already_processed = base_f in processed_bases or (f_norm_id and f_norm_id in processed_uuids)
+                    if not already_processed:
                         child_db_node = self._build_database_node_from_csv(zf, f)
                         node.children.append(child_db_node)
                         processed_bases.add(base_f)
+                        if f_norm_id:
+                            processed_uuids.add(f_norm_id)
+                        if getattr(child_db_node, "id", None):
+                            processed_uuids.add(normalize_id(child_db_node.id))
 
         return node
 
@@ -1936,12 +1958,37 @@ class HtmlZipExtractor:
                     "configuration": {"group_by": {"property_name": group_field} if group_field else None},
                 }
 
+                # 実DBノードとのタイトル正規化紐付けによる実DB ID補完
+                real_db_id = None
+                norm_db_title = normalize_db_title(db_title)
+                if norm_db_title and db_csv_map:
+                    for k, v in db_csv_map.items():
+                        # キーが32桁UUID / 正規化UUIDの場合、値(CSVパス)のベース名からタイトル正規化比較
+                        base_v = os.path.splitext(os.path.basename(v))[0]
+                        v_title = re.sub(r"\s+[0-9a-fA-F]{32}$", "", base_v).strip()
+                        if normalize_db_title(v_title) == norm_db_title:
+                            v_uids = UUID_PATTERN.findall(base_v)
+                            if v_uids:
+                                real_db_id = normalize_id(v_uids[-1])
+                                break
+                            elif len(k) in (32, 36) and k != base_v:
+                                real_db_id = k
+                                break
+                        # キー自体がタイトルまたはパスの場合
+                        elif normalize_db_title(os.path.basename(k)) == norm_db_title:
+                            k_uids = UUID_PATTERN.findall(k)
+                            if k_uids:
+                                real_db_id = normalize_id(k_uids[-1])
+                                break
+
+                target_db_id = real_db_id or db_el_id
+
                 db_block: Dict[str, Any] = {
                     "id": db_el_id,
                     "type": "child_database",
                     "is_linked_database": True,
-                    "data_sources": [{"name": db_title, "id": db_el_id}],
-                    "database_id": db_el_id,
+                    "data_sources": [{"name": db_title, "id": target_db_id}],
+                    "database_id": target_db_id,
                     "views": [view_info],
                 }
                 if via_synced_wrapper:
@@ -2909,7 +2956,7 @@ class MultiZipExtractor:
 
         # 2. 各ZIPを並行してアンパック＆PageNode構築
         def _parse_single_zip(z_path: str) -> PageNode:
-            extractor = HtmlZipExtractor(z_path, global_db_csv_map=global_db_csv_map)
+            extractor = HtmlZipExtractor(z_path, global_db_csv_map=global_db_csv_map, mark_unresolved=False)
             return extractor.extract_tree()
 
         block_nodes: List[PageNode] = []

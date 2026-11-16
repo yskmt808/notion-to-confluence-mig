@@ -387,6 +387,49 @@ class TestMultiZipCrossReference(unittest.TestCase):
             self.assertIn("A-01 テンプレート見出し集", out)
             self.assertIn("B-01 開発設計書", out)
 
+    def test_normalize_db_title_and_linked_database_view_cross_reference(self):
+        """コロン付きタイトル差分、同一ZIP内埋め込み、クロスZIP埋め込みビューの解決を検証する"""
+        from src.extractor import normalize_db_title
+        self.assertEqual(normalize_db_title("A-DB: 基盤プロジェクト管理"), "a-db 基盤プロジェクト管理")
+        self.assertEqual(normalize_db_title("A-DB 基盤プロジェクト管理"), "a-db 基盤プロジェクト管理")
+        self.assertEqual(normalize_db_title("B-DB: 開発タスク管理"), "b-db 開発タスク管理")
+        self.assertEqual(normalize_db_title("  B-DB   開発タスク管理  "), "b-db 開発タスク管理")
+        self.assertEqual(normalize_db_title(None), "")
+
+        # multizip_cros_reference 配下の実ZIPデータで二重DBノード非生成・警告0件を検証
+        mz_dir = "multizip_cros_reference"
+        if os.path.exists(mz_dir) and os.path.isdir(mz_dir):
+            import glob
+            zip_paths = sorted(glob.glob(os.path.join(mz_dir, "*.zip")))
+            if len(zip_paths) >= 2:
+                extractor = MultiZipExtractor(zip_paths)
+                combined_root = extractor.extract_tree()
+                self.assertIsNotNone(combined_root)
+
+                # Block A 配下のDBが二重ノード（.html と .csv）になっていないこと
+                block_a = _find_node(combined_root, "Block A")
+                self.assertIsNotNone(block_a)
+                db_a_nodes = [c for c in block_a.children if c.node_type == "database"]
+                self.assertEqual(len(db_a_nodes), 1, "同一DBに対して二重にノードが生成されていないこと")
+
+                # B-01 開発設計書内の Linked Database View が実DB IDを補完されていること
+                b_doc = _find_node(combined_root, "B-01")
+                self.assertIsNotNone(b_doc)
+                linked_dbs = [b for b in b_doc.blocks if b.get("type") == "child_database" and b.get("is_linked_database")]
+                self.assertTrue(len(linked_dbs) >= 1)
+                for ldb in linked_dbs:
+                    self.assertFalse(ldb.get("_is_unresolved_external_db"), f"Linked DB should be resolved: {ldb}")
+                    self.assertEqual(ldb.get("database_id"), db_a_nodes[0].id)
+
+                # 全体の未解決外部DB参照が 0 件であること
+                def _count_unresolved_dbs(n):
+                    cnt = len(getattr(n, "unresolved_external_dbs", []))
+                    for ch in n.children:
+                        cnt += _count_unresolved_dbs(ch)
+                    return cnt
+                self.assertEqual(_count_unresolved_dbs(combined_root), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
