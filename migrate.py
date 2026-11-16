@@ -472,6 +472,14 @@ def main():
         help="人間が確認・修正したDB属性・ビューチェックシート (CSV/JSON) を読み込んで移行に適用する (Task B.4)",
     )
     parser.add_argument(
+        "--external-mapping", "--import-mapping",
+        dest="external_mapping",
+        type=str,
+        nargs="+",
+        default=None,
+        help="先行移行の実行結果マッピングファイル (migration_result.json 等) のパス。未収録の外部DB/ページ参照を解決するために事前ロードします (複数指定可、カンマ区切り可)",
+    )
+    parser.add_argument(
         "--timezone", "--tz",
         type=str,
         default=None,
@@ -878,6 +886,8 @@ def main():
         metadata_template=meta_tpl,
         private_mode=private_mode,
         prune_blocks_on_pass2=(args.no_verify and not args.repair_inpage_links),
+        title_prefix=title_prefix,
+        external_mapping=args.external_mapping,
     )
 
     def _safe_mark_interrupted():

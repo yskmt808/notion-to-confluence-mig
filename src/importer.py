@@ -119,8 +119,15 @@ class ConfluenceClient:
             self.base_url = f"{self.base_url}/wiki"
         self.auth = (username, token)
         self.headers = {"Content-Type": "application/json"}
+        self._space_title_cache: Dict[Tuple[str, str, str], Optional[Dict[str, Any]]] = {}
 
-    def get_page_by_title(self, space_key: str, title: str) -> Optional[Dict[str, Any]]:
+    def get_page_by_title(
+        self, space_key: str, title: str, title_prefix: str = "", cql_fallback: bool = False, use_cache: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        cache_key = (space_key, "page", title, title_prefix)
+        if use_cache and cache_key in self._space_title_cache:
+            return self._space_title_cache[cache_key]
+
         if title and len(title) > 255:
             title = title[:252] + "..."
         url = f"{self.base_url}/rest/api/content"
@@ -133,7 +140,56 @@ class ConfluenceClient:
         if res.status_code == 200:
             results = res.json().get("results", [])
             if results:
+                if use_cache:
+                    self._space_title_cache[cache_key] = results[0]
                 return results[0]
+
+        # title_prefix がある場合のフォールバック検索
+        if title_prefix and not title.startswith(title_prefix):
+            prefixed = f"{title_prefix}{title}"
+            if len(prefixed) > 255:
+                prefixed = prefixed[:252] + "..."
+            res_pref = requests.get(url, params={"spaceKey": space_key, "title": prefixed, "expand": "version,ancestors"}, auth=self.auth, timeout=30)
+            if res_pref.status_code == 200:
+                results_pref = res_pref.json().get("results", [])
+                if results_pref:
+                    if use_cache:
+                        self._space_title_cache[cache_key] = results_pref[0]
+                    return results_pref[0]
+
+        # CQLによる柔軟なタイトル検索フォールバック (オプトイン)
+        if cql_fallback:
+            safe_title = title.replace('\\', '\\\\').replace('"', '\\"')
+            safe_space = space_key.replace('\\', '\\\\').replace('"', '\\"')
+            cql = f'type = page AND space = "{safe_space}" AND title ~ "{safe_title}"'
+            try:
+                cql_url = f"{self.base_url}/rest/api/content/search"
+                cql_res = requests.get(cql_url, params={"cql": cql}, auth=self.auth, timeout=30)
+                if cql_res.status_code == 200:
+                    results = cql_res.json().get("results", [])
+                    norm_target = normalize_db_title(title)
+                    expected_trunc = title[:252] + "..." if len(title) > 255 else title
+                    for r in results:
+                        r_title = r.get("title", "")
+                        if r_title == title or r_title == expected_trunc:
+                            if use_cache:
+                                self._space_title_cache[cache_key] = r
+                            return r
+                        if norm_target and normalize_db_title(r_title) == norm_target:
+                            if use_cache:
+                                self._space_title_cache[cache_key] = r
+                            return r
+                        if title_prefix:
+                            norm_pref = normalize_db_title(f"{title_prefix}{title}")
+                            if norm_pref and normalize_db_title(r_title) == norm_pref:
+                                if use_cache:
+                                    self._space_title_cache[cache_key] = r
+                                return r
+            except Exception as e:
+                logger.debug(f"CQL page search error for [{title}]: {e}")
+
+        if use_cache:
+            self._space_title_cache[cache_key] = None
         return None
 
     def get_page_by_id(self, page_id: str, expand: str = "version,ancestors") -> Optional[Dict[str, Any]]:
@@ -383,8 +439,14 @@ class ConfluenceClient:
         res = requests.delete(url, auth=self.auth, timeout=30)
         return res.status_code in (200, 204)
 
-    def get_database_by_title(self, space_key: str, title: str) -> Optional[Dict[str, Any]]:
+    def get_database_by_title(
+        self, space_key: str, title: str, title_prefix: str = "", use_cache: bool = False
+    ) -> Optional[Dict[str, Any]]:
         """Confluence Databases (type: database) をタイトルとスペースから検索する。"""
+        cache_key = (space_key, "database", title, title_prefix)
+        if use_cache and cache_key in self._space_title_cache:
+            return self._space_title_cache[cache_key]
+
         if title and len(title) > 255:
             title = title[:252] + "..."
         url = f"{self.base_url}/rest/api/content/search"
@@ -392,13 +454,72 @@ class ConfluenceClient:
         safe_space = space_key.replace('\\', '\\\\').replace('"', '\\"')
         cql = f'type = database AND space = "{safe_space}" AND title ~ "{safe_title}"'
         res = requests.get(url, params={"cql": cql}, auth=self.auth, timeout=30)
+        results = []
         if res.status_code == 200:
             results = res.json().get("results", [])
+
+        # もし見つからず title_prefix がある場合、prefix 付き CQL も試行
+        if not results and title_prefix and not title.startswith(title_prefix):
+            pref_title = f"{title_prefix}{title}"
+            safe_pref_title = pref_title.replace('\\', '\\\\').replace('"', '\\"')
+            cql_pref = f'type = database AND space = "{safe_space}" AND title ~ "{safe_pref_title}"'
+            res_pref = requests.get(url, params={"cql": cql_pref}, auth=self.auth, timeout=30)
+            if res_pref.status_code == 200:
+                results = res_pref.json().get("results", [])
+
+        if results:
             expected_trunc = title[:252] + "..." if len(title) > 255 else title
+            norm_target = normalize_db_title(title)
+            pref_trunc = (f"{title_prefix}{title}"[:252] + "...") if title_prefix else ""
+            norm_pref = normalize_db_title(f"{title_prefix}{title}") if title_prefix else ""
+
+            # 1. 完全一致
             for r in results:
                 r_title = r.get("title", "")
                 if r_title == title or r_title == expected_trunc:
+                    if use_cache:
+                        self._space_title_cache[cache_key] = r
                     return r
+
+            # 2. プレフィックス付き完全一致
+            if title_prefix:
+                for r in results:
+                    r_title = r.get("title", "")
+                    if r_title == f"{title_prefix}{title}" or (pref_trunc and r_title == pref_trunc):
+                        if use_cache:
+                            self._space_title_cache[cache_key] = r
+                        return r
+
+            # 3. タイトル正規化一致（記号・コロン・空白差分）
+            if norm_target:
+                for r in results:
+                    r_title = r.get("title", "")
+                    if normalize_db_title(r_title) == norm_target:
+                        if use_cache:
+                            self._space_title_cache[cache_key] = r
+                        return r
+
+            # 4. プレフィックス付きタイトル正規化一致
+            if norm_pref:
+                for r in results:
+                    r_title = r.get("title", "")
+                    if normalize_db_title(r_title) == norm_pref:
+                        if use_cache:
+                            self._space_title_cache[cache_key] = r
+                        return r
+
+            # 5. 接尾辞一致（プレフィックスが付与されている可能性）
+            if norm_target and len(norm_target) >= 3:
+                for r in results:
+                    r_title = r.get("title", "")
+                    norm_r = normalize_db_title(r_title)
+                    if norm_r and (norm_r.endswith(norm_target) or norm_target.endswith(norm_r)):
+                        if use_cache:
+                            self._space_title_cache[cache_key] = r
+                        return r
+
+        if use_cache:
+            self._space_title_cache[cache_key] = None
         return None
 
     def get_space_id(self, space_key: str) -> Optional[str]:
@@ -787,6 +908,8 @@ class ConfluenceImporter:
         metadata_template: Optional[str] = None,
         private_mode: bool = False,
         prune_blocks_on_pass2: bool = False,
+        title_prefix: Optional[str] = None,
+        external_mapping: Optional[Union[str, List[str]]] = None,
     ):
         self.space_key = space_key
         self.checkpoint = checkpoint
@@ -798,6 +921,7 @@ class ConfluenceImporter:
         self.metadata_template = metadata_template
         self.private_mode = private_mode
         self.prune_blocks_on_pass2 = prune_blocks_on_pass2
+        self.title_prefix = title_prefix or ""
         self._current_user_account_id: Optional[str] = None
         from src.timezone_util import resolve_timezone, format_iso_datetime
         self.timezone = resolve_timezone(timezone)
@@ -836,6 +960,306 @@ class ConfluenceImporter:
                         self._reserved_titles.add(c_title)
                         self._node_to_title[n_id] = c_title
                 logger.info(f"Initialized migration map with {len(existing_map)} nodes from checkpoint ({len(self._reserved_titles)} titles reserved).")
+
+        if external_mapping:
+            self._preload_external_mapping(external_mapping)
+
+    def _preload_external_mapping(self, external_mapping_paths: Union[str, List[str]]) -> int:
+        """先行移行の実行結果マッピングファイル (migration_result.json 等) を読み込み、初期マップへ反映する。"""
+        if not external_mapping_paths:
+            return 0
+        if isinstance(external_mapping_paths, str):
+            paths = [p.strip() for p in external_mapping_paths.split(",") if p.strip()]
+        else:
+            paths = list(external_mapping_paths)
+
+        loaded_count = 0
+        for p in paths:
+            if not os.path.exists(p):
+                logger.warning(f"External mapping file not found: {p}")
+                continue
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                mapping_dict = data.get("mapping", data) if isinstance(data, dict) else {}
+                if not isinstance(mapping_dict, dict):
+                    continue
+
+                for nid, ninfo in mapping_dict.items():
+                    if not isinstance(ninfo, dict):
+                        continue
+                    norm_id = str(nid).replace("-", "").lower()
+                    title = ninfo.get("title") or ""
+                    conf_id = str(ninfo.get("confluence_id")) if ninfo.get("confluence_id") is not None else ""
+                    url = ninfo.get("url") or (f"{self.client.base_url}/spaces/{self.space_key}/pages/{conf_id}" if conf_id else "")
+                    node_type = ninfo.get("node_type", "page")
+
+                    entry = {
+                        "confluence_id": conf_id,
+                        "title": title,
+                        "url": url,
+                        "node_type": node_type,
+                    }
+                    if "views" in ninfo and isinstance(ninfo["views"], dict):
+                        entry["views"] = ninfo["views"]
+                    if "views_info" in ninfo and isinstance(ninfo["views_info"], list):
+                        entry["views_info"] = ninfo["views_info"]
+
+                    self.migration_map[nid] = entry
+                    if norm_id != nid:
+                        self.migration_map[norm_id] = entry
+                    if title:
+                        self._reserved_titles.add(title)
+                        self._node_to_title[nid] = title
+                        self._node_to_title[norm_id] = title
+                        if hasattr(self, "converter"):
+                            if not hasattr(self.converter, "id_to_title_map") or self.converter.id_to_title_map is None:
+                                self.converter.id_to_title_map = {}
+                            self.converter.id_to_title_map[nid] = title
+                            self.converter.id_to_title_map[norm_id] = title
+
+                    loaded_count += 1
+                logger.info(f"Loaded {loaded_count} entries from external mapping: {p}")
+            except Exception as e:
+                logger.warning(f"Failed to load external mapping {p}: {e}")
+
+        if hasattr(self, "converter"):
+            self.converter.migration_map = self.migration_map
+        return loaded_count
+
+    def _resolve_remote_database(
+        self, candidate_ids: Optional[List[str]] = None, candidate_title: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """未登録のデータベース参照について、Confluence API 経由で既存DB（およびそのビュー一覧）を検索・解決して migration_map に動的登録する。"""
+        with self._lock:
+            candidate_ids = [cid for cid in (candidate_ids or []) if cid]
+            for cid in candidate_ids:
+                norm = cid.replace("-", "").lower()
+                if cid in self.migration_map and self.migration_map[cid].get("node_type") == "database":
+                    return self.migration_map[cid]
+                if norm in self.migration_map and self.migration_map[norm].get("node_type") == "database":
+                    return self.migration_map[norm]
+
+            if candidate_title:
+                clean_t = candidate_title.strip()
+                norm_t = normalize_db_title(clean_t)
+                for mid, minfo in self.migration_map.items():
+                    if minfo.get("node_type") == "database":
+                        m_title = minfo.get("title", "")
+                        norm_m = normalize_db_title(m_title)
+                        if m_title == clean_t or (norm_t and norm_m == norm_t):
+                            return minfo
+
+            # Confluence API による検索
+            found_db = None
+            if candidate_title:
+                found_db = self.client.get_database_by_title(
+                    self.space_key, candidate_title, title_prefix=getattr(self, "title_prefix", ""), use_cache=True
+                )
+
+            if not found_db and candidate_ids:
+                for cid in candidate_ids:
+                    known_title = getattr(self, "_node_to_title", {}).get(cid) or (
+                        getattr(self.converter, "id_to_title_map", {}).get(cid) if hasattr(self, "converter") else None
+                    )
+                    if known_title:
+                        found_db = self.client.get_database_by_title(
+                            self.space_key, known_title, title_prefix=getattr(self, "title_prefix", ""), use_cache=True
+                        )
+                        if found_db:
+                            break
+
+            if not found_db:
+                return None
+
+            conf_id = str(found_db.get("id"))
+            real_title = found_db.get("title") or candidate_title or "Remote Database"
+            db_url = f"{self.client.base_url}/spaces/{self.space_key}/database/{conf_id}"
+
+            views_list = self.client.get_database_views(conf_id)
+            views_dict = {v["name"]: v["id"] for v in views_list if v.get("name") and v.get("id")}
+
+            db_entry = {
+                "confluence_id": conf_id,
+                "title": real_title,
+                "url": db_url,
+                "node_type": "database",
+                "views": views_dict,
+                "views_info": views_list,
+                "_is_remote_resolved": True,
+            }
+
+            for cid in candidate_ids:
+                self.migration_map[cid] = db_entry
+                norm = cid.replace("-", "").lower()
+                self.migration_map[norm] = db_entry
+                self._node_to_title[cid] = real_title
+                self._node_to_title[norm] = real_title
+                if hasattr(self, "converter"):
+                    if not hasattr(self.converter, "id_to_title_map") or self.converter.id_to_title_map is None:
+                        self.converter.id_to_title_map = {}
+                    self.converter.id_to_title_map[cid] = real_title
+                    self.converter.id_to_title_map[norm] = real_title
+
+            self._reserved_titles.add(real_title)
+            if hasattr(self, "converter"):
+                self.converter.migration_map = self.migration_map
+
+            logger.info(f"Dynamically resolved remote database [{real_title}] (ID: {conf_id}, views: {list(views_dict.keys())})")
+            return db_entry
+
+    def _resolve_remote_page(
+        self, candidate_ids: Optional[List[str]] = None, candidate_title: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """未登録のページ参照について、Confluence API 経由で既存ページを検索・解決して migration_map に動的登録する。"""
+        with self._lock:
+            candidate_ids = [cid for cid in (candidate_ids or []) if cid]
+            for cid in candidate_ids:
+                norm = cid.replace("-", "").lower()
+                if cid in self.migration_map and self.migration_map[cid].get("node_type") == "page":
+                    return self.migration_map[cid]
+                if norm in self.migration_map and self.migration_map[norm].get("node_type") == "page":
+                    return self.migration_map[norm]
+
+            if candidate_title:
+                clean_t = candidate_title.strip()
+                norm_t = normalize_db_title(clean_t)
+                for mid, minfo in self.migration_map.items():
+                    if minfo.get("node_type") == "page":
+                        m_title = minfo.get("title", "")
+                        norm_m = normalize_db_title(m_title)
+                        if m_title == clean_t or (norm_t and norm_m == norm_t):
+                            return minfo
+
+            found_p = None
+            if candidate_title:
+                found_p = self.client.get_page_by_title(
+                    self.space_key, candidate_title, title_prefix=getattr(self, "title_prefix", ""), cql_fallback=True, use_cache=True
+                )
+
+            if not found_p and candidate_ids:
+                for cid in candidate_ids:
+                    known_title = getattr(self, "_node_to_title", {}).get(cid) or (
+                        getattr(self.converter, "id_to_title_map", {}).get(cid) if hasattr(self, "converter") else None
+                    )
+                    if known_title:
+                        found_p = self.client.get_page_by_title(
+                            self.space_key, known_title, title_prefix=getattr(self, "title_prefix", ""), cql_fallback=True, use_cache=True
+                        )
+                        if found_p:
+                            break
+
+            if not found_p:
+                return None
+
+            conf_id = str(found_p.get("id"))
+            real_title = found_p.get("title") or candidate_title or ""
+            p_url = f"{self.client.base_url}/spaces/{self.space_key}/pages/{conf_id}"
+
+            page_entry = {
+                "confluence_id": conf_id,
+                "title": real_title,
+                "url": p_url,
+                "node_type": "page",
+                "_is_remote_resolved": True,
+            }
+
+            for cid in candidate_ids:
+                self.migration_map[cid] = page_entry
+                norm = cid.replace("-", "").lower()
+                self.migration_map[norm] = page_entry
+                self._node_to_title[cid] = real_title
+                self._node_to_title[norm] = real_title
+                if hasattr(self, "converter"):
+                    if not hasattr(self.converter, "id_to_title_map") or self.converter.id_to_title_map is None:
+                        self.converter.id_to_title_map = {}
+                    self.converter.id_to_title_map[cid] = real_title
+                    self.converter.id_to_title_map[norm] = real_title
+
+            self._reserved_titles.add(real_title)
+            if hasattr(self, "converter"):
+                self.converter.migration_map = self.migration_map
+
+            logger.info(f"Dynamically resolved remote page [{real_title}] (ID: {conf_id})")
+            return page_entry
+
+    def _resolve_external_and_remote_references(self, root_node: PageNode):
+        """ツリー内の未解決 Linked Database View や外部参照について、Confluence上の既存リソースを検索して動的解決する。"""
+        from src.converter import extract_uuids
+
+        def _scan_blocks(blocks: List[Dict[str, Any]]):
+            for b in blocks or []:
+                b_type = b.get("type", "")
+                if b_type == "child_database":
+                    c_ids = []
+                    if b.get("database_id"):
+                        c_ids.append(b["database_id"])
+                    if b.get("id"):
+                        c_ids.append(b["id"])
+                    src_name = b.get("database_title") or (b.get("child_database") or {}).get("title", "")
+                    for ds in b.get("data_sources", []):
+                        if isinstance(ds, dict):
+                            if ds.get("id"):
+                                c_ids.append(ds["id"])
+                            if not src_name and ds.get("name"):
+                                src_name = ds["name"]
+
+                    resolved = self._resolve_remote_database(candidate_ids=c_ids, candidate_title=src_name)
+                    if resolved:
+                        b.pop("_is_unresolved_external_db", None)
+
+                elif b_type == "child_page":
+                    c_title = (b.get("child_page") or {}).get("title")
+                    c_id = b.get("id")
+                    if b.get("_is_unresolved_external_page"):
+                        resolved_p = self._resolve_remote_page(candidate_ids=[c_id] if c_id else [], candidate_title=c_title)
+                        if resolved_p:
+                            b.pop("_is_unresolved_external_page", None)
+
+                elif b_type == "link_to_page":
+                    lp = b.get("link_to_page", {}) or {}
+                    t_id = lp.get("database_id") or lp.get("page_id")
+                    t_title = lp.get("title") or b.get("link_title") or b.get("title")
+                    if t_id:
+                        resolved_db = self._resolve_remote_database(candidate_ids=[t_id], candidate_title=t_title)
+                        if resolved_db:
+                            b.pop("_is_unresolved_external_db", None)
+                        else:
+                            resolved_p = self._resolve_remote_page(candidate_ids=[t_id], candidate_title=t_title)
+                            if resolved_p:
+                                b.pop("_is_unresolved_external_page", None)
+
+                # rich_text 内のリンク・参照の動的解決
+                data = b.get(b_type, {})
+                if isinstance(data, dict):
+                    rts = data.get("rich_text", [])
+                    if isinstance(rts, list):
+                        for rt in rts:
+                            if not isinstance(rt, dict):
+                                continue
+                            if rt.get("_is_unresolved_external_page"):
+                                p_id = rt.get("page_id")
+                                plain = str(rt.get("plain_text") or (rt.get("text") or {}).get("content", "") or "").strip()
+                                link_obj = (rt.get("text") or {}).get("link") if isinstance(rt.get("text"), dict) else None
+                                href = (link_obj.get("url") if isinstance(link_obj, dict) else None) or rt.get("href") or ""
+                                uuids = extract_uuids(href) if href else []
+                                candidate_ids = ([p_id] if p_id else []) + uuids
+                                resolved_p = self._resolve_remote_page(candidate_ids=candidate_ids, candidate_title=plain)
+                                if resolved_p:
+                                    rt.pop("_is_unresolved_external_page", None)
+
+                if b.get("children_blocks"):
+                    _scan_blocks(b["children_blocks"])
+
+        def _traverse(n: PageNode):
+            if n.blocks:
+                # 2パス走査: rich_text等のタイトルから解決された後、IDのみのlink_to_pageも確実に解消
+                _scan_blocks(n.blocks)
+                _scan_blocks(n.blocks)
+            for c in n.children:
+                _traverse(c)
+
+        _traverse(root_node)
 
     @staticmethod
     def _extract_db_field_values(db_node: PageNode, field_name: str) -> List[str]:
@@ -1008,11 +1432,43 @@ class ConfluenceImporter:
             for c in n.children:
                 collect_titles(c)
         collect_titles(root_node)
+
+        # 外部マッピングや事前解決済みのタイトルをマージ
+        for mid, mtitle in getattr(self, "_node_to_title", {}).items():
+            if mid not in id_title_map:
+                id_title_map[mid] = mtitle
+
         self.converter.id_to_title_map = id_title_map
         self.converter.migration_map = self.migration_map
 
+        # 未解決の外部参照・クロスZIP参照についてConfluenceリモートリソースを動的解決
+        self._resolve_external_and_remote_references(root_node)
+
         # ツリー全体を事前スキャンし、他ページから参照されているDBビュー要件（ボード/ギャラリー/カテゴリ等）を収集
         self._db_view_requirements = self._analyze_database_view_requirements(root_node)
+
+        # リモート解決されたDBに対して必要なビュー（board / gallery等）が存在しなければ自動作成
+        for db_norm_id, req in (self._db_view_requirements or {}).items():
+            for mid, minfo in list(self.migration_map.items()):
+                if minfo.get("node_type") == "database" and str(mid).replace("-", "").lower() == db_norm_id:
+                    views = minfo.get("views") or {}
+                    db_conf_id = minfo.get("confluence_id")
+                    if req.get("needs_board") and not any("ボード" in vn or "board" in vn.lower() for vn in views):
+                        try:
+                            created_v = self.client.create_database_view(db_conf_id, "ボード", layout="board")
+                            if created_v and created_v.get("id"):
+                                minfo.setdefault("views", {})["ボード"] = created_v["id"]
+                                logger.info(f"Created missing board view for remote database [{minfo.get('title')}]")
+                        except Exception as e:
+                            logger.debug(f"Could not auto-create board view for DB {db_conf_id}: {e}")
+                    if req.get("needs_gallery") and not any("ギャラリー" in vn or "gallery" in vn.lower() for vn in views):
+                        try:
+                            created_v = self.client.create_database_view(db_conf_id, "ギャラリー", layout="gallery")
+                            if created_v and created_v.get("id"):
+                                minfo.setdefault("views", {})["ギャラリー"] = created_v["id"]
+                                logger.info(f"Created missing gallery view for remote database [{minfo.get('title')}]")
+                        except Exception as e:
+                            logger.debug(f"Could not auto-create gallery view for DB {db_conf_id}: {e}")
 
         # ダッシュボードの開始 (Task B.10)
         def _count_tree_nodes(n: PageNode) -> int:
@@ -1033,6 +1489,9 @@ class ConfluenceImporter:
                 self.dashboard.set_main_task("Pass 1 完了: 未解決DB行ビューの非同期解決中...")
             # 1. 未解決のデータベース行ビューを非同期解決 (Approach B / Resume)
             self.resolve_pending_database_row_views(root_node)
+
+            # Pass 2 直前にも未解決参照を再度動的解決
+            self._resolve_external_and_remote_references(root_node)
 
             # 2. データベースの最新ビュー一覧を再取得して確実に migration_map を補完
             db_items = [(nid, ninfo) for nid, ninfo in self.migration_map.items() if ninfo.get("node_type") == "database"]
