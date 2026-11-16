@@ -1485,6 +1485,11 @@ class NotionToConfluenceConverter:
                     if target_page_id and self.id_to_title_map:
                         norm_id = target_page_id.replace("-", "").lower()
                         target_title = self.id_to_title_map.get(target_page_id) or self.id_to_title_map.get(norm_id)
+                    if not target_title and target_page_id and hasattr(self, "migration_map") and self.migration_map:
+                        norm_id = target_page_id.replace("-", "").lower()
+                        m_entry = self.migration_map.get(target_page_id) or self.migration_map.get(norm_id)
+                        if m_entry:
+                            target_title = m_entry.get("title")
                     if target_title:
                         escaped_title = html.escape(target_title)
                         output.append(
