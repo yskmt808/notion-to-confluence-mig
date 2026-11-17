@@ -743,6 +743,110 @@ class TestUnifiedMissingAndUnsupportedWarningsPlanA(unittest.TestCase):
         self.assertEqual(telemetry.unresolved_external_pages_count, 0)
         self.assertEqual(telemetry.total_warnings_count, 0)
 
+    def test_invisible_empty_div_with_uuid_is_not_flagged_as_external_synced_block(self):
+        """TCK_00026: Notion上の不可視・空要素 (<div id="<uuid>" dir="auto"></div>) は外部同期ブロックと誤検知されないこと。"""
+        from migrate import collect_external_synced_pages
+
+        doc = _build_html_doc(
+            "Invisible Div Page",
+            """
+            <p>Normal paragraph</p>
+            <div id="4157be77-284d-80dc-82fb-cb5ee2c54c71" dir="auto"></div>
+            """,
+        )
+        zip_path = os.path.join(self.tmpdir, "inv.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("Invisible Div Page 12345678123412341234123456789012.html", doc)
+        tree = HtmlZipExtractor(zip_path).extract_tree()
+        count, pages = collect_external_synced_pages(tree)
+        self.assertEqual(count, 0)
+        self.assertEqual(pages, [])
+
+    def test_multihop_nested_synced_block_expansion_and_empty_removal_via_api(self):
+        """TCK_00026: 多段ネスト同期ブロックのNotion APIピンポイント展開および空同期ブロックの除去が行われること。"""
+        from unittest.mock import patch
+        from migrate import collect_external_synced_pages
+        from src.api_enricher import NotionApiEnricher
+
+        page_id = "4137be77-284d-8041-89c8-d080073331b4"
+        outer_sync_id = "4157be77-284d-805c-bc1f-d19bd475dde9"
+        inner_sync_id = "4157be77-284d-801e-b467-cab868436607"
+        orig_sync_id = "4157be77-284d-805b-845e-dd942bbeddfe"
+        dup_sync_id = "41b7be77-284d-80c4-bf31-f0dc1c5deb97"
+        empty_sync_id = "4157be77-284d-80dc-82fb-cb5ee2c54c71"
+
+        doc = _build_html_doc(
+            "MultiHop Sync Page",
+            f"""
+            <div dir="auto"><figure class="callout" id="{outer_sync_id}"><p>同期ブロック１</p></figure></div>
+            <div dir="auto"><div dir="auto"></div></div>
+            """,
+            page_id=page_id,
+        )
+        zip_path = os.path.join(self.tmpdir, "multihop.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr(f"MultiHop Sync Page {page_id.replace('-', '')}.html", doc)
+        tree = HtmlZipExtractor(zip_path).extract_tree()
+        before_count, _ = collect_external_synced_pages(tree)
+        self.assertEqual(before_count, 1)
+
+        children_map = {
+            page_id: [
+                {
+                    "id": outer_sync_id,
+                    "type": "synced_block",
+                    "has_children": True,
+                    "synced_block": {"synced_from": None},
+                },
+                {
+                    "id": dup_sync_id,
+                    "type": "synced_block",
+                    "has_children": False,
+                    "synced_block": {"synced_from": {"block_id": outer_sync_id}},
+                },
+                {
+                    "id": empty_sync_id,
+                    "type": "synced_block",
+                    "has_children": False,
+                    "synced_block": {"synced_from": None},
+                },
+            ],
+            outer_sync_id: [
+                {
+                    "id": inner_sync_id,
+                    "type": "synced_block",
+                    "has_children": False,
+                    "synced_block": {"synced_from": {"block_id": orig_sync_id}},
+                }
+            ],
+            orig_sync_id: [
+                {
+                    "id": "99999999-9999-9999-9999-999999999999",
+                    "type": "callout",
+                    "has_children": False,
+                    "callout": {
+                        "rich_text": [{"plain_text": "同期ブロック１", "annotations": {}}],
+                        "icon": {"type": "emoji", "emoji": "💡"},
+                    },
+                }
+            ],
+            empty_sync_id: [],
+        }
+
+        enricher = NotionApiEnricher(token="secret_dummy")
+        with patch.object(
+            enricher,
+            "_fetch_block_children_cached",
+            side_effect=lambda bid: (200, children_map.get(bid, [])),
+        ):
+            expanded = enricher.enrich_external_synced_blocks(tree)
+
+        self.assertEqual(expanded, 1)
+        after_count, _ = collect_external_synced_pages(tree)
+        self.assertEqual(after_count, 0)
+        storage = NotionToConfluenceConverter().generate_page_content(tree)
+        self.assertEqual(storage.count("同期ブロック１"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

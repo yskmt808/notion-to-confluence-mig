@@ -2511,10 +2511,10 @@ class HtmlZipExtractor:
         reason = "missing_content"
 
         if is_empty:
+            has_uuid_id = bool(el.get("id") and UUID_PATTERN.search(str(el.get("id"))))
             is_notion_wrapper = (
                 has_marker
-                or el.get("dir") == "auto"
-                or bool(el.get("id") and UUID_PATTERN.search(str(el.get("id"))))
+                or (el.get("dir") == "auto" and not has_uuid_id)
             )
             if is_notion_wrapper:
                 detected = True

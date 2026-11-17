@@ -42,12 +42,10 @@ class TestDuplicateDbAndPageLinks(unittest.TestCase):
         self.assertEqual(db1.title, "同じ名前")
         self.assertEqual(db2.title, "同じ名前 (2)")
 
-        # 両方のDBが作成されていること
+        # 両方のDBが作成されていること（並行実行のため呼び出し順は問わない）
         self.assertEqual(self.mock_client.create_database.call_count, 2)
-        first_call = self.mock_client.create_database.call_args_list[0]
-        second_call = self.mock_client.create_database.call_args_list[1]
-        self.assertEqual(first_call.kwargs["title"], "同じ名前")
-        self.assertEqual(second_call.kwargs["title"], "同じ名前 (2)")
+        created_titles = {c.kwargs["title"] for c in self.mock_client.create_database.call_args_list}
+        self.assertEqual(created_titles, {"同じ名前", "同じ名前 (2)"})
 
         # migration_mapに両方登録されていること
         self.assertIn("db-1", importer.migration_map)

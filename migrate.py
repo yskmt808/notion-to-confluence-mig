@@ -782,6 +782,8 @@ def main():
         if enrich_summary.get("users_fetched") or enrich_summary.get("users_enriched"):
             user_msg = f", {enrich_summary.get('users_fetched', 0)} 名のユーザーキャッシュ ({enrich_summary.get('users_enriched', 0)} 箇所補完)"
         print(f"✓ API補完完了: {enrich_summary['databases_enriched']} 件のデータベース, {enrich_summary['properties_mapped']} 件の正確なカラム型をマージしました{user_msg}\n")
+    elif use_zip and notion_token and collect_external_synced_pages(tree)[0] > 0:
+        NotionApiEnricher(token=notion_token).enrich_external_synced_blocks(tree)
 
     # Task B.4: 人間確認済みチェックシートの読込・適用
     if args.import_worksheet:

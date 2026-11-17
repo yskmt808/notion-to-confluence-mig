@@ -5,17 +5,32 @@ HTML/CSVエクスポートから高速解析したPageNodeツリーに対し、N
 ビュー定義（Board/カンバン、Gallery、Table、Group by設定）を高精度に復元・マージします。
 """
 
+import copy
 import logging
+import re
 import requests
-from typing import Dict, Any, List, Optional
-from src.extractor import PageNode
+from typing import Dict, Any, List, Optional, Set, Tuple
+from src.extractor import (
+    PageNode,
+    collect_external_synced_blocks_from_blocks,
+    normalize_notion_block,
+)
 from src.user_mapper import UserMappingManager
 
 logger = logging.getLogger(__name__)
 
+_HEX32_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
 
 def _normalize_uuid(uid: Optional[str]) -> str:
     return (uid or "").strip().replace("-", "").lower()
+
+
+def _format_uuid_36(uid: Optional[str]) -> Optional[str]:
+    norm = _normalize_uuid(uid)
+    if not _HEX32_RE.match(norm):
+        return None
+    return f"{norm[:8]}-{norm[8:12]}-{norm[12:16]}-{norm[16:20]}-{norm[20:]}"
 
 
 class NotionApiEnricher:
@@ -36,6 +51,7 @@ class NotionApiEnricher:
         self.workspace_users: List[Dict[str, Any]] = []
         self.users_by_id: Dict[str, Dict[str, Any]] = {}
         self.users_by_name: Dict[str, List[Dict[str, Any]]] = {}
+        self._block_children_cache: Dict[str, Tuple[int, List[Dict[str, Any]]]] = {}
 
     def _fetch_workspace_users(self, summary: Dict[str, Any]):
         """GET /v1/users (page_size=100) を一括取得し、ローカルのID/表示名辞書を構築する。"""
@@ -176,6 +192,8 @@ class NotionApiEnricher:
             "users_fetched": 0,
             "users_enriched": 0,
             "rows_enriched": 0,
+            "synced_blocks_resolved": 0,
+            "empty_synced_blocks_removed": 0,
             "homonym_warnings": [],
             "errors": [],
         }
@@ -183,10 +201,11 @@ class NotionApiEnricher:
         # 1. ワークスペースユーザー一覧を最初に一括キャッシュ
         self._fetch_workspace_users(summary)
 
-        # 2. ツリー走査（DB補完＋全ノードのユーザー補完）
+        # 2. ツリー走査（DB補完＋未展開同期ブロックのピンポイント解決＋全ノードのユーザー補完）
         def traverse(node: PageNode):
             if node.node_type == "database":
                 self._enrich_database(node, summary)
+            self._enrich_node_external_synced_blocks(node, summary)
             self._enrich_node_users(node, summary)
             for child in node.children:
                 traverse(child)
@@ -546,4 +565,197 @@ class NotionApiEnricher:
                     }
 
             row.properties.update(aligned_props)
+
+    def _fetch_block_children_cached(self, block_id: str) -> Tuple[int, List[Dict[str, Any]]]:
+        """Notion API から指定ブロックの子要素一覧をキャッシュ付きで取得する。"""
+        formatted = _format_uuid_36(block_id)
+        if not formatted:
+            return 400, []
+        if formatted in self._block_children_cache:
+            return self._block_children_cache[formatted]
+
+        results: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        last_status = 200
+        try:
+            while True:
+                params: Dict[str, Any] = {"page_size": 100}
+                if cursor:
+                    params["start_cursor"] = cursor
+                res = requests.get(
+                    f"https://api.notion.com/v1/blocks/{formatted}/children",
+                    headers=self.headers_v1,
+                    params=params,
+                    timeout=15,
+                )
+                last_status = res.status_code
+                if res.status_code != 200:
+                    break
+                data = res.json() or {}
+                results.extend(b for b in data.get("results", []) if isinstance(b, dict))
+                if not data.get("has_more") or not data.get("next_cursor"):
+                    break
+                cursor = data.get("next_cursor")
+        except Exception as e:
+            logger.debug(f"[API-ENRICH] Error fetching children for block {formatted}: {e}")
+            last_status = 500
+
+        out = (last_status, results)
+        self._block_children_cache[formatted] = out
+        return out
+
+    def _resolve_synced_block_leaf_children(
+        self,
+        api_sb: Dict[str, Any],
+        visited: Optional[Set[str]] = None,
+    ) -> Tuple[str, str, List[Dict[str, Any]]]:
+        """synced_block の synced_from および入れ子 synced_block を多段で辿り、実体子ブロック群を返す。
+        戻り値: (status: 'resolved' | 'inaccessible' | 'error', target_id, leaf_blocks)
+        """
+        if visited is None:
+            visited = set()
+        sb_data = api_sb.get("synced_block") or {}
+        synced_from = sb_data.get("synced_from") if isinstance(sb_data, dict) else None
+        raw_target = (synced_from.get("block_id") if isinstance(synced_from, dict) else None) or api_sb.get("id") or ""
+        norm_target = _normalize_uuid(raw_target)
+        if not norm_target or norm_target in visited:
+            return "resolved", raw_target, []
+
+        new_visited = set(visited)
+        new_visited.add(norm_target)
+
+        status_code, children = self._fetch_block_children_cached(raw_target)
+        if status_code in (403, 404):
+            return "inaccessible", raw_target, []
+        if status_code != 200:
+            return "error", raw_target, []
+
+        leaf_blocks: List[Dict[str, Any]] = []
+        for cb in children:
+            cb_type = cb.get("type")
+            if cb_type == "synced_block":
+                sub_status, sub_target, sub_leaves = self._resolve_synced_block_leaf_children(cb, new_visited)
+                if sub_status == "inaccessible":
+                    return "inaccessible", sub_target or raw_target, []
+                if sub_status == "error":
+                    return "error", sub_target or raw_target, []
+                leaf_blocks.extend(sub_leaves)
+            else:
+                cb_copy = copy.deepcopy(cb)
+                if cb_copy.get("has_children") and not cb_copy.get("children_blocks"):
+                    c_stat, sub_ch = self._fetch_block_children_cached(cb_copy.get("id", ""))
+                    if c_stat == 200 and sub_ch:
+                        for sc in sub_ch:
+                            normalize_notion_block(sc)
+                            sc["_via_synced_block"] = True
+                        cb_copy["children_blocks"] = sub_ch
+                normalize_notion_block(cb_copy)
+                cb_copy["_via_synced_block"] = True
+                leaf_blocks.append(cb_copy)
+
+        return "resolved", raw_target, leaf_blocks
+
+    def _enrich_node_external_synced_blocks(
+        self,
+        node: PageNode,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """未展開同期ブロック (_is_external_synced_block) を持つページについてのみ Notion API を呼び出し、
+        多段参照の同期ブロック展開および不可視の空要素除外を行う。
+        """
+        if not self.token or not getattr(node, "blocks", None):
+            return 0
+        if not collect_external_synced_blocks_from_blocks(node.blocks):
+            return 0
+        if not _format_uuid_36(getattr(node, "id", "")):
+            return 0
+
+        status_code, api_blocks = self._fetch_block_children_cached(node.id)
+        if status_code != 200:
+            return 0
+
+        api_synced_blocks = [b for b in api_blocks if b.get("type") == "synced_block"]
+        resolved_slots = [self._resolve_synced_block_leaf_children(sb) for sb in api_synced_blocks]
+
+        # node.blocks 内の同期スロット（展開済み _via_synced_block 連続ラン または 未展開 _is_external_synced_block）を走査
+        new_blocks: List[Dict[str, Any]] = []
+        slot_idx = 0
+        resolved_count = 0
+        removed_empty_count = 0
+        i = 0
+        n_len = len(node.blocks)
+        while i < n_len:
+            b = node.blocks[i]
+            if isinstance(b, dict) and b.get("_is_external_synced_block"):
+                explicit_ref = ((b.get("synced_block") or {}).get("synced_from") or {}).get("block_id")
+                matched_slot = None
+                if explicit_ref and _format_uuid_36(explicit_ref):
+                    matched_slot = self._resolve_synced_block_leaf_children(b)
+                elif slot_idx < len(resolved_slots):
+                    matched_slot = resolved_slots[slot_idx]
+                    slot_idx += 1
+
+                if matched_slot is not None:
+                    st, t_id, leaves = matched_slot
+                    if st == "resolved":
+                        if leaves:
+                            new_blocks.extend(copy.deepcopy(leaves))
+                            resolved_count += 1
+                        else:
+                            # Notion上でも中身が空の不可視同期ブロックは除去して警告対象外とする
+                            removed_empty_count += 1
+                        i += 1
+                        continue
+                    elif st == "inaccessible":
+                        b.setdefault("synced_block", {})["synced_from"] = {"type": "block_id", "block_id": t_id}
+                        new_blocks.append(b)
+                        i += 1
+                        continue
+                elif not explicit_ref:
+                    # ページAPIに存在しない余剰な空 <div dir="auto">（不可視の空要素）は除去する
+                    removed_empty_count += 1
+                    i += 1
+                    continue
+
+                new_blocks.append(b)
+                i += 1
+            elif isinstance(b, dict) and b.get("_via_synced_block"):
+                # HTML側で既に展開されている1つ分の同期ブロック群を1スロットとして進める
+                slot_idx += 1
+                while i < n_len and isinstance(node.blocks[i], dict) and node.blocks[i].get("_via_synced_block"):
+                    new_blocks.append(node.blocks[i])
+                    i += 1
+            else:
+                new_blocks.append(b)
+                i += 1
+
+        if resolved_count or removed_empty_count:
+            node.blocks = new_blocks
+            node.external_synced_blocks = collect_external_synced_blocks_from_blocks(node.blocks)
+            if summary is not None:
+                summary["synced_blocks_resolved"] = summary.get("synced_blocks_resolved", 0) + resolved_count
+                summary["empty_synced_blocks_removed"] = summary.get("empty_synced_blocks_removed", 0) + removed_empty_count
+            logger.info(
+                f"[API-ENRICH] Page [{node.title}] ({node.id}): "
+                f"resolved {resolved_count} multi-hop synced block(s), removed {removed_empty_count} empty/invisible block(s)."
+            )
+        return resolved_count + removed_empty_count
+
+    def enrich_external_synced_blocks(
+        self,
+        root_node: PageNode,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """ツリー内の未展開同期ブロックを持つページのみピンポイントでAPI補完・展開する。"""
+        total_changed = 0
+
+        def _walk(n: PageNode):
+            nonlocal total_changed
+            total_changed += self._enrich_node_external_synced_blocks(n, summary)
+            for c in getattr(n, "children", None) or []:
+                _walk(c)
+
+        if root_node:
+            _walk(root_node)
+        return total_changed
 
