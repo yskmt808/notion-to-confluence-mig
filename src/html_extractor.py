@@ -510,6 +510,54 @@ class HtmlZipExtractor:
 
         return None
 
+    def _extract_cover_from_soup(
+        self,
+        soup: BeautifulSoup,
+        zf: Optional[zipfile.ZipFile] = None,
+        current_dir: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """HTMLの <img class="page-cover-image"> からカバー画像情報と垂直表示位置(position)を抽出する。"""
+        cover_img = soup.find("img", class_="page-cover-image")
+        if not cover_img or not cover_img.get("src"):
+            return None
+        cover_src = str(cover_img["src"]).strip()
+        if not cover_src:
+            return None
+
+        position = 50
+        style_attr = str(cover_img.get("style") or "")
+        m_pos = re.search(r"object-position\s*:\s*[^;]*?(\d+(?:\.\d+)?)%", style_attr, re.IGNORECASE)
+        if m_pos:
+            try:
+                position = max(0, min(100, int(round(float(m_pos.group(1))))))
+            except Exception:
+                position = 50
+
+        if cover_src.lower().startswith(("http://", "https://")):
+            return {
+                "type": "external",
+                "external": {"url": cover_src},
+                "position": position,
+            }
+
+        if zf is not None:
+            raw_bytes, resolved_path = self._read_zip_attachment_bytes(zf, current_dir, cover_src)
+            if raw_bytes is not None:
+                fname = os.path.basename(urllib.parse.unquote(resolved_path or cover_src))
+                return {
+                    "type": "file",
+                    "file": {"url": resolved_path or cover_src},
+                    "_local_bytes": raw_bytes,
+                    "_filename": unicodedata.normalize("NFC", fname),
+                    "position": position,
+                }
+
+        return {
+            "type": "external",
+            "external": {"url": cover_src},
+            "position": position,
+        }
+
     def _build_page_node(
         self,
         zf: zipfile.ZipFile,
@@ -538,11 +586,7 @@ class HtmlZipExtractor:
         icon = self._extract_icon_from_soup(soup)
 
         # カバー画像
-        cover = None
-        cover_img = soup.find("img", class_="page-cover-image")
-        if cover_img and cover_img.get("src"):
-            cover_src = cover_img["src"]
-            cover = {"type": "external", "external": {"url": cover_src}}
+        cover = self._extract_cover_from_soup(soup, zf=zf, current_dir=os.path.dirname(html_file))
 
         # ノードタイプの判定（データベースか通常ページか）
         is_database = node_id in db_csv_map
@@ -928,9 +972,7 @@ class HtmlZipExtractor:
             if row_html_file and (row_html_file in file_set if file_set is not None else row_html_file in zf.namelist()):
                 row_soup = BeautifulSoup(zf.read(row_html_file).decode("utf-8"), "html.parser")
                 row_icon = self._extract_icon_from_soup(row_soup)
-                cover_img = row_soup.find("img", class_="page-cover-image")
-                if cover_img and cover_img.get("src"):
-                    row_cover = {"type": "external", "external": {"url": cover_img["src"]}}
+                row_cover = self._extract_cover_from_soup(row_soup, zf=zf, current_dir=os.path.dirname(row_html_file))
                 row_prop_table = row_soup.find("table", class_="properties")
                 if row_prop_table:
                     row_html_props = self._extract_properties_from_table(row_prop_table, col_types_out=col_html_types)

@@ -2442,20 +2442,20 @@ class NotionToConfluenceConverter:
         self.referenced_anchors = set()
         self._collect_page_anchors(getattr(node, "blocks", []))
         cover_html = ""
-        cover_file = getattr(node, "_cover_filename", None) or (
-            f"cover_{node.id.replace('-', '')[:8]}.jpg" if getattr(node, "cover", None) else None
-        )
-        if cover_file:
-            # Notionのカバー画像のようにページの最上部に横幅いっぱいの美しいバナーとして表示
-            cover_html = (
-                f'<div style="width: 100%; max-height: 250px; overflow: hidden; margin-bottom: 24px; border-radius: 8px;">'
-                f'<p style="text-align: center; margin: 0;">'
-                f'<ac:image ac:align="center" ac:layout="full-width" ac:width="1200">'
-                f'<ri:attachment ri:filename="{html.escape(cover_file)}" />'
-                f'</ac:image>'
-                f'</p>'
-                f'</div>\n'
+        if getattr(node, "_legacy_inline_cover", False):
+            cover_file = getattr(node, "_cover_filename", None) or (
+                f"cover_{node.id.replace('-', '')[:8]}.jpg" if getattr(node, "cover", None) else None
             )
+            if cover_file:
+                cover_html = (
+                    f'<div style="width: 100%; max-height: 250px; overflow: hidden; margin-bottom: 24px; border-radius: 8px;">'
+                    f'<p style="text-align: center; margin: 0;">'
+                    f'<ac:image ac:align="center" ac:layout="full-width" ac:width="1200">'
+                    f'<ri:attachment ri:filename="{html.escape(cover_file)}" />'
+                    f'</ac:image>'
+                    f'</p>'
+                    f'</div>\n'
+                )
 
         metadata_header = self._render_metadata_header(node)
 

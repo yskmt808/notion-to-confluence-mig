@@ -435,6 +435,68 @@ class ConfluenceClient:
                     else:
                         logger.warning(f"Exception setting page emoji property for {page_id}: {e}")
 
+    def set_page_cover(self, page_id: str, cover_id: str, position: int = 50) -> bool:
+        """Confluenceのページヘッダーカバー画像プロパティ（cover-picture-id-published / cover-picture-id-draft）を設定する。"""
+        if not cover_id:
+            return False
+        try:
+            pos_val = max(0, min(100, int(position if position is not None else 50)))
+        except Exception:
+            pos_val = 50
+        val_str = json.dumps({"id": str(cover_id), "position": pos_val}, separators=(",", ":"))
+        success_any = False
+
+        for prop_key in ("cover-picture-id-published", "cover-picture-id-draft"):
+            url = f"{self.base_url}/rest/api/content/{page_id}/property/{prop_key}"
+            for attempt in range(3):
+                try:
+                    get_res = requests.get(url, auth=self.auth, timeout=15)
+                    if get_res.status_code == 200:
+                        prop_data = get_res.json()
+                        version = prop_data.get("version", {}).get("number", 1) + 1
+                        res = requests.put(
+                            url,
+                            json={"key": prop_key, "value": val_str, "version": {"number": version}},
+                            auth=self.auth,
+                            headers=self.headers,
+                            timeout=15,
+                        )
+                    else:
+                        post_url = f"{self.base_url}/rest/api/content/{page_id}/property"
+                        res = requests.post(
+                            post_url,
+                            json={"key": prop_key, "value": val_str},
+                            auth=self.auth,
+                            headers=self.headers,
+                            timeout=15,
+                        )
+                    if res.status_code == 429:
+                        time.sleep(1.0 * (attempt + 1))
+                        continue
+                    if res.status_code in (200, 201):
+                        success_any = True
+                        break
+                    else:
+                        logger.warning(f"Failed setting {prop_key} on page {page_id}: HTTP {res.status_code}")
+                        break
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(1.0)
+                    else:
+                        logger.warning(f"Exception setting page cover property {prop_key} for {page_id}: {e}")
+        return success_any
+
+    def get_page_property(self, page_id: str, prop_key: str) -> Optional[Dict[str, Any]]:
+        """指定したConfluenceページのContent Propertyを取得する。"""
+        url = f"{self.base_url}/rest/api/content/{page_id}/property/{prop_key}"
+        try:
+            res = requests.get(url, auth=self.auth, timeout=15)
+            if res.status_code == 200:
+                return res.json()
+        except Exception as e:
+            logger.debug(f"Error fetching page property {prop_key} for {page_id}: {e}")
+        return None
+
     def delete_page(self, page_id: str) -> bool:
         """Confluenceページを削除する。"""
         url = f"{self.base_url}/rest/api/content/{page_id}"
@@ -2033,20 +2095,68 @@ class ConfluenceImporter:
             for db in db_nodes:
                 _resolve_single_db(db)
 
+    @staticmethod
+    def _extract_attachment_file_id(upload_res: Any) -> Optional[str]:
+        """upload_attachment のレスポンス辞書から Atlassian Media Service の fileId (UUID) を抽出する。"""
+        if not isinstance(upload_res, dict):
+            return None
+        ext = upload_res.get("extensions")
+        if isinstance(ext, dict) and ext.get("fileId"):
+            return str(ext["fileId"])
+        results = upload_res.get("results")
+        if isinstance(results, list) and results and isinstance(results[0], dict):
+            r_ext = results[0].get("extensions")
+            if isinstance(r_ext, dict) and r_ext.get("fileId"):
+                return str(r_ext["fileId"])
+            if results[0].get("id"):
+                return str(results[0]["id"])
+        if upload_res.get("id"):
+            return str(upload_res["id"])
+        return None
+
     def _process_cover(self, node: PageNode, page_id: str):
-        """ページのカバー画像をダウンロードし、Notion風の横長バナー（1200x200）にローカルでクロップしてアップロードする。"""
+        """ページのカバー画像をConfluenceへ添付アップロードし、ネイティブカバー画像プロパティ（cover-picture-id-published / draft）を設定する。"""
         if not getattr(node, "cover", None):
             return
 
-        cover_data = node.cover
+        cover_data = node.cover if isinstance(node.cover, dict) else {}
+        position = cover_data.get("position", 50)
         f_obj = cover_data.get("file") or {}
         e_obj = cover_data.get("external") or {}
         cover_url = f_obj.get("url") or e_obj.get("url")
-        if not cover_url:
+        local_bytes = cover_data.get("_local_bytes")
+
+        filename = (
+            cover_data.get("_filename")
+            or getattr(node, "_cover_filename", None)
+            or f"cover_{node.id.replace('-', '')[:8]}.jpg"
+        )
+        node._cover_filename = filename
+
+        if isinstance(local_bytes, (bytes, bytearray)):
+            mime_type = detect_attachment_mime_type(filename)
+            try:
+                upload_res = self.client.upload_attachment(
+                    page_id=page_id,
+                    filename=filename,
+                    file_bytes=bytes(local_bytes),
+                    mime_type=mime_type,
+                )
+                file_id = self._extract_attachment_file_id(upload_res)
+                if file_id:
+                    self.client.set_page_cover(page_id, file_id, position=position)
+                    node._cover_uploaded = True
+                    node._native_cover_set = True
+                    logger.info(f"Successfully set native cover image from ZIP: {filename} (fileId={file_id}, position={position})")
+                else:
+                    node._cover_uploaded = False
+            except Exception as e:
+                node._cover_uploaded = False
+                logger.warning(f"Failed to upload/set local ZIP cover image {filename}: {e}")
             return
 
-        filename = getattr(node, "_cover_filename", None) or f"cover_{node.id.replace('-', '')[:8]}.jpg"
-        node._cover_filename = filename
+        if not cover_url:
+            return
 
         if not _is_safe_external_url(cover_url):
             logger.warning(f"Skipped unsafe or non-HTTP cover URL for page {page_id}: {cover_url}")
@@ -2058,42 +2168,18 @@ class ConfluenceImporter:
         try:
             resp = requests.get(cover_url, headers=headers, timeout=30)
             if resp.status_code == 200:
-                # 縦長画像などをNotionの横長ヘッダーバナー比率（1200x200）にローカルで安全にクロップ
-                banner_bytes = resp.content
-                try:
-                    img = Image.open(io.BytesIO(resp.content))
-                    if img.mode != "RGB":
-                        img = img.convert("RGB")
-                    orig_w, orig_h = img.size
-                    target_w, target_h = 1200, 200
-                    target_ratio = target_w / target_h
-                    orig_ratio = orig_w / orig_h
-
-                    if orig_ratio > target_ratio:
-                        new_w = int(orig_h * target_ratio)
-                        left = (orig_w - new_w) // 2
-                        img = img.crop((left, 0, left + new_w, orig_h))
-                    else:
-                        new_h = int(orig_w / target_ratio)
-                        top = int((orig_h - new_h) * 0.5)  # Notionのデフォルト切り抜き位置（中央 50%）に合わせる
-                        img = img.crop((0, top, orig_w, top + new_h))
-
-                    img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                    out = io.BytesIO()
-                    img.save(out, format="JPEG", quality=90)
-                    banner_bytes = out.getvalue()
-                    logger.info(f"Successfully cropped cover image to banner ratio (1200x200)")
-                except Exception as ce:
-                    logger.warning(f"Could not crop cover image, uploading original: {ce}")
-
-                self.client.upload_attachment(
+                content_type = resp.headers.get("Content-Type") or detect_attachment_mime_type(filename)
+                upload_res = self.client.upload_attachment(
                     page_id=page_id,
                     filename=filename,
-                    file_bytes=banner_bytes,
-                    mime_type="image/jpeg",
+                    file_bytes=resp.content,
+                    mime_type=content_type,
                 )
+                file_id = self._extract_attachment_file_id(upload_res) or cover_url
+                self.client.set_page_cover(page_id, file_id, position=position)
                 node._cover_uploaded = True
-                logger.info(f"Successfully uploaded cover banner: {filename} ({len(banner_bytes)} bytes)")
+                node._native_cover_set = True
+                logger.info(f"Successfully uploaded and set native cover image: {filename} ({len(resp.content)} bytes, fileId={file_id}, position={position})")
             else:
                 node._cover_uploaded = False
                 logger.warning(f"Failed to download cover image {filename}: HTTP {resp.status_code}")

@@ -107,14 +107,19 @@ class MigrationVerifier:
         soup = BeautifulSoup(storage_body, "html.parser")
         extracted_text = soup.get_text()
 
-        # カバー画像の検証
+        # カバー画像の検証 (Confluenceネイティブ cover-picture-id-published プロパティ または レガシー本文 <ac:image>)
         if getattr(node, "cover", None):
             cover_file = getattr(node, "_cover_filename", None) or f"cover_{node.id.replace('-', '')[:8]}"
             cover_prefix = cover_file.rsplit(".", 1)[0]
-            if "<ac:image" in storage_body and cover_prefix in storage_body:
+            has_native_cover = bool(getattr(node, "_native_cover_set", False) or getattr(node, "_cover_uploaded", False))
+            if not has_native_cover and hasattr(self.client, "get_page_property"):
+                prop_res = self.client.get_page_property(confluence_page_id, "cover-picture-id-published")
+                if isinstance(prop_res, dict) and prop_res.get("value"):
+                    has_native_cover = True
+            if has_native_cover or ("<ac:image" in storage_body and cover_prefix in storage_body):
                 checks_passed.append(f"Page cover header image present ({cover_prefix}).")
             else:
-                issues.append(f"Cover image detected in Notion, but <ac:image> with {cover_prefix} not found in Confluence.")
+                issues.append(f"Cover image detected in Notion, but native cover property (cover-picture-id-published) not found in Confluence.")
 
         # ブロック別の固有要素チェック（カラム・トグル等のネスト配下も含めて再帰収集）
         all_blocks: List[Dict[str, Any]] = []

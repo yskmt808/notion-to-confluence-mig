@@ -866,6 +866,98 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
             self.assertNotIn(f'ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="{nfc_a10}"', storage_xml)
             self.assertIn('<ac:structured-macro ac:name="viewpdf"><ac:parameter ac:name="name"><ri:attachment ri:filename="subaru_studres_2016_p01.pdf" /></ac:parameter></ac:structured-macro>', storage_xml)
 
+    def test_native_cover_image_extraction_and_confluence_property_migration(self):
+        """TCK_00028: Notionのカバー画像(外部URL・ZIP内ローカル画像・position)がConfluenceネイティブプロパティへ移行され本文に重複出力されないこと。"""
+        from unittest.mock import MagicMock, patch
+        from src.importer import ConfluenceClient, ConfluenceImporter
+        from src.verifier import MigrationVerifier
+
+        html_ext_cover = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Cover Test</title></head>
+<body>
+  <article id="4137be77-284d-8041-89c8-d080073331b4" class="page sans">
+    <header>
+      <img class="page-cover-image" src="https://app.notion.com/images/page-cover/artemis_ii_7.jpg" style="object-position:center 35%"/>
+      <h1 class="page-title">Cover Test</h1>
+    </header>
+    <div class="page-body"><p>Hello Cover</p></div>
+  </article>
+</body>
+</html>"""
+
+        html_local_cover = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Local Cover Test</title></head>
+<body>
+  <article id="5137be77-284d-8041-89c8-d080073331b4" class="page sans">
+    <header>
+      <img class="page-cover-image" src="Local Cover Test/my_banner.png" style="object-position:center 75%"/>
+      <h1 class="page-title">Local Cover Test</h1>
+    </header>
+    <div class="page-body"><p>Hello Local Cover</p></div>
+  </article>
+</body>
+</html>"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. External URL cover test
+            zip_ext = os.path.join(tmpdir, "ext_cover.zip")
+            with zipfile.ZipFile(zip_ext, "w") as zf:
+                zf.writestr("Cover Test 4137be77284d804189c8d080073331b4.html", html_ext_cover)
+            tree_ext = HtmlZipExtractor(zip_ext).extract_tree()
+            self.assertEqual(tree_ext.cover["external"]["url"], "https://app.notion.com/images/page-cover/artemis_ii_7.jpg")
+            self.assertEqual(tree_ext.cover["position"], 35)
+
+            importer = ConfluenceImporter("https://example.atlassian.net/wiki", "u", "t", "TEST")
+            importer.client = MagicMock(spec=ConfluenceClient)
+            importer.client.upload_attachment.return_value = {
+                "results": [{"id": "att-100", "extensions": {"fileId": "uuid-file-id-1234"}}]
+            }
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.content = b"fake-jpeg-bytes"
+            mock_resp.headers = {"Content-Type": "image/jpeg"}
+
+            with patch("src.importer.requests.get", return_value=mock_resp):
+                importer._process_cover(tree_ext, "9001")
+
+            importer.client.upload_attachment.assert_called_once()
+            importer.client.set_page_cover.assert_called_once_with("9001", "uuid-file-id-1234", position=35)
+            self.assertTrue(tree_ext._native_cover_set)
+
+            # 本文中に重複した <ac:image> バナーが出力されないこと
+            body_xml = self.converter.generate_page_content(tree_ext)
+            self.assertNotIn("<ac:image", body_xml)
+            self.assertIn("Hello Cover", body_xml)
+
+            # Verifier がネイティブカバー設定済みページを PASS と判定すること
+            importer.client.get_page_by_id.return_value = {
+                "id": "9001",
+                "title": "Cover Test",
+                "body": {"storage": {"value": body_xml}, "view": {"value": body_xml}},
+            }
+            vres = MigrationVerifier(importer.client).verify_page_node(tree_ext, "9001")
+            self.assertEqual(vres["status"], "PASS", f"Expected PASS, got issues={vres['issues']}")
+            self.assertTrue(any("Page cover header image present" in c for c in vres["checks_passed"]))
+
+            # 2. Local ZIP cover test
+            zip_loc = os.path.join(tmpdir, "loc_cover.zip")
+            with zipfile.ZipFile(zip_loc, "w") as zf:
+                zf.writestr("Local Cover Test 5137be77284d804189c8d080073331b4.html", html_local_cover)
+                zf.writestr("Local Cover Test/my_banner.png", b"\x89PNG\r\n\x1a\nlocal-cover")
+            tree_loc = HtmlZipExtractor(zip_loc).extract_tree()
+            self.assertEqual(tree_loc.cover["position"], 75)
+            self.assertEqual(tree_loc.cover["_local_bytes"], b"\x89PNG\r\n\x1a\nlocal-cover")
+
+            importer.client.reset_mock()
+            importer.client.upload_attachment.return_value = {
+                "results": [{"id": "att-200", "extensions": {"fileId": "uuid-local-5678"}}]
+            }
+            importer._process_cover(tree_loc, "9002")
+            importer.client.upload_attachment.assert_called_once()
+            importer.client.set_page_cover.assert_called_once_with("9002", "uuid-local-5678", position=75)
+
 
 if __name__ == "__main__":
     unittest.main()
