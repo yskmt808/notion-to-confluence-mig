@@ -847,6 +847,29 @@ class TestUnifiedMissingAndUnsupportedWarningsPlanA(unittest.TestCase):
         storage = NotionToConfluenceConverter().generate_page_content(tree)
         self.assertEqual(storage.count("同期ブロック１"), 2)
 
+    def test_sharepoint_and_external_urls_with_guids_are_not_flagged_as_missing_pages(self):
+        """TCK_00027: SharePoint等のNotion外URLにGUIDが含まれていてもZIP未収録の外部ページ参照として誤警告されないこと。"""
+        sp_url = "https://contoso.sharepoint.com/:x:/r/sites/team/_layouts/15/Doc.aspx?sourcedoc=%7B12345678-1234-1234-1234-123456789abc%7D&action=default"
+        teams_url = "https://teams.microsoft.com/l/entity/87654321-4321-4321-4321-cba987654321/0"
+        doc = _build_html_doc(
+            "External Links Page",
+            f"""
+            <p><a href="{sp_url}">SharePoint Excel</a></p>
+            <p><a href="{teams_url}">Teams Channel</a></p>
+            """,
+        )
+        zip_path = os.path.join(self.tmpdir, "sp.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("External Links Page 12345678123412341234123456789012.html", doc)
+        tree = HtmlZipExtractor(zip_path).extract_tree()
+        telemetry = SanitizedTelemetry()
+        telemetry.record_tree(tree)
+        self.assertEqual(telemetry.unresolved_external_pages_count, 0)
+        self.assertEqual(tree.unresolved_external_pages, [])
+        storage = NotionToConfluenceConverter().generate_page_content(tree)
+        self.assertNotIn("外部ページ参照（ZIP未収録）", storage)
+        self.assertIn("SharePoint Excel", storage)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,7 @@ from src.extractor import (
     classify_external_app_url,
     collect_external_synced_blocks_from_blocks,
     is_broken_or_placeholder_url,
+    is_notion_page_link_target,
     mark_unresolved_external_references,
     normalize_db_title,
 )
@@ -2888,10 +2889,7 @@ class HtmlZipExtractor:
                         if child.get("data-notion-page-id"):
                             new_marks["page_id"] = normalize_id(child["data-notion-page-id"])
                         elif href_val and not ATTACHMENT_REF_PATTERN.match(unquoted_a_href):
-                            parsed_p = urllib.parse.urlparse(unquoted_a_href.split("#", 1)[0]).path.lower()
-                            if not parsed_p.endswith(
-                                (".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".mp4", ".mp3", ".zip", ".docx", ".xlsx", ".pptx")
-                            ):
+                            if is_notion_page_link_target(unquoted_a_href):
                                 h_uids = extract_uuids(href_val)
                                 if h_uids:
                                     new_marks["page_id"] = normalize_id(h_uids[-1])

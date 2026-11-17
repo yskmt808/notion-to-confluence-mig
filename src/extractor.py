@@ -579,21 +579,21 @@ def is_notion_page_link_target(href: Optional[str], page_id: Optional[str] = Non
         return False
     if clean_href.lower().startswith(("mailto:", "tel:", "javascript:", "attachment:")):
         return False
-    if page_id:
-        return True
     if not clean_href:
-        return False
+        return bool(page_id)
     parsed = urllib.parse.urlparse(clean_href)
     path_lower = urllib.parse.unquote(parsed.path or "").strip().lower()
     if path_lower.endswith(_ATTACHMENT_LINK_EXTENSIONS):
         return False
     is_http = parsed.scheme.lower() in ("http", "https")
-    if not is_http:
-        return path_lower.endswith(".html") or bool(_INLINE_UUID_RE.search(clean_href))
-    host = (parsed.hostname or "").lower()
-    if any(h in host for h in ("notion.so", "notion.site")):
-        return bool(_INLINE_UUID_RE.search(clean_href))
-    return False
+    if is_http:
+        host = (parsed.hostname or "").lower()
+        if any(h in host for h in ("notion.so", "notion.site")):
+            return bool(page_id) or bool(_INLINE_UUID_RE.search(clean_href))
+        return False
+    if page_id:
+        return True
+    return path_lower.endswith(".html") or bool(_INLINE_UUID_RE.search(clean_href))
 
 
 def _iter_block_rich_text_lists(block: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
