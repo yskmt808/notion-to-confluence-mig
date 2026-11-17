@@ -442,10 +442,15 @@ class ConfluenceClient:
         return res.status_code in (200, 204)
 
     def get_database_by_title(
-        self, space_key: str, title: str, title_prefix: str = "", use_cache: bool = False
+        self,
+        space_key: str,
+        title: str,
+        title_prefix: str = "",
+        use_cache: bool = False,
+        allow_fuzzy_suffix: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Confluence Databases (type: database) をタイトルとスペースから検索する。"""
-        cache_key = (space_key, "database", title, title_prefix)
+        cache_key = (space_key, "database", title, title_prefix, allow_fuzzy_suffix)
         if use_cache and cache_key in self._space_title_cache:
             return self._space_title_cache[cache_key]
 
@@ -474,6 +479,22 @@ class ConfluenceClient:
             norm_target = normalize_db_title(title)
             pref_trunc = (f"{title_prefix}{title}"[:252] + "...") if title_prefix else ""
             norm_pref = normalize_db_title(f"{title_prefix}{title}") if title_prefix else ""
+
+            # title_prefix 指定時はプレフィックス付き完全一致・正規化一致を最優先
+            if title_prefix and not title.startswith(title_prefix):
+                for r in results:
+                    r_title = r.get("title", "")
+                    if r_title == f"{title_prefix}{title}" or (pref_trunc and r_title == pref_trunc):
+                        if use_cache:
+                            self._space_title_cache[cache_key] = r
+                        return r
+                if norm_pref:
+                    for r in results:
+                        r_title = r.get("title", "")
+                        if normalize_db_title(r_title) == norm_pref:
+                            if use_cache:
+                                self._space_title_cache[cache_key] = r
+                            return r
 
             # 1. 完全一致
             for r in results:
@@ -510,12 +531,12 @@ class ConfluenceClient:
                             self._space_title_cache[cache_key] = r
                         return r
 
-            # 5. 接尾辞一致（プレフィックスが付与されている可能性）
-            if norm_target and len(norm_target) >= 3:
+            # 5. 接尾辞一致（allow_fuzzy_suffix=True かつ 異プレフィックス誤爆しない場合のみ）
+            if allow_fuzzy_suffix and norm_target and len(norm_target) >= 3 and not title_prefix:
                 for r in results:
                     r_title = r.get("title", "")
                     norm_r = normalize_db_title(r_title)
-                    if norm_r and (norm_r.endswith(norm_target) or norm_target.endswith(norm_r)):
+                    if norm_r and norm_r.endswith(norm_target):
                         if use_cache:
                             self._space_title_cache[cache_key] = r
                         return r
@@ -1189,6 +1210,58 @@ class ConfluenceImporter:
         """ツリー内の未解決 Linked Database View や外部参照について、Confluence上の既存リソースを検索して動的解決する。"""
         from src.converter import extract_uuids
 
+        # 現在移行中のローカルツリー内に存在するDB・ページはリモート検索対象から除外する
+        # (Pass 1 前に過去の別プレフィックス移行DBで _node_to_title / migration_map が上書きされるのを防止)
+        local_db_ids: Set[str] = set()
+        local_db_norm_titles: Set[str] = set()
+        local_node_ids: Set[str] = set()
+        local_node_norm_titles: Set[str] = set()
+        prefix_str = getattr(self, "title_prefix", "") or ""
+
+        def _collect_local_tree(n: PageNode):
+            if not n:
+                return
+            if n.id:
+                norm_nid = str(n.id).replace("-", "").lower()
+                local_node_ids.add(n.id)
+                local_node_ids.add(norm_nid)
+                if n.node_type == "database":
+                    local_db_ids.add(n.id)
+                    local_db_ids.add(norm_nid)
+            if n.title:
+                raw_t = n.title.strip()
+                unpref_t = raw_t[len(prefix_str):].strip() if (prefix_str and raw_t.startswith(prefix_str)) else raw_t
+                for t_cand in (raw_t, unpref_t):
+                    nt = normalize_db_title(t_cand)
+                    if nt:
+                        local_node_norm_titles.add(nt)
+                        if n.node_type == "database":
+                            local_db_norm_titles.add(nt)
+            for c in n.children or []:
+                _collect_local_tree(c)
+
+        _collect_local_tree(root_node)
+
+        def _is_local_db(c_ids: List[str], title_cand: Optional[str]) -> bool:
+            for cid in c_ids or []:
+                if cid and (cid in local_db_ids or str(cid).replace("-", "").lower() in local_db_ids):
+                    return True
+            if title_cand:
+                nt = normalize_db_title(title_cand)
+                if nt and nt in local_db_norm_titles:
+                    return True
+            return False
+
+        def _is_local_node(c_ids: List[str], title_cand: Optional[str]) -> bool:
+            for cid in c_ids or []:
+                if cid and (cid in local_node_ids or str(cid).replace("-", "").lower() in local_node_ids):
+                    return True
+            if title_cand:
+                nt = normalize_db_title(title_cand)
+                if nt and nt in local_node_norm_titles:
+                    return True
+            return False
+
         def _scan_blocks(blocks: List[Dict[str, Any]]):
             for b in blocks or []:
                 b_type = b.get("type", "")
@@ -1206,6 +1279,9 @@ class ConfluenceImporter:
                             if not src_name and ds.get("name"):
                                 src_name = ds["name"]
 
+                    if _is_local_db(c_ids, src_name):
+                        b.pop("_is_unresolved_external_db", None)
+                        continue
                     resolved = self._resolve_remote_database(candidate_ids=c_ids, candidate_title=src_name)
                     if resolved:
                         b.pop("_is_unresolved_external_db", None)
@@ -1214,6 +1290,9 @@ class ConfluenceImporter:
                     c_title = (b.get("child_page") or {}).get("title")
                     c_id = b.get("id")
                     if b.get("_is_unresolved_external_page"):
+                        if _is_local_node([c_id] if c_id else [], c_title):
+                            b.pop("_is_unresolved_external_page", None)
+                            continue
                         resolved_p = self._resolve_remote_page(candidate_ids=[c_id] if c_id else [], candidate_title=c_title)
                         if resolved_p:
                             b.pop("_is_unresolved_external_page", None)
@@ -1223,6 +1302,10 @@ class ConfluenceImporter:
                     t_id = lp.get("database_id") or lp.get("page_id")
                     t_title = lp.get("title") or b.get("link_title") or b.get("title")
                     if t_id:
+                        if _is_local_db([t_id], t_title) or _is_local_node([t_id], t_title):
+                            b.pop("_is_unresolved_external_db", None)
+                            b.pop("_is_unresolved_external_page", None)
+                            continue
                         resolved_db = self._resolve_remote_database(candidate_ids=[t_id], candidate_title=t_title)
                         if resolved_db:
                             b.pop("_is_unresolved_external_db", None)
@@ -1246,6 +1329,9 @@ class ConfluenceImporter:
                                 href = (link_obj.get("url") if isinstance(link_obj, dict) else None) or rt.get("href") or ""
                                 uuids = extract_uuids(href) if href else []
                                 candidate_ids = ([p_id] if p_id else []) + uuids
+                                if _is_local_node(candidate_ids, plain):
+                                    rt.pop("_is_unresolved_external_page", None)
+                                    continue
                                 resolved_p = self._resolve_remote_page(candidate_ids=candidate_ids, candidate_title=plain)
                                 if resolved_p:
                                     rt.pop("_is_unresolved_external_page", None)

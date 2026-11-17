@@ -378,6 +378,124 @@ class TestSplitExecutionCrossZipScenario(unittest.TestCase):
             self.assertIn('<ri:page ri:content-title="[HTML] A-01 テンプレート見出し集" />', body_arg)
             self.assertNotIn("未展開の外部データベース", body_arg)
 
+    def test_new_title_prefix_does_not_reuse_or_delete_previous_migration_db(self):
+        """TCK_00025: 新しい --title-prefix での移行時に過去の別プレフィックスDBを誤解決・削除せず、新プレフィックスでDBを作成すること"""
+        db_a_id = "4197be77-284d-810e-a5bf-f5771610db74"
+        new_prefix = "[20261117-0044]"
+        old_db_title = "[20261116-1040]A-DB 基盤プロジェクト管理"
+        new_db_title = f"{new_prefix}A-DB 基盤プロジェクト管理"
+
+        importer = ConfluenceImporter(
+            url="https://example.atlassian.net",
+            username="user@example.com",
+            token="tok",
+            space_key="TEST",
+            title_prefix=new_prefix,
+        )
+
+        # Confluence 上には前回移行の DB (4948089) が存在し、CQL 検索では候補として返ってくる状況を再現
+        real_client = ConfluenceClient("https://example.atlassian.net", "user@example.com", "tok")
+
+        def fake_requests_get(url, params=None, **kwargs):
+            r = MagicMock(status_code=200, ok=True)
+            if "/rest/api/content/search" in url:
+                r.json.return_value = {
+                    "results": [
+                        {"id": "4948089", "title": old_db_title},
+                        {"id": "4900001", "title": "A-DB 基盤プロジェクト管理"},
+                    ]
+                }
+            elif "/rest/api/content" in url:
+                r.json.return_value = {"results": []}
+            else:
+                r.json.return_value = {}
+            return r
+
+        created_dbs = []
+
+        def fake_create_database(space_id, title, parent_id=None, csv_body="", **kwargs):
+            created_dbs.append({"id": "5999001", "title": title})
+            return {"id": "5999001", "_links": {"webui": "/spaces/TEST/database/5999001"}}
+
+        with patch("src.importer.requests.get", side_effect=fake_requests_get):
+            real_client.get_space_id = MagicMock(return_value="sp_1")
+            real_client.create_database = MagicMock(side_effect=fake_create_database)
+            real_client.delete_database = MagicMock(return_value=True)
+            real_client.get_database_views = MagicMock(return_value=[{"id": "v_new_1", "name": "すべてのデータ", "type": "table"}])
+            real_client.get_database_entries = MagicMock(return_value=[])
+            real_client.update_database_field_options = MagicMock()
+
+            created_pages = {}
+            updated_pages = {}
+
+            def fake_create_page(space_key, title, body, parent_id=None, **kw):
+                pid = f"p_{len(created_pages) + 1}"
+                created_pages[pid] = {"id": pid, "title": title, "body": body}
+                return {"id": pid, "_links": {"webui": f"/spaces/{space_key}/pages/{pid}"}}
+
+            def fake_update_page(page_id, space_key, title, body, current_version, **kw):
+                updated_pages[page_id] = body
+                return {"id": page_id}
+
+            real_client.create_page = MagicMock(side_effect=fake_create_page)
+            real_client.update_page = MagicMock(side_effect=fake_update_page)
+            real_client.get_page_by_id = MagicMock(side_effect=lambda pid, expand=None: {
+                "id": pid,
+                "title": created_pages[pid]["title"],
+                "version": {"number": 1},
+                "body": {"storage": {"value": created_pages[pid]["body"]}},
+            })
+            importer.client = real_client
+
+            root = PageNode(
+                id="multi_block_root_page",
+                title=f"{new_prefix}【統合移行】マルチブロック移行ルート",
+                node_type="page",
+                blocks=[],
+                children=[
+                    PageNode(
+                        id="block_a",
+                        title=f"{new_prefix}Block A",
+                        node_type="page",
+                        blocks=[
+                            {
+                                "id": "view_in_a",
+                                "type": "child_database",
+                                "is_linked_database": True,
+                                "database_id": "41a7be77-284d-8027-83a3-e7588b6ae0cf",
+                                "data_sources": [{"name": "A-DB: 基盤プロジェクト管理", "id": "41a7be77-284d-8027-83a3-e7588b6ae0cf"}],
+                                "views": [{"name": "すべてのデータ", "type": "table"}],
+                            }
+                        ],
+                        children=[
+                            PageNode(
+                                id=db_a_id,
+                                title=new_db_title,
+                                node_type="database",
+                                properties={"schema": {"名前": {"type": "title"}}},
+                                children=[],
+                            )
+                        ],
+                    )
+                ],
+            )
+
+            mapping = importer.import_tree(root, parent_id="top_p", overwrite=True)
+
+        # 1. 過去の別プレフィックスDB (4948089) やプレフィックス無しDB (4900001) が削除されていないこと
+        real_client.delete_database.assert_not_called()
+
+        # 2. 新しいプレフィックスのタイトルでDBが新規作成されていること
+        self.assertEqual(len(created_dbs), 1)
+        self.assertEqual(created_dbs[0]["title"], new_db_title)
+        self.assertEqual(mapping[db_a_id]["title"], new_db_title)
+        self.assertEqual(mapping[db_a_id]["confluence_id"], "5999001")
+
+        # 3. 同一移行内の Linked DB View が新DB (5999001) を参照していること
+        block_a_conf_id = mapping["block_a"]["confluence_id"]
+        self.assertIn("5999001", updated_pages[block_a_conf_id])
+        self.assertNotIn("4948089", updated_pages[block_a_conf_id])
+
 
 if __name__ == "__main__":
     unittest.main()
