@@ -349,6 +349,7 @@ class HtmlZipExtractor:
         self.zip_path = os.path.abspath(zip_path)
         self.global_db_csv_map = global_db_csv_map or {}
         self.mark_unresolved = mark_unresolved
+        self._resolved_attachments_count = 0
         if not os.path.exists(self.zip_path):
             raise FileNotFoundError(f"Export zip file not found: {self.zip_path}")
         if not os.path.isfile(self.zip_path):
@@ -356,8 +357,16 @@ class HtmlZipExtractor:
         with zipfile.ZipFile(self.zip_path, "r"):
             pass
 
+    def _record_attachment_loaded(self, detail_msg: str):
+        """添付ファイル解決ログはDEBUGに抑え、INFOには100件ごとの進捗のみ出力する。"""
+        logger.debug(detail_msg)
+        self._resolved_attachments_count += 1
+        if self._resolved_attachments_count % 100 == 0:
+            logger.info(f"添付ファイル・メディア読み込み進捗: {self._resolved_attachments_count} 件解決済み...")
+
     def extract_tree(self) -> PageNode:
         """ZIPファイル全体を解析し、ルートPageNodeを返す。"""
+        self._resolved_attachments_count = 0
         logger.info(f"Opening and scanning Notion HTML export ZIP: {self.zip_path}")
         with zipfile.ZipFile(self.zip_path, "r") as zf:
             file_list = zf.namelist()
@@ -415,6 +424,8 @@ class HtmlZipExtractor:
 
             # 4. 全ファイルからPageNodeを再帰的に構築
             root_node = self._build_page_node(zf, root_file, db_csv_map)
+            if self._resolved_attachments_count > 0:
+                logger.info(f"添付ファイル・メディア読み込み完了: 合計 {self._resolved_attachments_count} 件")
             if self.mark_unresolved:
                 mark_unresolved_external_references(root_node)
             return root_node
@@ -2174,7 +2185,7 @@ class HtmlZipExtractor:
                                 "_attachment_filename": filename,
                                 "_attachment_bytes": data_bytes,
                             })
-                            logger.info(f"Loaded inline base64/data URI image: {filename} ({len(data_bytes)} bytes)")
+                            self._record_attachment_loaded(f"Loaded inline base64/data URI image: {filename} ({len(data_bytes)} bytes)")
                             blocks.append(block_obj)
                         elif src.startswith(("http://", "https://")) and is_broken_or_placeholder_url(src):
                             blocks.append(
@@ -2209,7 +2220,7 @@ class HtmlZipExtractor:
                             if resolved_path:
                                 block_obj["_attachment_zip_path"] = self.zip_path
                                 block_obj["_attachment_zip_entry"] = resolved_path
-                                logger.info(f"Resolved inline image attachment in ZIP: {resolved_path}")
+                                self._record_attachment_loaded(f"Resolved inline image attachment in ZIP: {resolved_path}")
                             elif not is_external:
                                 logger.warning(f"Image attachment not found in ZIP: src='{src}'")
                                 _mark_missing_zip_attachment(block_obj, src, img_filename)
@@ -2333,7 +2344,7 @@ class HtmlZipExtractor:
                             if resolved_path:
                                 pdf_obj["_attachment_zip_path"] = self.zip_path
                                 pdf_obj["_attachment_zip_entry"] = resolved_path
-                                logger.info(f"Resolved inline PDF attachment in ZIP: {resolved_path}")
+                                self._record_attachment_loaded(f"Resolved inline PDF attachment in ZIP: {resolved_path}")
                             elif not is_external:
                                 logger.warning(f"PDF attachment not found in ZIP: href='{clean_href}', filename='{att_filename}'")
                                 _mark_missing_zip_attachment(pdf_obj, clean_href, display_name or att_filename)
@@ -2353,7 +2364,7 @@ class HtmlZipExtractor:
                             if resolved_path:
                                 audio_obj["_attachment_zip_path"] = self.zip_path
                                 audio_obj["_attachment_zip_entry"] = resolved_path
-                                logger.info(f"Resolved inline audio attachment in ZIP: {resolved_path}")
+                                self._record_attachment_loaded(f"Resolved inline audio attachment in ZIP: {resolved_path}")
                             elif not is_external:
                                 logger.warning(f"Audio attachment not found in ZIP: href='{clean_href}', filename='{att_filename}'")
                                 _mark_missing_zip_attachment(audio_obj, clean_href, display_name or att_filename)
@@ -2378,7 +2389,7 @@ class HtmlZipExtractor:
                             if resolved_path:
                                 video_obj["_attachment_zip_path"] = self.zip_path
                                 video_obj["_attachment_zip_entry"] = resolved_path
-                                logger.info(f"Resolved inline video attachment in ZIP: {resolved_path}")
+                                self._record_attachment_loaded(f"Resolved inline video attachment in ZIP: {resolved_path}")
                             elif not is_external:
                                 logger.warning(f"Video attachment not found in ZIP: href='{clean_href}', filename='{att_filename}'")
                                 _mark_missing_zip_attachment(video_obj, clean_href, display_name or att_filename)
@@ -2413,7 +2424,7 @@ class HtmlZipExtractor:
                             if resolved_path:
                                 file_obj["_attachment_zip_path"] = self.zip_path
                                 file_obj["_attachment_zip_entry"] = resolved_path
-                                logger.info(f"Resolved inline file attachment in ZIP: {resolved_path}")
+                                self._record_attachment_loaded(f"Resolved inline file attachment in ZIP: {resolved_path}")
                             elif not is_external:
                                 logger.warning(f"File attachment not found in ZIP: href='{clean_href}', filename='{att_filename}'")
                                 _mark_missing_zip_attachment(file_obj, clean_href, display_name or att_filename)
@@ -2438,7 +2449,7 @@ class HtmlZipExtractor:
                             "_attachment_filename": filename,
                             "_attachment_bytes": data_bytes,
                         })
-                        logger.info(f"Loaded inline base64/data URI image: {filename} ({len(data_bytes)} bytes)")
+                        self._record_attachment_loaded(f"Loaded inline base64/data URI image: {filename} ({len(data_bytes)} bytes)")
                         blocks.append(block_obj)
                     else:
                         is_external = src.startswith(("http://", "https://"))
@@ -2460,7 +2471,7 @@ class HtmlZipExtractor:
                         if resolved_path:
                             block_obj["_attachment_zip_path"] = self.zip_path
                             block_obj["_attachment_zip_entry"] = resolved_path
-                            logger.info(f"Resolved inline image attachment in ZIP: {resolved_path}")
+                            self._record_attachment_loaded(f"Resolved inline image attachment in ZIP: {resolved_path}")
                         elif not is_external:
                             logger.warning(f"Image attachment not found in ZIP: src='{src}'")
                             _mark_missing_zip_attachment(block_obj, src, img_filename)
