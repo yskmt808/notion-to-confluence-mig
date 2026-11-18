@@ -49,19 +49,32 @@ class TestDbTriage(unittest.TestCase):
             node_type="database",
             children=[_row(f"rl{i}", f"Log-{i}", has_body=(i < 10), block_count=2) for i in range(300)],
         )
-        root = PageNode(id="root-1", title="Root", node_type="page", children=[db_small, db_large])
+        root = PageNode(
+            id="root-1",
+            title="Root",
+            node_type="page",
+            blocks=[
+                {"type": "child_database", "is_linked_database": True, "database_id": "aaaa0000-0000-0000-0000-000000000001"},
+                {"type": "link_to_page", "link_to_page": {"database_id": "aaaa0000-0000-0000-0000-000000000001"}},
+            ],
+            children=[db_small, db_large],
+        )
 
         rows = collect_db_triage_rows(root, individual_db_child_threshold=5)
         self.assertEqual(len(rows), 2)
+        self.assertNotIn("parent_path", rows[0])
         self.assertEqual(rows[0]["migration_mode"], "individual")
+        self.assertEqual(rows[0]["embedded_view_count"], 2)
         self.assertIn("小規模DB", rows[0]["recommendation"])
         self.assertEqual(rows[1]["migration_mode"], "aggregated")
         self.assertEqual(rows[1]["total_rows"], 300)
         self.assertEqual(rows[1]["total_body_blocks"], 20)
+        self.assertEqual(rows[1]["embedded_view_count"], 0)
         self.assertIn("大規模DB注意", rows[1]["recommendation"])
 
         table_str = format_db_triage_table(rows)
         self.assertIn("議事録DB", table_str)
+        self.assertIn("埋め込み: 2件", table_str)
         self.assertIn("巨大ログDB", table_str)
 
         with tempfile.TemporaryDirectory() as tmpdir:

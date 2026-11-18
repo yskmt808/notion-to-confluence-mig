@@ -9,6 +9,7 @@ from src.extractor import (
     database_row_has_substantive_body,
     is_empty_database_row,
     is_individual_child_pages_database,
+    normalize_db_title,
     normalize_notion_id,
 )
 
@@ -50,6 +51,81 @@ def _recommend_db_triage(total_rows: int, body_rows: int, total_body_blocks: int
     return "✅ 標準 (aggregated推奨)"
 
 
+def _count_embedded_db_views(root_node: Any) -> Dict[str, int]:
+    """ツリー全体のブロックを走査し、各DB(正規化ID)が他ページからビュー埋め込み/リンク参照されている回数を集計する。"""
+    db_by_norm_id: Dict[str, str] = {}
+    db_by_title: Dict[str, str] = {}
+
+    def _collect_dbs(n: Any):
+        if getattr(n, "node_type", "") == "database":
+            nid = normalize_notion_id(getattr(n, "id", "") or "")
+            if nid:
+                db_by_norm_id[nid] = nid
+            title = getattr(n, "title", "")
+            if title:
+                s_title = str(title).strip()
+                db_by_title[s_title] = nid
+                norm_t = normalize_db_title(s_title)
+                if norm_t and norm_t not in db_by_title:
+                    db_by_title[norm_t] = nid
+        for c in (getattr(n, "children", None) or []):
+            _collect_dbs(c)
+
+    _collect_dbs(root_node)
+    counts: Dict[str, int] = {nid: 0 for nid in db_by_norm_id}
+    if not db_by_norm_id:
+        return counts
+
+    def _resolve_target(candidate_ids: List[str], candidate_title: str = "") -> Optional[str]:
+        for cid in candidate_ids:
+            if cid:
+                nid = normalize_notion_id(cid)
+                if nid in db_by_norm_id:
+                    return nid
+        if candidate_title:
+            s = str(candidate_title).strip()
+            if s in db_by_title:
+                return db_by_title[s]
+            nt = normalize_db_title(s)
+            if nt in db_by_title:
+                return db_by_title[nt]
+        return None
+
+    def _scan_blocks(blocks: List[Dict[str, Any]]):
+        for b in (blocks or []):
+            if not isinstance(b, dict):
+                continue
+            b_type = b.get("type", "")
+            if b_type == "child_database" and b.get("is_linked_database"):
+                c_ids = [b.get("database_id"), b.get("id")]
+                src_name = ""
+                for ds in (b.get("data_sources") or []):
+                    if isinstance(ds, dict):
+                        if ds.get("id"):
+                            c_ids.append(ds["id"])
+                        if not src_name and ds.get("name"):
+                            src_name = ds["name"]
+                target_db = _resolve_target([c for c in c_ids if c], src_name)
+                if target_db:
+                    counts[target_db] = counts.get(target_db, 0) + 1
+            elif b_type == "link_to_page":
+                lp = b.get("link_to_page") or {}
+                target_id = lp.get("page_id") or lp.get("database_id")
+                target_db = _resolve_target([target_id] if target_id else [])
+                if target_db:
+                    counts[target_db] = counts.get(target_db, 0) + 1
+            if b.get("children_blocks"):
+                _scan_blocks(b["children_blocks"])
+
+    def _walk_pages(n: Any):
+        _scan_blocks(getattr(n, "blocks", None) or [])
+        for c in (getattr(n, "children", None) or []):
+            _walk_pages(c)
+
+    _walk_pages(root_node)
+    return counts
+
+
 def collect_db_triage_rows(
     root_node: Any,
     individual_db_child_threshold: int = 0,
@@ -60,7 +136,9 @@ def collect_db_triage_rows(
     if not root_node:
         return rows
 
-    def _walk(node: Any, ancestors: List[str]):
+    embedded_counts = _count_embedded_db_views(root_node)
+
+    def _walk(node: Any):
         ntype = getattr(node, "node_type", "")
         title = getattr(node, "title", "") or "(無題)"
         if ntype == "database":
@@ -76,14 +154,15 @@ def collect_db_triage_rows(
                 individual_db_child_threshold=individual_db_child_threshold,
                 mode_overrides=mode_overrides,
             )
+            norm_id = normalize_notion_id(getattr(node, "id", "") or "") or (getattr(node, "id", "") or "")
             rows.append({
-                "db_id": normalize_notion_id(getattr(node, "id", "") or "") or (getattr(node, "id", "") or ""),
+                "db_id": norm_id,
                 "db_title": title,
-                "parent_path": " / ".join(ancestors) if ancestors else "(root)",
                 "total_rows": stats["total_rows"],
                 "body_rows": stats["body_rows"],
                 "body_ratio_pct": round(stats["body_ratio_pct"], 1),
                 "total_body_blocks": total_body_blocks,
+                "embedded_view_count": embedded_counts.get(norm_id, 0),
                 "migration_mode": mode,
                 "recommendation": _recommend_db_triage(
                     stats["total_rows"],
@@ -91,11 +170,10 @@ def collect_db_triage_rows(
                     total_body_blocks,
                 ),
             })
-        next_ancestors = ancestors + [title]
         for child in (getattr(node, "children", None) or []):
-            _walk(child, next_ancestors)
+            _walk(child)
 
-    _walk(root_node, [])
+    _walk(root_node)
     return rows
 
 
@@ -107,11 +185,11 @@ def export_db_triage_csv(rows: List[Dict[str, Any]], output_path: str) -> str:
     fieldnames = [
         "db_id",
         "db_title",
-        "parent_path",
         "total_rows",
         "body_rows",
         "body_ratio_pct",
         "total_body_blocks",
+        "embedded_view_count",
         "migration_mode",
         "recommendation",
     ]
@@ -156,7 +234,7 @@ def format_db_triage_table(rows: List[Dict[str, Any]]) -> str:
     lines = [
         f"📊 [DB Triage] データベース移行方式トリアージ一覧 ({len(rows)} 件):",
         "  --------------------------------------------------------------------------------",
-        "  DB名 | 総行 / 本文行 (率) | 本文ブロック | 予定方式 | 判定メモ",
+        "  DB名 | 総行 / 本文行 (率) | 本文ブロック | ビュー埋め込み | 予定方式 | 判定メモ",
         "  --------------------------------------------------------------------------------",
     ]
     for r in rows:
@@ -164,6 +242,7 @@ def format_db_triage_table(rows: List[Dict[str, Any]]) -> str:
             f"  - {r['db_title']} ({r['db_id'][:8]}...) | "
             f"{r['total_rows']}行 / {r['body_rows']}行 ({r['body_ratio_pct']}%) | "
             f"{r['total_body_blocks']} blocks | "
+            f"埋め込み: {r.get('embedded_view_count', 0)}件 | "
             f"[{r['migration_mode']}] | {r['recommendation']}"
         )
     lines.append("  --------------------------------------------------------------------------------")
