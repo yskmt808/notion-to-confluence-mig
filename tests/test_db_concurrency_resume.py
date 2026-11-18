@@ -223,6 +223,58 @@ class TestDatabaseConcurrencyAndResume(unittest.TestCase):
         remaining_pending = self.checkpoint.get_pending_row_views("db_root")
         self.assertEqual(remaining_pending, [])
 
+    def test_pass2_preserves_parent_db_url_when_db_indexed_immediately_in_pass1(self):
+        """TCK_00029: Pass 1のDB作成直後にインデックスが即時完了した場合でも、Pass 2更新で子ページのparent_db_urlと行ビューが維持されること。"""
+        row = PageNode(
+            id="row-immediate-1",
+            title="課題A",
+            node_type="database_row",
+            properties={"ステータス": {"type": "select", "select": {"name": "未着手"}, "value": "未着手"}},
+            blocks=[{"id": "b1", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": "詳細本文"}, "plain_text": "詳細本文"}]}}],
+        )
+        db = PageNode(
+            id="db-immediate-1",
+            title="課題リスト　(1)",
+            node_type="database",
+            properties={"schema": {"ステータス": {"type": "select"}}},
+            children=[row],
+        )
+        root = PageNode(id="root-1", title="親ページ", node_type="page", children=[db])
+
+        importer = ConfluenceImporter("https://example.atlassian.net/wiki", "user", "token", "TEST", page_workers=1)
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_space_id.return_value = "space-1"
+        mock_client.get_page_by_title.return_value = None
+        mock_client.get_database_by_title.return_value = None
+        mock_client.create_page.side_effect = [
+            {"id": "conf-root-1", "_links": {"webui": "/spaces/TEST/pages/conf-root-1"}},
+            {"id": "conf-row-1", "_links": {"webui": "/spaces/TEST/pages/conf-row-1"}},
+        ]
+        mock_client.create_database.return_value = {
+            "id": "conf-db-1",
+            "_links": {"webui": "/spaces/TEST/database/conf-db-1"},
+        }
+        mock_client.get_page_by_id.return_value = {"id": "dummy", "version": {"number": 1}}
+        mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = [
+            {"id": "entry-imm-1", "values": {"f1": {"type": "pageLink", "value": [{"contentId": "conf-row-1"}]}}}
+        ]
+        importer.client = mock_client
+
+        importer.import_tree(root, parent_id="space-home", overwrite=True)
+
+        # Pass 2 完了後の最後の conf-row-1 への update_page 呼び出し内容を確認
+        row_updates = [
+            c.kwargs for c in mock_client.update_page.call_args_list
+            if c.kwargs.get("page_id") == "conf-row-1"
+        ]
+        self.assertGreaterEqual(len(row_updates), 2)
+        final_body = row_updates[-1]["body"]
+        expected_db_url = "https://example.atlassian.net/wiki/spaces/TEST/database/conf-db-1"
+        self.assertIn(f'<a href="{expected_db_url}">課題リスト　(1)</a>', final_body)
+        self.assertIn(f"{expected_db_url}?entryId=entry-imm-1", final_body)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1912,6 +1912,7 @@ class ConfluenceImporter:
                 c_latest = self.client.get_page_by_id(c_id, expand="version")
                 c_ver = c_latest.get("version", {}).get("number", 1) if c_latest else 1
                 c_title = c_info.get("title") or child_node.title
+                child_node.parent_db_url = db_web_url
                 child_node.entry_id = entry_id
                 child_body = self.converter.generate_page_content(
                     child_node,
@@ -1970,6 +1971,7 @@ class ConfluenceImporter:
                 c_latest = self.client.get_page_by_id(c_id, expand="version")
                 c_ver = c_latest.get("version", {}).get("number", 1) if c_latest else 1
                 c_title = c_info.get("title") or child_node.title
+                child_node.parent_db_url = db_web_url
                 child_body = self.converter.generate_page_content(
                     child_node,
                     db_url=db_web_url,
@@ -2049,14 +2051,14 @@ class ConfluenceImporter:
                 resolved_items = []
                 resolved_child_ids = []
                 for child in node.children:
+                    child.parent_db_title = node.title
+                    child.parent_db_url = db_web_url
                     if child.id in pending_ids:
                         with self._lock:
                             c_info = self.migration_map.get(child.id) or (self.checkpoint.get_node_info(child.id) if self.checkpoint else None)
                         if c_info:
                             c_cid = str(c_info["confluence_id"])
                             if c_cid in page_to_entry_map:
-                                child.parent_db_title = node.title
-                                child.parent_db_url = db_web_url
                                 resolved_items.append((child, page_to_entry_map[c_cid]))
                                 resolved_child_ids.append(child.id)
 
@@ -2558,6 +2560,12 @@ class ConfluenceImporter:
                 if "views_info" in cached:
                     self.migration_map[node.id]["views_info"] = cached["views_info"]
 
+                if node.node_type == "database":
+                    resume_db_web_url = f"{self.client.base_url}/spaces/{self.space_key}/database/{confluence_page_id}"
+                    for child in node.children:
+                        child.parent_db_title = node.title
+                        child.parent_db_url = resume_db_web_url
+
                 if node.node_type == "database" and analyze_database_child_page_stats(node)["skip_child_pages"]:
                     node._skipped_row_child_pages = True
                     self._register_skipped_db_rows(node, confluence_url)
@@ -2899,6 +2907,8 @@ class ConfluenceImporter:
             pending_children = []
             pending_child_ids = []
             for child in node.children:
+                child.parent_db_title = node.title
+                child.parent_db_url = db_web_url
                 with self._lock:
                     c_info = self.migration_map.get(child.id)
                 if c_info:
