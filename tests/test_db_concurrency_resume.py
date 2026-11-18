@@ -341,6 +341,39 @@ class TestDatabaseConcurrencyAndResume(unittest.TestCase):
         self.assertEqual(entries, [])
         self.assertEqual(views, [])
 
+    def test_resume_skips_remote_existence_check_when_verify_resume_remote_false(self):
+        """TCK_00035: verify_resume_remote=False の場合、Pass 1 スキップ時に get_page_by_id / get_database_by_id を呼ばないこと。"""
+        child = PageNode(id="child-skip-1", title="子ページ", node_type="page")
+        db = PageNode(id="db-skip-1", title="DB", node_type="database", children=[child])
+        root = PageNode(id="root-skip-1", title="親ページ", node_type="page", children=[db])
+
+        self.checkpoint.record_pass1("root-skip-1", "conf-root", "親ページ", "https://example/root", "page")
+        self.checkpoint.record_pass1("db-skip-1", "conf-db", "DB", "https://example/db", "database")
+        self.checkpoint.record_pass1("child-skip-1", "conf-child", "子ページ", "https://example/child", "page")
+        self.checkpoint.record_pass2("root-skip-1")
+        self.checkpoint.record_pass2("db-skip-1")
+        self.checkpoint.record_pass2("child-skip-1")
+
+        importer = ConfluenceImporter(
+            "https://example.atlassian.net/wiki",
+            "user",
+            "token",
+            "TEST",
+            checkpoint=self.checkpoint,
+            verify_resume_remote=False,
+        )
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_database_views.return_value = []
+        importer.client = mock_client
+
+        importer.import_tree(root, parent_id="space-home", overwrite=True)
+
+        mock_client.get_page_by_id.assert_not_called()
+        mock_client.get_database_by_id.assert_not_called()
+        mock_client.create_page.assert_not_called()
+        mock_client.create_database.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

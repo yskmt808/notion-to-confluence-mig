@@ -1149,6 +1149,7 @@ def main():
         external_mapping=args.external_mapping,
         db_child_rate_threshold=args.db_child_rate_threshold,
         low_rate_db_text_key=args.low_rate_db_text_key,
+        verify_resume_remote=not (args.resume and args.no_verify),
     )
 
     def _safe_mark_interrupted():

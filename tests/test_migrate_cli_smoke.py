@@ -582,6 +582,7 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
             self.assertEqual(str(mock_importer_cls.call_args.kwargs["timezone"]), "UTC")
             self.assertTrue(mock_importer_cls.call_args.kwargs["low_rate_db_text_key"])
             self.assertEqual(mock_importer_cls.call_args.kwargs["db_child_rate_threshold"], 15.0)
+            self.assertFalse(mock_importer_cls.call_args.kwargs["verify_resume_remote"])
             self.assertFalse(mock_importer.import_tree.call_args.kwargs["overwrite"])
             self.assertIsNone(mock_importer.import_tree.call_args.kwargs["parent_id"])
 
