@@ -24,6 +24,7 @@ from src.extractor import (
     is_unsupported_page_element_block,
 )
 from src.converter import NotionToConfluenceConverter
+from src.db_triage import resolve_db_migration_mode
 from src.importer import ConfluenceClient, ConfluenceImporter
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,10 @@ class MigrationVerifier:
     def __init__(
         self,
         confluence_client: ConfluenceClient,
+        db_mode_overrides: Optional[Dict[str, str]] = None,
     ):
         self.client = confluence_client
+        self.db_mode_overrides: Dict[str, str] = dict(db_mode_overrides) if db_mode_overrides else {}
         self._db_view_requirements: Dict[str, Dict[str, Any]] = {}
 
     def verify_page_node(
@@ -774,13 +777,17 @@ class MigrationVerifier:
         results = []
         conf_id = page_id_map.get(node.id)
         skip_db_children = False
+        db_override_mode = None
         if node.node_type == "database":
+            db_override_mode = resolve_db_migration_mode(node, mode_overrides=self.db_mode_overrides) if self.db_mode_overrides else None
+            if db_override_mode == "skip":
+                return results
             skip_db_children = bool(
                 getattr(node, "_skipped_row_child_pages", False)
                 or analyze_database_child_page_stats(node)["skip_child_pages"]
             )
         if conf_id:
-            if node.node_type == "database":
+            if node.node_type == "database" and db_override_mode != "static_table":
                 res = self.verify_database_node(node, conf_id, expected_parent_id)
             else:
                 res = self.verify_page_node(node, conf_id, expected_parent_id)
