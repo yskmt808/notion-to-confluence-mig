@@ -205,7 +205,7 @@ Notionのブロック構造とConfluence Storage Format（XHTML）の完全対�
 | **数式ブロック** (`equation`) | `<ac:image><ri:attachment ri:filename="equation_*.png" />` | **【独自高機能】** matplotlibにより300dpi高解像度PNGを完全オフライン生成し、添付・画像埋め込み。 |
 | **画像** (`image`) | `<ac:image><ri:attachment ri:filename="*.png" />` | Notion署名付きURLまたはZIP内バイナリを永続添付ファイルとしてアップロードし、インライン埋め込み。 |
 | **添付ファイル** (`file`, `pdf`) | `<ac:link><ri:attachment ... />` / `viewpdf` | 実体ファイルをConfluence添付ファイルとして登録し、`file`（HTML上 `data-notion-file` 付きのプレビューなしPDF含む）はダウンロードリンク、`pdf`（埋め込みPDF）は `viewpdf` マクロによるインライン埋め込みプレビューを配置。 |
-| **カバー画像** (`cover`) | `<ac:image ac:align="center" ac:layout="full-width">` | カバー画像を取得し、中央50%（1200x200）でバナー比率にローカルクロップの上、最上部ヘッダーバナーとして配置。 |
+| **カバー画像** (`cover`) | Content Property (`cover-picture-id-published` / `cover-picture-id-draft`) | **【ネイティブ対応】** 外部URLまたはZIP内ローカル画像を添付ファイルとしてアップロードし、`extensions.fileId` と `object-position`（0〜100）をConfluenceネイティブのヘッダーカバー画像プロパティに設定（本文先頭への重複バナー出力なし）。 |
 | **マルチコラム（段組）** (`column_list`, `column`) | `<ac:structured-macro ac:name="section\|column">` | 2〜N段組のネイティブセクション・カラムマクロに変換。 |
 | **目次** (`table_of_contents`) | `<ac:structured-macro ac:name="toc" />` | 見出し階層と完全連動するConfluenceネイティブTOCマクロを生成。 |
 | **シンプルテーブル** (`table`, `table_row`) | `<table><thead>...<tbody>...</table>` | ヘッダー行指定を忠実に反映した標準テーブルとして出力。 |
@@ -232,16 +232,24 @@ Notionのブロック構造とConfluence Storage Format（XHTML）の完全対�
   - 未指定時は、ローカル実行環境（OS/Python環境の `datetime.now().astimezone().tzinfo` および `tzname()`）からデフォルトタイムゾーン（日本環境なら `JST`）を自動検出し、起動バナーおよび各種メタデータヘッダー（Notionコメント日時等）へ自動反映。
 * **子ページへの編集可能な行ビュー（Row View）カード埋め込み**:
   - DBレコードの子ページ最上部に、親DBを開かずに直接プロパティ編集可能な行ビューカードを埋め込み配置。
+* **DBレコード子ページの生成最適化・低存在率DB対応 (`--db-child-rate-threshold`, `--low-rate-db-text-key`)**:
+  - **本文なしDBの子ページ作成スキップ**: 全行に本文・子ページが存在しないDB（0%）は、子ページを作成せずキーカラムを `text` 型として移行し、スキップした行は移行対象ページ数（進捗総数・Pass 2・Step 3検証）から除外。他ページからの行リンクは親DB URLへフォールバック。
+  - **低子ページ存在率の警告・`--low-rate-db-text-key` モード**: 本文あり行の存在率が閾値（デフォルト `20.0%`）未満の場合は警告を出力。`--low-rate-db-text-key` 指定時は閾値以下のDBについてキーカラムを `text` 型とし、**本文あり行のみ**子ページを作成した上で、キーカラム右隣の非表示 `confluence-page-link` カラム（`詳細ページ` / `hidden_fields` 指定）へ子ページURLを格納（レコード詳細ペインから参照可能）。
+* **DBレコード子ページ配下のDB・子ページ抽出とDBタイトル正規化**:
+  - DB行子ページ配下のサブフォルダに定義されたインラインDB（`.csv`）や子ページも再帰抽出し、`db_csv_map` を伝播して参照解決。
+  - Notionエクスポート時のファイル名置換に合わせて、OS禁止文字に加えてピリオド（`.` / `．`）も空白に正規化してDB名を照合（`normalize_db_title`）。
 
 ### 3.5 プラットフォーム差分の近似対応と制限事項 (Parity Limitations)
 
 1. **外部Web埋め込み (`embed`)**:
    - Confluence Cloudのセキュリティポリシー（CSP）により、未許可ドメインのiframe展開は行わず、Atlassian Smart Links（カード形式）または安全なハイパーリンクとして配置。
 2. **同期ブロック (`synced_block`)**:
-   - Confluenceにリアルタイム双方向同期ブロックが存在しないため、同期元ブロックの内容を各同期先ページへ静的に展開・配置（情報・レイアウト欠落ゼロ）。
-3. **メンション記法 (`mention`)**:
+   - Confluence Cloud REST API の仕様制限によりAPI経由で生成したネイティブ同期ブロック（`bodied-sync-block`）は登録・描画不可のため、同期元ブロックの内容を各同期先ページへ静的に展開・配置（情報・レイアウト欠落ゼロ）。
+   - HTMLエクスポート時に未展開となる多段ネスト同期ブロックは、`NOTION_TOKEN` 設定時に未展開候補を含むページのみ Notion API (`blocks/children`) でピンポイント展開し、Notion上の不可視・空 `div` 要素を自動除外。
+3. **メンション記法 (`mention`) とZIP外外部参照警告**:
    - 日付メンションは `<time datetime="YYYY-MM-DD" />` の固定日付バッジに変換（Notionの動的相対日付やリマインダー通知は非連動）。
    - ページメンションは内部ページリンク（`<ac:link>`）へ変換。
+   - `notion.so` / `notion.site` / `notion.com`（`app.notion.com` 等）のリンクおよび `mention[type="page"]` のうちZIP/ツリー未収録のものは外部参照警告対象とし、SharePoint等の外部サービスURLは除外。大量出力抑制のため、ページ別詳細はデフォルト非表示（`--dry-run --show-external-warnings` 指定時のみ詳細出力、Step 3検証結果は件数のみ出力）。
 4. **Group by 表示**:
    - Confluence Databasesに単一ビュー内Group by機能がないため、Notionのグループ化設定に基づき、未完了グループは常時展開見出し＋完了グループは折りたたみExpandマクロのハイブリッド複数ビューとして近似移植。
 
@@ -354,21 +362,31 @@ python migrate.py --zip export.zip --show-all-pages
 | :--- | :--- | :--- | :--- |
 | `--zip` | `<path>` | `None` | Notion公式エクスポートZIPファイルのパス。 |
 | `--zip-dir` | `<dir>` | `None` | 複数分割エクスポートZIPが格納されたディレクトリパス。 |
-| `--title-prefix` | `<str>` | `""` | 移行先Confluenceページタイトルに付与する接頭辞。 |
-| `--parent-id` | `<id>` | `None` | 移行先Confluence親ページID（省略時はスペースルート）。 |
+| `--title-prefix` | `<str>` | `None` (ZIP時 `[HTML] `) | 移行先Confluenceページ/DBタイトルに付与する接頭辞。 |
+| `--new-tree` | なし | `False` | 既存ツリーに依存せず、Confluenceスペース直下に新しい親ツリーを作成して移行。 |
+| `--confluence-parent-id` | `<id>` | `None` | 移行先Confluence親ページID（省略時は `.env` またはスペース直下）。 |
+| `--no-overwrite` | なし | `False` | Confluence上に同名ページが存在する場合に上書きせず、連番を付与して新規作成。 |
 | `--page-workers` | `<int>` | `8` | **Confluence APIへの並行アクセスワーカースレッド数**（DB行子ページ作成および行ビュー埋め込み）。 |
 | `--resume` | なし | `False` | 中断されたチェックポイントから未完了ノード・Passを安全に再開。 |
 | `--checkpoint` | `<path>` | `migration_checkpoint.json` | チェックポイントファイルの保存・読込パス。 |
 | `--dry-run` | なし | `False` | Confluence APIを実行せず、抽出ツリー構造のみを検証・表示。 |
+| `--show-external-warnings` | なし | `False` | `--dry-run` 時に外部参照（ZIP未収録ページリンク）警告のページ別詳細を表示（デフォルトは件数のみ）。 |
+| `--no-verify` | なし | `False` | 移行後のテキストベース自動整合性検証（Step 3）をスキップ。 |
 | `--enrich-via-api` | なし | `False` | Notion APIを併用してDBプロパティスキーマ・ビュー設定を高精度補完。 |
 | `--export-worksheet` | `[path]` | `None` | DBカラム型・ビュー設定の人間確認用ワークシート（CSV/JSON）を出力。 |
 | `--import-worksheet` | `<path>` | `None` | 人間が承認・修正したワークシートを読み込んでConfluenceへ反映。 |
+| `--external-mapping`, `--import-mapping` | `<path...>` | `None` | 先行移行の結果ファイル（`migration_result.json` 等）を読み込み、分割移行を跨ぐ参照を事前解決。 |
+| `--repair-inpage-links` | なし | `False` | アンカー欠落の可能性がある自ページ内リンクをNotion APIで照合・自動修復。 |
+| `--notion-token` | `<token>` | 環境変数 `NOTION_TOKEN` | API取得・多段同期ブロック補完・ページ内リンク修復用のNotion APIトークン。 |
+| `--db-child-rate-threshold` | `<float>` | `20.0` | DBレコードの本文/子ページ存在率がこの値(%)未満の場合にWARNINGを表示する閾値（`0`で無効）。 |
+| `--low-rate-db-text-key` | なし | `False` | 存在率が閾値以下のDBについてキーカラムを `text` 型とし、本文あり行のみ子ページを作成して右隣の非表示リンク列へURLを格納。 |
 | `--generate-debug-report` | なし | `False` | 機密情報をハッシュ化した開発者報告用サニタイズレポートを出力。 |
-| `--debug-report-dir` | `<dir>` | `./debug_reports` | サニタイズレポートの出力先ディレクトリ。 |
+| `--debug-report-dir` | `<dir>` | `.` | サニタイズレポートの出力先ディレクトリ。 |
 | `--timezone`, `--tz` | `<tz>` | `None` (ローカル自動判定) | 時刻表示に使用するタイムゾーン (例: `Asia/Tokyo`, `JST`, `UTC`)。 |
 | `--no-dashboard` | なし | `False` | Richインタラクティブ進捗ダッシュボードを無効化し、プレーンテキストログで出力。 |
 | `--user-mapping` | `<path>` | `None` | NotionユーザーとConfluenceアカウントIDの対応表 (CSV/JSON)。 |
 | `--export-user-mapping` | `[path]` | `None` | 移行ツリー内のNotionユーザーを抽出し自動検索候補付きマッピングCSVを出力。 |
+| `--metadata-template` | `<str>` | `default` | ページ最上部のメタデータヘッダーのカスタムテンプレート文字列（`none` / `""` で非表示）。 |
 | `--show-all-pages` | なし | `False` | ノード数が25件超でも省略せず、全ページリストを端末に全件出力。 |
 | `--private` | なし | `False` | 移行先ページの権限を実行者本人のみのプライベート設定（閲覧・編集制限）にする。 |
 | `--visibility` | `<mode>` | `space` | 移行先ページの公開範囲を指定 (`space` または `private`)。 |
@@ -381,7 +399,7 @@ python migrate.py --zip export.zip --show-all-pages
 ### 7.1 10,000行超の大規模DB実用性検証とフォールバック（未実装）
 - Confluence Databasesのブラウザ描画性能・検索インデックス負荷の限界値を実測し、閾値を超える場合の自動分割DBプロビジョニング仕様の策定。
 
-### 7.2 複数回実行（分割移行）を跨ぐリンク・DBビュー連結および未解決参照の事後自動更新仕様（未実装）
+### 7.2 複数回実行（分割移行）を跨ぐリンク・DBビュー連結および未解決参照の事後自動更新仕様（順方向 `--external-mapping` 実装済 / 双方向レジストリ未実装）
 
 複数のHTMLエクスポートZIPや異なるページツリーを別々のスクリプト実行で段階的に移行する場合に、実行を跨いでページ間リンク・DBリレーション・DBビュー（リンクドデータベース）を相互連結するための仕様です。
 
