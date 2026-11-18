@@ -37,6 +37,7 @@ from src.extractor import (
 )
 from src.converter import NotionToConfluenceConverter
 from src.checkpoint import CheckpointWriteError
+from src.db_triage import resolve_db_migration_mode
 
 logger = logging.getLogger(__name__)
 
@@ -1003,6 +1004,7 @@ class ConfluenceImporter:
         title_prefix: Optional[str] = None,
         external_mapping: Optional[Union[str, List[str]]] = None,
         individual_db_child_threshold: int = 0,
+        db_mode_overrides: Optional[Dict[str, str]] = None,
         verify_resume_remote: bool = True,
     ):
         self.space_key = space_key
@@ -1017,6 +1019,7 @@ class ConfluenceImporter:
         self.prune_blocks_on_pass2 = prune_blocks_on_pass2
         self.title_prefix = title_prefix or ""
         self.individual_db_child_threshold = max(0, int(individual_db_child_threshold or 0))
+        self.db_mode_overrides: Dict[str, str] = dict(db_mode_overrides) if db_mode_overrides else {}
         self.verify_resume_remote = bool(verify_resume_remote)
         self._current_user_account_id: Optional[str] = None
         from src.timezone_util import resolve_timezone, format_iso_datetime
@@ -1632,10 +1635,11 @@ class ConfluenceImporter:
                             logger.debug(f"Could not auto-create gallery view for DB {db_conf_id}: {e}")
 
         # ダッシュボードの開始 (Task B.10)
-        # 実際に作成されるノード数（skip_child_pages / 1ページ集約 / 空DB行を反映）を母数とする
+        # 実際に作成されるノード数（skip_child_pages / 1ページ集約 / 個別上書き / 空DB行を反映）を母数とする
         total_nodes = count_migratable_nodes(
             root_node,
             individual_db_child_threshold=self.individual_db_child_threshold,
+            db_mode_overrides=self.db_mode_overrides,
         )
         if self.dashboard:
             self.dashboard.start(total_nodes)
@@ -1880,14 +1884,19 @@ class ConfluenceImporter:
             node.blocks = []
             node.properties = {}
 
-    def _is_aggregated_db(self, db_node: PageNode) -> bool:
-        """DBがデフォルトの1ページ集約方式（本文あり行あり、かつ個別子ページ閾値対象外）かを判定する。"""
-        if analyze_database_child_page_stats(db_node)["skip_child_pages"]:
-            return False
-        return not is_individual_child_pages_database(
+    def _get_db_migration_mode(self, db_node: PageNode) -> str:
+        """DBノードの移行方式 ('aggregated' / 'individual' / 'static_table' / 'skip') を返す。"""
+        return resolve_db_migration_mode(
             db_node,
             individual_db_child_threshold=self.individual_db_child_threshold,
+            mode_overrides=self.db_mode_overrides,
         )
+
+    def _is_aggregated_db(self, db_node: PageNode) -> bool:
+        """DBが1ページ集約方式（本文あり行あり、かつ aggregated または static_table）かを判定する。"""
+        if analyze_database_child_page_stats(db_node)["skip_child_pages"]:
+            return False
+        return self._get_db_migration_mode(db_node) in ("aggregated", "static_table")
 
     def _update_aggregated_detail_page_pass2(self, db_node: PageNode):
         """Pass 2: 1ページ集約方式のDB詳細まとめページに解決済みリンクと?entryId=戻りリンクを反映する。"""
@@ -1965,6 +1974,8 @@ class ConfluenceImporter:
         aggregated_dbs: List[PageNode] = []
         def _collect(n: PageNode):
             if n.node_type == "database_row" and self.is_empty_database_row(n):
+                return
+            if n.node_type == "database" and self._get_db_migration_mode(n) == "skip":
                 return
             all_nodes.append(n)
             if n.node_type == "database":
@@ -2790,6 +2801,136 @@ class ConfluenceImporter:
             self.dashboard.set_worker_busy(node.title, node_type=node.node_type)
 
         if node.node_type == "database":
+            db_mode = self._get_db_migration_mode(node)
+            if db_mode == "skip":
+                logger.info(f"[DB Triage] Skipping database [{node.title}] (ID: {node.id}) as requested (mode=skip).")
+                return None
+
+            if db_mode == "static_table":
+                target_title, existing_page = self._resolve_unique_page_title(
+                    base_title=node.title,
+                    notion_node_id=node.id,
+                    allow_existing_overwrite=overwrite,
+                )
+                node.title = target_title
+                overview_body = self.converter.generate_page_content(node)
+                if existing_page and overwrite:
+                    confluence_page_id = str(existing_page["id"])
+                    self._apply_root_private_restriction(node, confluence_page_id)
+                    latest = self.client.get_page_by_id(confluence_page_id, expand="version")
+                    ver = latest.get("version", {}).get("number", 1) if latest else 1
+                    self.client.update_page(
+                        page_id=confluence_page_id,
+                        space_key=self.space_key,
+                        title=node.title,
+                        body=overview_body,
+                        current_version=ver,
+                    )
+                    webui = existing_page.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{confluence_page_id}")
+                else:
+                    with self._get_parent_lock(parent_id):
+                        res = self.client.create_page(
+                            space_key=self.space_key,
+                            title=node.title,
+                            body=overview_body,
+                            parent_id=parent_id,
+                        )
+                    confluence_page_id = str(res["id"])
+                    webui = res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{confluence_page_id}")
+                    self._apply_root_private_restriction(node, confluence_page_id)
+                confluence_url = f"{self.client.base_url}{webui}"
+                if node.icon:
+                    self.client.set_page_emoji(confluence_page_id, node.icon)
+
+                db_map_entry = {
+                    "confluence_id": confluence_page_id,
+                    "title": node.title,
+                    "url": confluence_url,
+                    "node_type": "page",
+                }
+                body_children = [
+                    c for c in (node.children or [])
+                    if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
+                ]
+                if body_children:
+                    node._aggregated_mode = True
+                    agg_node_id = f"{node.id}__details"
+                    agg_title, existing_agg = self._resolve_unique_page_title(
+                        base_title=f"{node.title} - 詳細ページ一覧",
+                        notion_node_id=agg_node_id,
+                        allow_existing_overwrite=overwrite,
+                    )
+                    if existing_agg and overwrite:
+                        agg_page_id = str(existing_agg["id"])
+                        agg_webui = existing_agg.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
+                    else:
+                        agg_res = self.client.create_page(
+                            space_key=self.space_key,
+                            title=agg_title,
+                            body="<p>詳細ページを生成中...</p>",
+                            parent_id=confluence_page_id,
+                        )
+                        agg_page_id = str(agg_res["id"])
+                        agg_webui = agg_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
+                    agg_page_url = f"{self.client.base_url}{agg_webui}"
+                    node._aggregated_detail_page_id = agg_page_id
+                    node._aggregated_detail_page_title = agg_title
+                    node._aggregated_detail_page_url = agg_page_url
+                    db_map_entry["aggregated_detail_page_id"] = agg_page_id
+                    db_map_entry["aggregated_detail_page_title"] = agg_title
+                    db_map_entry["aggregated_detail_page_url"] = agg_page_url
+                    with self._lock:
+                        self.migration_map[agg_node_id] = {
+                            "confluence_id": agg_page_id,
+                            "title": agg_title,
+                            "url": agg_page_url,
+                            "node_type": "page",
+                        }
+                        for c in body_children:
+                            anchor = urllib.parse.quote((c.title or "").strip(), safe="")
+                            row_anchor_url = f"{agg_page_url}#{anchor}" if anchor else agg_page_url
+                            self.migration_map[c.id] = {
+                                "confluence_id": agg_page_id,
+                                "title": c.title,
+                                "url": row_anchor_url,
+                                "node_type": c.node_type,
+                            }
+                    if self.checkpoint:
+                        self.checkpoint.record_pass1(
+                            node_id=agg_node_id,
+                            confluence_id=agg_page_id,
+                            title=agg_title,
+                            url=agg_page_url,
+                            node_type="page",
+                        )
+                    if self.dashboard:
+                        self.dashboard.record_pass1_done(agg_title, node_type="page")
+                    nested_children = [
+                        sub for c in (node.children or []) for sub in (getattr(c, "children", None) or [])
+                    ]
+                    if nested_children:
+                        self._import_children_concurrently(
+                            parent_node=node,
+                            children=nested_children,
+                            parent_id=agg_page_id,
+                            overwrite=overwrite,
+                            allow_sub_parallel=allow_sub_parallel,
+                        )
+                self._register_skipped_db_rows(node, confluence_url, skip_only_bodyless=True)
+                with self._lock:
+                    self.migration_map[node.id] = db_map_entry
+                if self.checkpoint:
+                    self.checkpoint.record_pass1(
+                        node_id=node.id,
+                        confluence_id=confluence_page_id,
+                        title=node.title,
+                        url=confluence_url,
+                        node_type="page",
+                    )
+                if self.dashboard:
+                    self.dashboard.record_pass1_done(node.title, node_type="page")
+                return confluence_page_id
+
             # 重複タイトル解決（同名DBが存在する場合に安全にユニークタイトルを採番）
             target_title, existing_db = self._resolve_unique_page_title(
                 base_title=node.title,
@@ -2828,10 +2969,8 @@ class ConfluenceImporter:
 
             db_stats = analyze_database_child_page_stats(node)
             skip_row_pages = bool(db_stats["skip_child_pages"])
-            is_individual_mode = (not skip_row_pages) and is_individual_child_pages_database(
-                node, individual_db_child_threshold=self.individual_db_child_threshold
-            )
-            is_aggregated_mode = (not skip_row_pages) and (not is_individual_mode)
+            is_individual_mode = (not skip_row_pages) and (db_mode == "individual")
+            is_aggregated_mode = (not skip_row_pages) and (db_mode == "aggregated")
             use_text_title = skip_row_pages or is_aggregated_mode
             node._skipped_row_child_pages = skip_row_pages
             node._aggregated_mode = is_aggregated_mode

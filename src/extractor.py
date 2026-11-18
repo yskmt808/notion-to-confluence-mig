@@ -15,6 +15,13 @@ from notion_client import Client
 logger = logging.getLogger(__name__)
 
 
+def normalize_notion_id(raw_id: Optional[str]) -> str:
+    """Notion ID（UUID）からハイフンを除去し小文字正規化する。"""
+    if not raw_id:
+        return ""
+    return str(raw_id).replace("-", "").strip().lower()
+
+
 def normalize_db_title(title: Optional[str]) -> str:
     """データベースタイトルやコレクション名の記号・OS禁止文字・空白差分を正規化して比較可能にする。"""
     if not title:
@@ -1420,24 +1427,37 @@ def is_individual_child_pages_database(
 def count_migratable_nodes(
     root_node: Any,
     individual_db_child_threshold: int = 0,
+    db_mode_overrides: Optional[Dict[str, str]] = None,
 ) -> int:
     """Confluence上で実際に作成・移行されるノード数（ダッシュボード母数と一致）を算出する。"""
     if not root_node:
         return 0
+
+    def _get_db_override(n: Any) -> Optional[str]:
+        if not db_mode_overrides:
+            return None
+        nid = normalize_notion_id(getattr(n, "id", "") or "")
+        return db_mode_overrides.get(nid) or db_mode_overrides.get(getattr(n, "id", "") or "")
 
     def _count(n: Any) -> int:
         ntype = getattr(n, "node_type", "")
         if ntype == "database_row" and is_empty_database_row(n):
             return 0
         if ntype == "database":
+            override_mode = _get_db_override(n)
+            if override_mode == "skip":
+                return 0
             if analyze_database_child_page_stats(n)["skip_child_pages"]:
                 return 1
-            if is_individual_child_pages_database(
-                n,
-                individual_db_child_threshold=individual_db_child_threshold,
+            if override_mode == "individual" or (
+                override_mode is None
+                and is_individual_child_pages_database(
+                    n,
+                    individual_db_child_threshold=individual_db_child_threshold,
+                )
             ):
                 return 1 + sum(_count(c) for c in (getattr(n, "children", None) or []))
-            # デフォルト: 1ページ集約方式（DB本体 + 集約詳細ページ1枚 + レコード配下のネスト子ページ/DB）
+            # aggregated または static_table: 本体1枚 + 集約詳細ページ1枚 + レコード配下のネスト子ページ/DB
             nested_count = sum(
                 _count(sub)
                 for c in (getattr(n, "children", None) or [])

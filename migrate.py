@@ -35,6 +35,12 @@ from src.html_extractor import HtmlZipExtractor, MultiZipExtractor
 from src.importer import ConfluenceImporter
 from src.verifier import MigrationVerifier
 from src.checkpoint import MigrationCheckpoint, CheckpointWriteError
+from src.db_triage import (
+    collect_db_triage_rows,
+    export_db_triage_csv,
+    format_db_triage_table,
+    load_db_triage_overrides,
+)
 from src.cancellation import CancellationManager, MigrationCancelledException
 from src.telemetry import SanitizedTelemetry
 from src.api_enricher import NotionApiEnricher
@@ -102,6 +108,7 @@ def print_tree(node: PageNode, depth: int = 0):
 def collect_tree_stats(
     node: PageNode,
     individual_db_child_threshold: int = 0,
+    db_mode_overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     stats = {
         "total": 0,
@@ -128,6 +135,7 @@ def collect_tree_stats(
     stats["total"] = count_migratable_nodes(
         node,
         individual_db_child_threshold=individual_db_child_threshold,
+        db_mode_overrides=db_mode_overrides,
     )
     return stats
 
@@ -137,6 +145,7 @@ def print_tree_summary(
     verbose: bool = False,
     show_all: bool = False,
     individual_db_child_threshold: int = 0,
+    db_mode_overrides: Optional[Dict[str, str]] = None,
 ):
     """
     Notionツリー構造の標準出力を表示する。
@@ -146,6 +155,7 @@ def print_tree_summary(
     stats = collect_tree_stats(
         root,
         individual_db_child_threshold=individual_db_child_threshold,
+        db_mode_overrides=db_mode_overrides,
     )
     threshold = 25
 
@@ -179,6 +189,7 @@ def print_tree_summary(
         c_stats = collect_tree_stats(
             child,
             individual_db_child_threshold=individual_db_child_threshold,
+            db_mode_overrides=db_mode_overrides,
         )
         if c_stats["total"] > 1:
             detail_parts = []
@@ -476,6 +487,7 @@ _RESUMABLE_CLI_OPTIONS = (
     "visibility",
     "repair_inpage_links",
     "individual_db_child_threshold",
+    "import_db_triage",
     "verbose",
 )
 
@@ -782,6 +794,19 @@ def main():
         help="本文ありレコード数がこの件数以下のDBのみ個別子ページ（従来pageLink方式）で作成する閾値 (デフォルト: 0=全DBで1ページ集約方式)",
     )
     parser.add_argument(
+        "--db-triage",
+        nargs="?",
+        const="reports/db_triage.csv",
+        default=None,
+        help="--dry-run 時に全DBの規模・移行方式トリアージ一覧を表示し、CSV出力する (デフォルト出力先: reports/db_triage.csv)",
+    )
+    parser.add_argument(
+        "--import-db-triage",
+        type=str,
+        default=None,
+        help="編集済みDBトリアージCSVを読み込み、DB単位の移行方式 (aggregated / individual / static_table / skip) を上書き適用する",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="詳細ログを出力する",
@@ -1046,6 +1071,18 @@ def main():
         user_mapper=user_mapper,
     )
 
+    # DBトリアージCSVの上書き読込
+    db_mode_overrides: Dict[str, str] = {}
+    if args.import_db_triage:
+        try:
+            db_mode_overrides = load_db_triage_overrides(args.import_db_triage)
+            print(f"📋 DBトリアージ上書き定義を読み込みました: {len(db_mode_overrides)} 件 ({args.import_db_triage})\n")
+        except Exception as e:
+            err_msg = f"DBトリアージCSVの読み込みに失敗しました: {e}"
+            logging.error(err_msg)
+            print(f"❌ [ERROR] {err_msg}")
+            sys.exit(1)
+
     # テレメトリとチェックポイントにツリー情報を記録
     telemetry.record_tree(tree)
     if not args.verify_only:
@@ -1078,6 +1115,7 @@ def main():
         verbose=args.verbose,
         show_all=args.show_all_pages,
         individual_db_child_threshold=args.individual_db_child_threshold,
+        db_mode_overrides=db_mode_overrides,
     )
 
     if args.dry_run:
@@ -1088,6 +1126,16 @@ def main():
             telemetry,
             show_external_warnings=args.show_external_warnings,
         )
+        if args.db_triage:
+            triage_rows = collect_db_triage_rows(
+                tree,
+                individual_db_child_threshold=args.individual_db_child_threshold,
+                mode_overrides=db_mode_overrides,
+            )
+            print("\n" + format_db_triage_table(triage_rows))
+            csv_out = export_db_triage_csv(triage_rows, args.db_triage)
+            print(f"💾 DBトリアージCSVを出力しました: {csv_out}")
+            print(f"   編集後に適用する場合: python migrate.py ... --import-db-triage {csv_out}")
         print("💡 DRY RUN モードのため、Confluence への移行はスキップされました。")
         if args.generate_debug_report:
             json_p = os.path.join(args.debug_report_dir, "debug_report.json")
@@ -1099,7 +1147,11 @@ def main():
     def _run_step3_verification(confluence_client, target_mapping):
         step3_start = datetime.now(resolved_tz)
         print(f"🔍 [Step 3/3] テキストベース移行整合性を自動検証中... (開始: {step3_start.strftime('%H:%M:%S')})")
-        verifier = MigrationVerifier(confluence_client)
+        verifier = (
+            MigrationVerifier(confluence_client, db_mode_overrides=db_mode_overrides)
+            if db_mode_overrides
+            else MigrationVerifier(confluence_client)
+        )
         page_id_map = {nid: item["confluence_id"] for nid, item in target_mapping.items() if item.get("confluence_id")}
         results = verifier.verify_tree(tree, page_id_map, conf_parent_id)
         step3_end = datetime.now(resolved_tz)
@@ -1165,6 +1217,7 @@ def main():
         title_prefix=title_prefix,
         external_mapping=args.external_mapping,
         individual_db_child_threshold=args.individual_db_child_threshold,
+        db_mode_overrides=db_mode_overrides,
         verify_resume_remote=not (args.resume and args.no_verify),
     )
 
