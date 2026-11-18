@@ -392,13 +392,13 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         self.assertEqual(created_titles, ["Root", "本文あり行"])
         self.assertEqual(len(mapping), 3)
 
-        # 2. DB CSVのキーカラムが text 型で、本文あり行にはリンク文字列が追記され、本文なし行はタイトルのみであること
+        # 2. DB CSVのキーカラムが text 型、右隣に非表示のリンク型カラム(詳細ページ)が配置され、本文あり行のみURLが入ること
         csv_body = created_dbs[0]["csv_body"]
         self.assertIn("名前,text,", csv_body)
-        self.assertNotIn("confluence-page-link", csv_body)
-        self.assertIn("本文あり行 (https://example.atlassian.net/wiki/spaces/D/pages/p_2)", csv_body)
-        self.assertIn("本文なし行1,", csv_body)
-        self.assertNotIn("本文なし行1 (", csv_body)
+        self.assertIn("詳細ページ,confluence-page-link,", csv_body)
+        self.assertIn('すべてのデータ,table,"","","詳細ページ"', csv_body)
+        self.assertIn('本文あり行,https://example.atlassian.net/wiki/spaces/D/pages/p_2,""', csv_body)
+        self.assertIn('本文なし行1,"",""', csv_body)
 
         # 3. MigrationVerifier でもスキップ行で FAIL せず PASS になること
         fake_db_res = MagicMock(ok=True)

@@ -2232,6 +2232,7 @@ class NotionToConfluenceConverter:
         db_node: PageNode,
         page_link_map: Dict[str, str],
         use_text_title: bool = False,
+        add_hidden_link_col: bool = False,
     ) -> str:
         """Confluence Databases (type: database) 用の構造化CSV (<fields>, <views>, <data>) を生成する。"""
         schema = db_node.properties.get("schema", {})
@@ -2338,15 +2339,27 @@ class NotionToConfluenceConverter:
 
         field_type_map = {f_name: f_type for f_name, f_type, _ in fields}
 
+        hidden_link_col_name: Optional[str] = None
+        if add_hidden_link_col:
+            cand_col = "詳細ページ"
+            existing_names = {f[0] for f in fields}
+            if cand_col in existing_names:
+                cand_col = "詳細ページリンク"
+            hidden_link_col_name = cand_col
+            # キーカラム(index 0)の右(index 1)に非表示のリンク型カラムを配置
+            fields.insert(1, (hidden_link_col_name, "confluence-page-link", ""))
+            field_type_map[hidden_link_col_name] = "confluence-page-link"
+
         field_lines = ["<fields>", "field_name,type,configuration"]
         for f_name, f_type, f_cfg in fields:
             field_lines.append(f"{self._escape_csv_cell(f_name)},{f_type},{f_cfg}")
         field_lines.append("</fields>")
 
+        hidden_fields_cell = f'"{hidden_link_col_name}"' if hidden_link_col_name else '""'
         view_lines = [
             "<views>",
             "view_name,layout,filters,sorts,hidden_fields",
-            'すべてのデータ,table,"","",""',
+            f'すべてのデータ,table,"","",{hidden_fields_cell}',
             "</views>",
         ]
 
@@ -2358,22 +2371,19 @@ class NotionToConfluenceConverter:
 
         for child in db_node.children:
             row_cells = []
+            child_link = str(page_link_map.get(child.id, "")).strip()
+            safe_link_val = child_link if (child_link and (child_link.startswith("http://") or child_link.startswith("https://") or child_link.isdigit())) else ""
+
             if use_text_title:
                 row_title_val = (child.title or "").strip()
                 if not row_title_val:
                     title_prop = child.properties.get(key_col_name)
                     row_title_val = self._format_prop_for_csv(title_prop, key_col_name, child.title)
-                child_link = str(page_link_map.get(child.id, "")).strip()
-                if child_link:
-                    row_title_val = f"{row_title_val} ({child_link})" if row_title_val else child_link
                 row_cells.append(self._escape_csv_cell(row_title_val))
             else:
-                child_link = str(page_link_map.get(child.id, "")).strip()
-                # confluence-page-link は有効なURLまたは数値Content IDのみ許容される。
-                # ページ未作成時などに文字列タイトルを入れるとConfluenceがContent ID解決に失敗し
-                # 「Could not create database entity in Handling Service: CANVAS / Content ID not found for page link value」
-                # で500/400エラーとなるため、有効なURLまたは数値ID以外は必ず空文字とする。
-                safe_link_val = child_link if (child_link and (child_link.startswith("http://") or child_link.startswith("https://") or child_link.isdigit())) else ""
+                row_cells.append(self._escape_csv_cell(safe_link_val))
+
+            if hidden_link_col_name:
                 row_cells.append(self._escape_csv_cell(safe_link_val))
 
             for p_name in prop_names:

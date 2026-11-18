@@ -2776,6 +2776,7 @@ class ConfluenceImporter:
                     node,
                     child_link_map,
                     use_text_title=use_text_title,
+                    add_hidden_link_col=is_low_rate_text_key,
                 )
 
                 # 3. Confluence Database を新規作成
