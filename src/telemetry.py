@@ -17,7 +17,6 @@ from typing import Dict, Any, List, Optional
 from collections import Counter
 
 from src.extractor import (
-    DEFAULT_DB_CHILD_RATE_THRESHOLD,
     analyze_database_child_page_stats,
     get_node_external_synced_blocks,
     get_node_missing_zip_attachments,
@@ -126,7 +125,6 @@ class SanitizedTelemetry:
     def record_tree(
         self,
         root_node,
-        db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
     ):
         """ノードツリーの構造統計を収集する（タイトル・本文は除外）。"""
         total = 0
@@ -146,18 +144,6 @@ class SanitizedTelemetry:
                 db_stats = analyze_database_child_page_stats(n)
                 if db_stats["skip_child_pages"]:
                     self.skipped_bodyless_dbs_count += 1
-                elif (
-                    db_child_rate_threshold is not None
-                    and db_child_rate_threshold > 0
-                    and db_stats["body_rows"] > 0
-                    and db_stats["body_ratio_pct"] < db_child_rate_threshold
-                ):
-                    self.low_child_rate_databases_count += 1
-                    self.record_warning(
-                        f"Low child-page ratio database detected: {n.id} "
-                        f"({db_stats['body_rows']}/{db_stats['total_rows']} rows, "
-                        f"{db_stats['body_ratio_pct']:.1f}% < {float(db_child_rate_threshold):.1f}%)"
-                    )
             elif n.node_type == "database_row":
                 rows += 1
 

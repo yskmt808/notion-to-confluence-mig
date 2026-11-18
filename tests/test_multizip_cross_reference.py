@@ -302,7 +302,8 @@ class TestMultiZipCrossReference(unittest.TestCase):
 
             b_row_xml = converter.generate_page_content(b_row_1)
             assert_valid_storage_xml(self, b_row_xml, label="DevTask-001")
-            self.assertIn('ri:content-title="Project Alpha-01"', b_row_xml)
+            self.assertIn("Project Alpha-01", b_row_xml)
+            self.assertNotIn("📋 レコードプロパティ・行編集", b_row_xml)
 
     def test_mutual_cross_references_and_template_heading_variations(self):
         """Block A ↔ Block B の相互参照とテンプレート見出し・ページ要素バリエーションが正常に変換されること"""

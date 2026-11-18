@@ -1403,26 +1403,23 @@ class NotionExtractor:
         return parsed
 
 
-def is_low_rate_text_key_database(
+def is_individual_child_pages_database(
     db_node: Any,
-    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
-    low_rate_db_text_key: bool = False,
+    individual_db_child_threshold: int = 0,
 ) -> bool:
-    """low_rate_db_text_key 有効時に、DBの子ページ存在率が閾値以下（0%超）でtextキー化対象かを判定する。"""
-    if not low_rate_db_text_key or db_child_rate_threshold is None or db_child_rate_threshold <= 0:
+    """--individual-db-child-threshold 指定時、本文あり子ページ数が閾値以下(0件超)なら個別子ページ(従来方式)にするか判定する。"""
+    if not individual_db_child_threshold or int(individual_db_child_threshold) <= 0:
         return False
     db_stats = analyze_database_child_page_stats(db_node)
     return bool(
         db_stats["total_rows"] > 0
-        and db_stats["body_rows"] > 0
-        and db_stats["body_ratio_pct"] <= float(db_child_rate_threshold)
+        and 0 < db_stats["body_rows"] <= int(individual_db_child_threshold)
     )
 
 
 def count_migratable_nodes(
     root_node: Any,
-    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
-    low_rate_db_text_key: bool = False,
+    individual_db_child_threshold: int = 0,
 ) -> int:
     """Confluence上で実際に作成・移行されるノード数（ダッシュボード母数と一致）を算出する。"""
     if not root_node:
@@ -1435,16 +1432,18 @@ def count_migratable_nodes(
         if ntype == "database":
             if analyze_database_child_page_stats(n)["skip_child_pages"]:
                 return 1
-            if is_low_rate_text_key_database(
+            if is_individual_child_pages_database(
                 n,
-                db_child_rate_threshold=db_child_rate_threshold,
-                low_rate_db_text_key=low_rate_db_text_key,
+                individual_db_child_threshold=individual_db_child_threshold,
             ):
-                return 1 + sum(
-                    _count(c)
-                    for c in (getattr(n, "children", None) or [])
-                    if not is_empty_database_row(c) and database_row_has_substantive_body(c)
-                )
+                return 1 + sum(_count(c) for c in (getattr(n, "children", None) or []))
+            # デフォルト: 1ページ集約方式（DB本体 + 集約詳細ページ1枚 + レコード配下のネスト子ページ/DB）
+            nested_count = sum(
+                _count(sub)
+                for c in (getattr(n, "children", None) or [])
+                for sub in (getattr(c, "children", None) or [])
+            )
+            return 2 + nested_count
         return 1 + sum(_count(c) for c in (getattr(n, "children", None) or []))
 
     return _count(root_node)

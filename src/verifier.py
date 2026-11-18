@@ -13,11 +13,8 @@ import requests
 from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
 from src.extractor import (
-    DEFAULT_DB_CHILD_RATE_THRESHOLD,
     PageNode,
     analyze_database_child_page_stats,
-    database_row_has_substantive_body,
-    format_low_child_rate_warning,
     get_node_external_synced_blocks,
     get_node_missing_zip_attachments,
     get_node_unresolved_external_dbs,
@@ -36,10 +33,8 @@ class MigrationVerifier:
     def __init__(
         self,
         confluence_client: ConfluenceClient,
-        db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
     ):
         self.client = confluence_client
-        self.db_child_rate_threshold = float(db_child_rate_threshold) if db_child_rate_threshold is not None else DEFAULT_DB_CHILD_RATE_THRESHOLD
         self._db_view_requirements: Dict[str, Dict[str, Any]] = {}
 
     def verify_page_node(
@@ -692,19 +687,16 @@ class MigrationVerifier:
             except Exception as fe:
                 warnings.append(f"Could not verify database field types: {fe}")
 
-        # 5. DB行の子ページ省略・低存在率チェック (TCK_00023)
+        # 5. DB行の子ページ省略・1ページ集約モード記録
         db_stats = analyze_database_child_page_stats(node)
         if db_stats["skip_child_pages"]:
             checks_passed.append(
                 f"Database row child pages skipped intentionally (0/{db_stats['total_rows']} rows with substantive body; title column uses 'text')."
             )
-        elif (
-            self.db_child_rate_threshold > 0
-            and db_stats["body_rows"] > 0
-            and db_stats["body_ratio_pct"] < self.db_child_rate_threshold
-        ):
-            stat_with_thresh = dict(db_stats, threshold_pct=self.db_child_rate_threshold)
-            warnings.append(format_low_child_rate_warning(stat_with_thresh))
+        elif getattr(node, "_aggregated_mode", False):
+            checks_passed.append(
+                f"Database row details aggregated into 1 detail page ({db_stats['body_rows']}/{db_stats['total_rows']} rows with substantive body)."
+            )
 
         status = "FAIL" if issues else ("WARN" if warnings else "PASS")
         # 検証完了後に即時メモリ解放
@@ -805,13 +797,16 @@ class MigrationVerifier:
             })
             this_parent_id = expected_parent_id
 
-        # 子ページの検証 (本文なしDBで子ページ作成をスキップした行および空行はスキップ)
+        # 子ページの検証 (本文なしDBで子ページ作成をスキップした行、1ページ集約方式の行、および空行はスキップ)
         if not skip_db_children:
-            low_rate_text_key = bool(getattr(node, "_low_rate_text_key_mode", False))
+            aggregated_mode = bool(getattr(node, "_aggregated_mode", False))
             for child in node.children:
                 if node.node_type == "database" and is_empty_database_row(child):
                     continue
-                if node.node_type == "database" and low_rate_text_key and not database_row_has_substantive_body(child):
+                if node.node_type == "database" and aggregated_mode:
+                    agg_parent_id = getattr(node, "_aggregated_detail_page_id", None) or this_parent_id
+                    for sub in (getattr(child, "children", None) or []):
+                        results.extend(self.verify_tree(sub, page_id_map, agg_parent_id, _analyze_root=False))
                     continue
                 results.extend(self.verify_tree(child, page_id_map, this_parent_id, _analyze_root=False))
 
