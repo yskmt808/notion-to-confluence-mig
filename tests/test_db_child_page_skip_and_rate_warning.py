@@ -290,6 +290,44 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         self.assertEqual(tel.low_child_rate_databases_count, 1)
         self.assertEqual(tel.skipped_bodyless_dbs_count, 0)
 
+    def test_skipped_db_rows_excluded_from_dashboard_and_pass2_node_counts(self):
+        """TCK_00030: 子ページを作成しないDB行が dashboard.start(total_nodes) および Pass 2 の対象ノード数に算入されないこと。"""
+        db_skipped = PageNode(
+            id="db-skip",
+            title="マスタDB",
+            node_type="database",
+            properties={"schema": {"名前": {"type": "title"}}},
+            children=[
+                _make_row("r1", "Row 1", has_body=False),
+                _make_row("r2", "Row 2", has_body=False),
+                _make_row("r3", "Row 3", has_body=False),
+            ],
+        )
+        root = PageNode(id="root-count", title="Root", node_type="page", children=[db_skipped])
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_space_id.return_value = "space-1"
+        mock_client.get_page_by_title.return_value = None
+        mock_client.get_database_by_title.return_value = None
+        mock_client.create_page.return_value = {"id": "p-root", "_links": {"webui": "/spaces/D/pages/p-root"}}
+        mock_client.create_database.return_value = {"id": "d-skip", "_links": {"webui": "/spaces/D/database/d-skip"}}
+        mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = []
+        mock_client.get_page_by_id.return_value = {"id": "p-root", "version": {"number": 1}}
+
+        mock_dashboard = MagicMock()
+        importer = ConfluenceImporter("https://example.atlassian.net/wiki", "user", "tok", space_key="D", dashboard=mock_dashboard)
+        importer.client = mock_client
+
+        mapping = importer.import_tree(root, parent_id="parent-0", overwrite=False)
+
+        # Root(1) + マスタDB(1) = 2 ノードのみが算入され、スキップされた3行は含まれないこと
+        mock_dashboard.start.assert_called_once_with(2)
+        self.assertEqual(len(mapping), 2)
+        pass2_skipped_titles = {c.args[0] for c in mock_dashboard.record_pass2_skip.call_args_list}
+        self.assertEqual(pass2_skipped_titles, {"Root", "マスタDB"})
+
 
 if __name__ == "__main__":
     unittest.main()

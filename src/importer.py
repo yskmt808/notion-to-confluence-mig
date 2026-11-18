@@ -1621,7 +1621,12 @@ class ConfluenceImporter:
                             logger.debug(f"Could not auto-create gallery view for DB {db_conf_id}: {e}")
 
         # ダッシュボードの開始 (Task B.10)
+        # 子ページを作成しないDB（skip_child_pages）配下の行および空DB行は移行対象ページ数から除外する
         def _count_tree_nodes(n: PageNode) -> int:
+            if n.node_type == "database_row" and self.is_empty_database_row(n):
+                return 0
+            if n.node_type == "database" and analyze_database_child_page_stats(n)["skip_child_pages"]:
+                return 1
             return 1 + sum(_count_tree_nodes(c) for c in n.children)
         total_nodes = _count_tree_nodes(root_node)
         if self.dashboard:
@@ -1871,7 +1876,14 @@ class ConfluenceImporter:
         """パス2: 全データベースおよびページの作成完了後、相互リンクおよび埋め込みDBビューを完全に解決して更新する（並行実行）。"""
         all_nodes: List[PageNode] = []
         def _collect(n: PageNode):
+            if n.node_type == "database_row" and self.is_empty_database_row(n):
+                return
             all_nodes.append(n)
+            if n.node_type == "database" and (
+                getattr(n, "_skipped_row_child_pages", False)
+                or analyze_database_child_page_stats(n)["skip_child_pages"]
+            ):
+                return
             for c in n.children:
                 _collect(c)
         _collect(root_node)
