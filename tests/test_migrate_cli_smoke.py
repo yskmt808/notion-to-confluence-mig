@@ -396,7 +396,7 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
 
     def test_large_tree_and_verification_summary_helpers(self):
         children = []
-        for i in range(12):
+        for i in range(13):
             db = PageNode(
                 id=f"db-{i}",
                 title=f"DB {i}",
@@ -408,10 +408,11 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         root = PageNode(id="root", title="Large Root", node_type="page", children=children)
 
         stats = migrate.collect_tree_stats(root)
-        self.assertEqual(stats["total"], 37)
-        self.assertEqual(stats["pages"], 13)
-        self.assertEqual(stats["databases"], 12)
-        self.assertEqual(stats["database_rows"], 12)
+        # ノード数(total)はDBレコード(database_row)を含まない (pages=14 + databases=13 = 27)
+        self.assertEqual(stats["total"], 27)
+        self.assertEqual(stats["pages"], 14)
+        self.assertEqual(stats["databases"], 13)
+        self.assertEqual(stats["database_rows"], 13)
         self.assertEqual(stats["max_depth"], 4)
 
         verify_results = [
@@ -440,8 +441,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
             migrate.print_verification_results(verify_results, verbose=False, show_all=False)
             migrate.print_result_summary(mapping, "migration_result.json", show_all=False, verbose=False)
         output = buf.getvalue()
-        self.assertIn("合計: 37 ノード", output)
-        self.assertIn("他 4 件の主要ページ・セクション", output)
+        self.assertIn("合計: 27 ノード", output)
+        self.assertIn("他 5 件の主要ページ・セクション", output)
         self.assertIn("確認・対応が必要なページ (1 件)", output)
         self.assertIn("移行成果サマリー (合計: 30 件)", output)
 

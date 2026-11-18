@@ -110,12 +110,13 @@ def collect_tree_stats(node: PageNode) -> Dict[str, Any]:
     }
 
     def _traverse(n: PageNode, depth: int):
-        stats["total"] += 1
         if n.node_type == "database":
+            stats["total"] += 1
             stats["databases"] += 1
         elif n.node_type == "database_row":
             stats["database_rows"] += 1
         else:
+            stats["total"] += 1
             stats["pages"] += 1
         if depth > stats["max_depth"]:
             stats["max_depth"] = depth

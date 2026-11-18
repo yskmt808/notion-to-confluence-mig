@@ -35,7 +35,8 @@ class TestOutputSummarizer(unittest.TestCase):
         root.children.append(sub1)
 
         stats = collect_tree_stats(root)
-        self.assertEqual(stats["total"], 13)
+        # ノード数(total)はDBレコード(database_row)を含まない (pages=2 + databases=1 = 3)
+        self.assertEqual(stats["total"], 3)
         self.assertEqual(stats["pages"], 2)
         self.assertEqual(stats["databases"], 1)
         self.assertEqual(stats["database_rows"], 10)
