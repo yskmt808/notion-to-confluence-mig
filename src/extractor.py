@@ -20,8 +20,8 @@ def normalize_db_title(title: Optional[str]) -> str:
     if not title:
         return ""
     t = unicodedata.normalize("NFC", str(title).strip())
-    # ファイル名禁止文字 (: / \ ? * " < > | 等) や全角コロン等を空白に置換
-    t = re.sub(r"[:：/\\?*\"<>|]+", " ", t)
+    # ファイル名禁止文字 (: / \ ? * " < > | 等) やピリオド (. ．) を空白に置換
+    t = re.sub(r"[:：/\\?*\"<>|.．]+", " ", t)
     # 連続空白を単一スペースにして前後の空白を除去し、小文字化
     return re.sub(r"\s+", " ", t).strip().lower()
 

@@ -953,6 +953,31 @@ class TestUnifiedMissingAndUnsupportedWarningsPlanA(unittest.TestCase):
         self.assertNotIn("[参照先: A, B, C]", v_out)
         self.assertNotIn("[WARN] Mention Warning Page", v_out)
 
+    def test_database_title_with_period_matches_exported_csv_with_space(self):
+        """TCK_00032: DB名にピリオド(.)が含まれCSVファイル名で空白に置換されていても、ZIP内DBとして正しく紐付くこと。"""
+        root_id = "11111111-1111-1111-1111-111111111111"
+        db_id = "22222222-2222-2222-2222-222222222222"
+        root_html = _build_html_doc(
+            "Period DB Root",
+            f"""
+            <div class="collection-content" id="view-1">
+              <h4 class="collection-title">1.0 課題管理DB</h4>
+            </div>
+            """,
+            page_id=root_id,
+        )
+        zpath = os.path.join(self.tmpdir, "period_db.zip")
+        with zipfile.ZipFile(zpath, "w") as zf:
+            zf.writestr(f"Period DB Root {root_id.replace('-', '')}.html", root_html)
+            zf.writestr(f"Period DB Root/1 0 課題管理DB {db_id.replace('-', '')}.csv", "名前,メモ\n項目A,テスト\n")
+
+        tree = HtmlZipExtractor(zpath).extract_tree()
+        self.assertEqual(tree.unresolved_external_dbs, [])
+        db_blocks = [b for b in tree.blocks if b.get("type") == "child_database"]
+        self.assertEqual(len(db_blocks), 1)
+        self.assertEqual(db_blocks[0]["database_id"], db_id)
+        self.assertFalse(db_blocks[0].get("_is_unresolved_external_db", False))
+
 
 if __name__ == "__main__":
     unittest.main()
