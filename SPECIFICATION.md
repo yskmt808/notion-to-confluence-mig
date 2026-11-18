@@ -136,9 +136,9 @@ sequenceDiagram
     - 空文字 `""` または `none` を指定した場合、ヘッダは一切出力されず完全非表示となります。
   - **親データベースへのナビゲーション**:
     - `📁 所属データベース: [DB名]` へのインラインリンクを配置。
-  - **行ビューおよびプロパティの折りたたみマクロ格納**:
-    - Confluence DB一覧から行リンクをクリックした際、右側プレビュー領域（サイドパネル）で開かれると行ビュー（スマートカード）が展開されず描画崩れを引き起こす現象を防止するため、**ネイティブ行ビューおよびプロパティ一覧テーブルは `<ac:structured-macro ac:name="expand">`（タイトル: `📋 レコードプロパティ・行編集 (クリックして展開)`）内に格納してデフォルト非展開（折りたたみ）** とします。
-    - 単独ページとして開いた際には、ユーザーが展開してプロパティの双方向編集や確認を行うことが可能。
+  - **行ビューの折りたたみマクロ格納（個別子ページ方式・`entryId` 解決時）**:
+    - 個別子ページ（`pageLink`）方式でネイティブ行ビュー URL（`?entryId=...`）が解決された場合のみ、右側プレビュー領域での描画崩れを防ぐため `<ac:structured-macro ac:name="expand">`（タイトル: `📋 レコードプロパティ・行編集 (クリックして展開)`）内に格納します。
+    - DB と連動しない静的なプロパティ一覧テーブル（折りたたみ）は出力しません。
   - **本文エリア**:
     - Notion側にブロックが存在する場合は `<hr />` および `<h2>📄 レコード詳細本文</h2>` の下に展開。
     - 本文が存在しないレコード（`blocks == 0`）の場合は、余分なプレースホルダ文言や区切り線を出力せず、折りたたみプロパティの直後でクリーンに終了。
@@ -230,11 +230,13 @@ Notionのブロック構造とConfluence Storage Format（XHTML）の完全対�
 * **タイムゾーン（Timezone）指定と実行環境からの自動検出仕様**:
   - CLIオプション `--timezone <tz>` / `--tz <tz>`（例: `Asia/Tokyo`, `JST`, `UTC`）により、コメントや日時に適用するタイムゾーンを明示指定可能。
   - 未指定時は、ローカル実行環境（OS/Python環境の `datetime.now().astimezone().tzinfo` および `tzname()`）からデフォルトタイムゾーン（日本環境なら `JST`）を自動検出し、起動バナーおよび各種メタデータヘッダー（Notionコメント日時等）へ自動反映。
-* **子ページへの編集可能な行ビュー（Row View）カード埋め込み**:
-  - DBレコードの子ページ最上部に、親DBを開かずに直接プロパティ編集可能な行ビューカードを埋め込み配置。
-* **DBレコード子ページの生成最適化・低存在率DB対応 (`--db-child-rate-threshold`, `--low-rate-db-text-key`)**:
-  - **本文なしDBの子ページ作成スキップ**: 全行に本文・子ページが存在しないDB（0%）は、子ページを作成せずキーカラムを `text` 型として移行し、スキップした行は移行対象ページ数（進捗総数・Pass 2・Step 3検証）から除外。他ページからの行リンクは親DB URLへフォールバック。
-  - **低子ページ存在率の警告・`--low-rate-db-text-key` モード**: 本文あり行の存在率が閾値（デフォルト `20.0%`）未満の場合は警告を出力。`--low-rate-db-text-key` 指定時は閾値以下のDBについてキーカラムを `text` 型とし、**本文あり行のみ**子ページを作成した上で、キーカラム右隣の非表示 `confluence-page-link` カラム（`詳細ページ` / `hidden_fields` 指定）へ子ページURLを格納（レコード詳細ペインから参照可能）。
+* **DBレコード詳細のデフォルト「1ページ集約方式」と閾値別・DB単位の方式選択**:
+  - **本文なしDBの詳細ページスキップ**: 全行に本文・子ページが存在しないDB（0%）は、詳細ページを作成せずキーカラムを `text` 型として移行し、スキップした行は移行対象ページ数（進捗総数・Pass 2・Step 3検証）から除外。他ページからの行リンクは親DB URLへフォールバック。
+  - **デフォルト：1ページ集約方式 (`aggregated`)**: 本文あり行が存在するDBは、DBごとに1枚の集約詳細ページ（`<DB名> - 詳細ページ一覧`）を作成し、DBのキーカラムを `text` 型、右隣に **非表示の `hyperlink` 型カラム（`詳細ページ` / `hidden_fields` 設定）** を配置して `#<URLエンコード見出し>` 付きアンカーURLを格納。集約ページ側の各 `<h2>` セクション直下には `📌 DBの該当レコードを直接開く`（`?entryId=...`）のピンポイント戻りリンクを配置し、非連動の静的プロパティ表は出力しない。
+  - **閾値以下DBの個別子ページ方式 (`--individual-db-child-threshold <N>`)**: 本文ありレコード数が `N` 件以下のDBのみ、従来の個別子ページ（`pageLink`）＋行ビュー埋め込み方式で移行（デフォルト `0` = 全DBで1ページ集約）。
+  - **DB移行方式トリアージ (`--dry-run --db-triage` / `--import-db-triage`)**:
+    - `--dry-run --db-triage [PATH]` 指定時のみ、全DBの規模（`db_id`, `db_title`, `total_rows`, `body_rows`, `body_ratio_pct`, `total_body_blocks`, `embedded_view_count`［他ページからのビュー埋め込み/参照回数］, `migration_mode`, `recommendation`）を標準出力に一覧表示し、UTF-8-BOM CSV（デフォルト `reports/db_triage.csv`）を出力。
+    - 出力したCSVの `migration_mode` 列を編集して `--import-db-triage <CSV>` で読み込むことで、DB単位に `aggregated`（1ページ集約）/ `individual`（個別子ページ）/ `static_table`（ネイティブDBを作らず通常ページ標準テーブル＋集約詳細ページ1枚）/ `skip`（移行除外）を上書き制御可能。
 * **DBレコード子ページ配下のDB・子ページ抽出とDBタイトル正規化**:
   - DB行子ページ配下のサブフォルダに定義されたインラインDB（`.csv`）や子ページも再帰抽出し、`db_csv_map` を伝播して参照解決。
   - Notionエクスポート時のファイル名置換に合わせて、OS禁止文字に加えてピリオド（`.` / `．`）も空白に正規化してDB名を照合（`normalize_db_title`）。
@@ -367,19 +369,21 @@ python migrate.py --zip export.zip --show-all-pages
 | `--confluence-parent-id` | `<id>` | `None` | 移行先Confluence親ページID（省略時は `.env` またはスペース直下）。 |
 | `--no-overwrite` | なし | `False` | Confluence上に同名ページが存在する場合に上書きせず、連番を付与して新規作成。 |
 | `--page-workers` | `<int>` | `8` | **Confluence APIへの並行アクセスワーカースレッド数**（DB行子ページ作成および行ビュー埋め込み）。 |
-| `--resume` | なし | `False` | 中断されたチェックポイントから未完了ノード・Passを安全に再開。 |
+| `--resume` | なし | `False` | 中断されたチェックポイントから未完了ノード・Passおよび前回CLIオプション（`cli_options`）を自動復元して再開（`--no-verify` 併用時はPass 1スキップ時のリモート実在確認も省略）。 |
 | `--checkpoint` | `<path>` | `migration_checkpoint.json` | チェックポイントファイルの保存・読込パス。 |
 | `--dry-run` | なし | `False` | Confluence APIを実行せず、抽出ツリー構造のみを検証・表示。 |
+| `--db-triage` | `[path]` | `None` | `--dry-run` 時に全DBのサイジング・ビュー埋め込み数・移行方式トリアージ一覧を表示し、CSV出力（デフォルト: `reports/db_triage.csv`）。 |
+| `--import-db-triage` | `<path>` | `None` | 編集済みDBトリアージCSVを読み込み、DB単位の移行方式 (`aggregated` / `individual` / `static_table` / `skip`) を上書き適用。 |
 | `--show-external-warnings` | なし | `False` | `--dry-run` 時に外部参照（ZIP未収録ページリンク）警告のページ別詳細を表示（デフォルトは件数のみ）。 |
 | `--no-verify` | なし | `False` | 移行後のテキストベース自動整合性検証（Step 3）をスキップ。 |
+| `--verify-only` | なし | `False` | 移行処理（Step 2）を実行せず、チェックポイントに基づいてStep 3の整合性検証のみを実行。 |
 | `--enrich-via-api` | なし | `False` | Notion APIを併用してDBプロパティスキーマ・ビュー設定を高精度補完。 |
 | `--export-worksheet` | `[path]` | `None` | DBカラム型・ビュー設定の人間確認用ワークシート（CSV/JSON）を出力。 |
 | `--import-worksheet` | `<path>` | `None` | 人間が承認・修正したワークシートを読み込んでConfluenceへ反映。 |
 | `--external-mapping`, `--import-mapping` | `<path...>` | `None` | 先行移行の結果ファイル（`migration_result.json` 等）を読み込み、分割移行を跨ぐ参照を事前解決。 |
 | `--repair-inpage-links` | なし | `False` | アンカー欠落の可能性がある自ページ内リンクをNotion APIで照合・自動修復。 |
 | `--notion-token` | `<token>` | 環境変数 `NOTION_TOKEN` | API取得・多段同期ブロック補完・ページ内リンク修復用のNotion APIトークン。 |
-| `--db-child-rate-threshold` | `<float>` | `20.0` | DBレコードの本文/子ページ存在率がこの値(%)未満の場合にWARNINGを表示する閾値（`0`で無効）。 |
-| `--low-rate-db-text-key` | なし | `False` | 存在率が閾値以下のDBについてキーカラムを `text` 型とし、本文あり行のみ子ページを作成して右隣の非表示リンク列へURLを格納。 |
+| `--individual-db-child-threshold` | `<int>` | `0` | 本文ありレコード数がこの件数以下のDBのみ個別子ページ（従来 `pageLink` 方式）で作成する閾値（`0` で全DBを1ページ集約）。 |
 | `--generate-debug-report` | なし | `False` | 機密情報をハッシュ化した開発者報告用サニタイズレポートを出力。 |
 | `--debug-report-dir` | `<dir>` | `.` | サニタイズレポートの出力先ディレクトリ。 |
 | `--timezone`, `--tz` | `<tz>` | `None` (ローカル自動判定) | 時刻表示に使用するタイムゾーン (例: `Asia/Tokyo`, `JST`, `UTC`)。 |
@@ -460,8 +464,8 @@ python migrate.py --zip export.zip --show-all-pages
 
 #### 3. `--resume` 再開時の状態復元と失敗時ハンドリング
 * **チェックポイント保存・自動復元**:
-  - `migrate.py` は `checkpoint.source_info["private_mode"]` に公開モード状態を永続化する。
-  - `--resume` 指定時、`--private` および `--visibility` が明示されていない場合は `checkpoint.source_info["private_mode"]` の設定を自動復元する（`--resume --visibility space` を明示指定した場合は `space` モードで上書き可能）。
+  - `migrate.py` は `checkpoint.source_info["cli_options"]` および `checkpoint.source_info["private_mode"]` に実行時オプションと公開モード状態を永続化する（機密トークン類は除外）。
+  - `--resume` 指定時、`--private` および `--visibility` 等が明示されていない場合はチェックポイントの設定を自動復元する（`--resume --visibility space` 等を明示指定した場合はコマンドライン引数が優先される）。
 * **権限設定失敗時の非致命的警告ハンドリング**:
   - API権限不足・HTTPエラー・ネットワーク例外・`accountId` 取得不可等により `set_page_private()` が失敗（`False` 返却）した場合でも移行プロセス自体は中断せず、警告ログ（`logger.warning`）およびテレメトリ／ダッシュボード警告（`record_warning`）へ記録した上で移行処理を継続する。
 
