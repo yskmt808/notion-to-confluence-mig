@@ -136,11 +136,9 @@ class TestDatabaseRowLayoutAndMetadata(unittest.TestCase):
         self.assertIn("所属データベース", html_out)
         self.assertIn("テストDB直接リクエスト", html_out)
 
-        # 3. プロパティテーブルが expand マクロで折りたたまれている
-        self.assertIn('<ac:structured-macro ac:name="expand">', html_out)
-        self.assertIn('ac:name="title">📋 レコードプロパティ・行編集 (クリックして展開)', html_out)
-        self.assertIn("ステータス", html_out)
-        self.assertIn("未着手", html_out)
+        # 3. 連動しない静的プロパティ一覧（折りたたみ）は出力されないこと
+        self.assertNotIn('<ac:structured-macro ac:name="expand">', html_out)
+        self.assertNotIn("📋 レコードプロパティ・行編集", html_out)
 
         # 4. 本文なしの場合、「（レコードの詳細本文はありません）」や不要な「<hr />」が出力されないこと
         self.assertNotIn("レコードの詳細本文はありません", html_out)

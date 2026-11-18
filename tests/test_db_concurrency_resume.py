@@ -78,6 +78,7 @@ class TestDatabaseConcurrencyAndResume(unittest.TestCase):
             space_key="TEST",
             checkpoint=self.checkpoint,
             page_workers=4,
+            individual_db_child_threshold=10,
         )
 
         mock_client = MagicMock(spec=ConfluenceClient)
@@ -147,6 +148,7 @@ class TestDatabaseConcurrencyAndResume(unittest.TestCase):
             space_key="TEST",
             checkpoint=self.checkpoint,
             page_workers=2,
+            individual_db_child_threshold=10,
         )
 
         mock_client = MagicMock(spec=ConfluenceClient)
@@ -241,7 +243,7 @@ class TestDatabaseConcurrencyAndResume(unittest.TestCase):
         )
         root = PageNode(id="root-1", title="親ページ", node_type="page", children=[db])
 
-        importer = ConfluenceImporter("https://example.atlassian.net/wiki", "user", "token", "TEST", page_workers=1)
+        importer = ConfluenceImporter("https://example.atlassian.net/wiki", "user", "token", "TEST", page_workers=1, individual_db_child_threshold=10)
         mock_client = MagicMock()
         mock_client.base_url = "https://example.atlassian.net/wiki"
         mock_client.get_space_id.return_value = "space-1"
@@ -293,7 +295,7 @@ class TestDatabaseConcurrencyAndResume(unittest.TestCase):
         )
         root = PageNode(id="root-null-1", title="親ページ", node_type="page", children=[db])
 
-        importer = ConfluenceImporter("https://example.atlassian.net/wiki", "user", "token", "TEST", page_workers=1)
+        importer = ConfluenceImporter("https://example.atlassian.net/wiki", "user", "token", "TEST", page_workers=1, individual_db_child_threshold=10)
         mock_client = MagicMock()
         mock_client.base_url = "https://example.atlassian.net/wiki"
         mock_client.get_space_id.return_value = "space-1"

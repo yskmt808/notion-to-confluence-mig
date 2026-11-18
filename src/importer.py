@@ -24,7 +24,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import requests
 from src.extractor import (
-    DEFAULT_DB_CHILD_RATE_THRESHOLD,
     PageNode,
     analyze_database_child_page_stats,
     classify_external_app_url,
@@ -32,7 +31,7 @@ from src.extractor import (
     database_row_has_substantive_body,
     is_broken_or_placeholder_url,
     is_empty_database_row as _shared_is_empty_database_row,
-    is_low_rate_text_key_database,
+    is_individual_child_pages_database,
     is_unsupported_page_element_block,
     normalize_db_title,
 )
@@ -1003,8 +1002,7 @@ class ConfluenceImporter:
         prune_blocks_on_pass2: bool = False,
         title_prefix: Optional[str] = None,
         external_mapping: Optional[Union[str, List[str]]] = None,
-        db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
-        low_rate_db_text_key: bool = False,
+        individual_db_child_threshold: int = 0,
         verify_resume_remote: bool = True,
     ):
         self.space_key = space_key
@@ -1018,10 +1016,7 @@ class ConfluenceImporter:
         self.private_mode = private_mode
         self.prune_blocks_on_pass2 = prune_blocks_on_pass2
         self.title_prefix = title_prefix or ""
-        self.db_child_rate_threshold = (
-            float(db_child_rate_threshold) if db_child_rate_threshold is not None else DEFAULT_DB_CHILD_RATE_THRESHOLD
-        )
-        self.low_rate_db_text_key = bool(low_rate_db_text_key)
+        self.individual_db_child_threshold = max(0, int(individual_db_child_threshold or 0))
         self.verify_resume_remote = bool(verify_resume_remote)
         self._current_user_account_id: Optional[str] = None
         from src.timezone_util import resolve_timezone, format_iso_datetime
@@ -1637,11 +1632,10 @@ class ConfluenceImporter:
                             logger.debug(f"Could not auto-create gallery view for DB {db_conf_id}: {e}")
 
         # ダッシュボードの開始 (Task B.10)
-        # 実際に作成されるノード数（skip_child_pages / low_rate_db_text_key / 空DB行を除外）を母数とする
+        # 実際に作成されるノード数（skip_child_pages / 1ページ集約 / 空DB行を反映）を母数とする
         total_nodes = count_migratable_nodes(
             root_node,
-            db_child_rate_threshold=self.db_child_rate_threshold,
-            low_rate_db_text_key=self.low_rate_db_text_key,
+            individual_db_child_threshold=self.individual_db_child_threshold,
         )
         if self.dashboard:
             self.dashboard.start(total_nodes)
@@ -1886,17 +1880,89 @@ class ConfluenceImporter:
             node.blocks = []
             node.properties = {}
 
-    def _is_low_rate_text_key_db(self, db_node: PageNode) -> bool:
-        """low_rate_db_text_key 有効時に、DBの子ページ存在率が閾値以下（0%超）でtextキー化対象かを判定する。"""
-        return is_low_rate_text_key_database(
+    def _is_aggregated_db(self, db_node: PageNode) -> bool:
+        """DBがデフォルトの1ページ集約方式（本文あり行あり、かつ個別子ページ閾値対象外）かを判定する。"""
+        if analyze_database_child_page_stats(db_node)["skip_child_pages"]:
+            return False
+        return not is_individual_child_pages_database(
             db_node,
-            db_child_rate_threshold=self.db_child_rate_threshold,
-            low_rate_db_text_key=self.low_rate_db_text_key,
+            individual_db_child_threshold=self.individual_db_child_threshold,
         )
+
+    def _update_aggregated_detail_page_pass2(self, db_node: PageNode):
+        """Pass 2: 1ページ集約方式のDB詳細まとめページに解決済みリンクと?entryId=戻りリンクを反映する。"""
+        with self._lock:
+            db_info = self.migration_map.get(db_node.id)
+        if not db_info:
+            return
+        agg_id = db_info.get("aggregated_detail_page_id") or getattr(db_node, "_aggregated_detail_page_id", None)
+        if not agg_id:
+            return
+        agg_node_id = f"{db_node.id}__details"
+        if self.checkpoint and self.checkpoint.is_pass2_done(agg_node_id):
+            if self.dashboard:
+                self.dashboard.record_pass2_skip(db_info.get("aggregated_detail_page_title") or db_node.title)
+            return
+
+        db_conf_id = str(db_info["confluence_id"])
+        db_web_url = f"{self.client.base_url}/spaces/{self.space_key}/database/{db_conf_id}"
+        body_children = [
+            c for c in (db_node.children or [])
+            if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
+        ]
+        if not body_children:
+            return
+
+        # entry_id が未解決の行があれば Pass 2 時点で再取得を試みる
+        if any(not getattr(c, "entry_id", None) for c in body_children):
+            try:
+                entries = self.client.get_database_entries(db_conf_id, expected_count=len(db_node.children or []), timeout_sec=10)
+                text_to_entry = self._build_text_key_to_entry_map(entries)
+                for c in body_children:
+                    if not getattr(c, "entry_id", None):
+                        eid = text_to_entry.get((c.title or "").strip())
+                        if eid:
+                            c.entry_id = eid
+            except Exception as e:
+                logger.debug(f"Pass 2 entryId lookup skipped for aggregated DB [{db_node.title}]: {e}")
+
+        row_entries = [(c, getattr(c, "entry_id", None)) for c in body_children]
+        agg_title = db_info.get("aggregated_detail_page_title") or getattr(db_node, "_aggregated_detail_page_title", f"{db_node.title} - 詳細ページ一覧")
+        try:
+            if self.dashboard:
+                self.dashboard.set_worker_busy(agg_title, node_type="page")
+            agg_body = self.converter.generate_aggregated_database_details_html(db_node, db_web_url, row_entries)
+            latest = self.client.get_page_by_id(str(agg_id), expand="version")
+            if latest:
+                current_ver = latest.get("version", {}).get("number", 1)
+                self.client.update_page(
+                    page_id=str(agg_id),
+                    space_key=self.space_key,
+                    title=agg_title,
+                    body=agg_body,
+                    current_version=current_ver,
+                )
+                logger.info(f"Pass 2 updated aggregated detail page [{agg_title}] (ID: {agg_id}, v{current_ver + 1})")
+                if self.checkpoint:
+                    self.checkpoint.record_pass2(agg_node_id)
+                if self.dashboard:
+                    self.dashboard.record_pass2_done(agg_title)
+        except CheckpointWriteError as ce:
+            if self.cancel_manager:
+                self.cancel_manager.trigger_error_halt(f"Checkpoint write error during Pass 2 for [{agg_title}]: {ce}")
+            raise
+        except Exception as e:
+            logger.warning(f"Pass 2 update error for aggregated detail page {agg_title} ({agg_id}): {e}")
+            if self.telemetry:
+                self.telemetry.record_warning(f"Pass 2 update error for aggregated detail page {agg_title}: {e}")
+        finally:
+            if self.dashboard:
+                self.dashboard.set_worker_idle()
 
     def _resolve_and_update_page_links(self, root_node: PageNode):
         """パス2: 全データベースおよびページの作成完了後、相互リンクおよび埋め込みDBビューを完全に解決して更新する（並行実行）。"""
         all_nodes: List[PageNode] = []
+        aggregated_dbs: List[PageNode] = []
         def _collect(n: PageNode):
             if n.node_type == "database_row" and self.is_empty_database_row(n):
                 return
@@ -1907,10 +1973,12 @@ class ConfluenceImporter:
                     or analyze_database_child_page_stats(n)["skip_child_pages"]
                 ):
                     return
-                if getattr(n, "_low_rate_text_key_mode", False) or self._is_low_rate_text_key_db(n):
+                if getattr(n, "_aggregated_mode", False) or self._is_aggregated_db(n):
+                    aggregated_dbs.append(n)
+                    # 1ページ集約方式: 行個別のupdateは行わず、レコード配下のネスト子ページ/DBのみ収集
                     for c in n.children:
-                        if not self.is_empty_database_row(c) and database_row_has_substantive_body(c):
-                            _collect(c)
+                        for sub in (getattr(c, "children", None) or []):
+                            _collect(sub)
                     return
             for c in n.children:
                 _collect(c)
@@ -1930,6 +1998,33 @@ class ConfluenceImporter:
                 self.dashboard.set_main_task(f"Pass 2: リンク・ビュー更新中 ({len(all_nodes)} 件)")
             for n in all_nodes:
                 self._resolve_and_update_single_node(n)
+
+        for db_n in aggregated_dbs:
+            self._update_aggregated_detail_page_pass2(db_n)
+
+    @staticmethod
+    def _build_text_key_to_entry_map(entries: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
+        """Confluence DB エントリ一覧から text キー値(plain) -> entryId マップを構築する。"""
+        text_to_entry: Dict[str, str] = {}
+        for e in entries or []:
+            if not isinstance(e, dict):
+                continue
+            entry_id = e.get("id")
+            if not entry_id:
+                continue
+            values = e.get("values") or {}
+            if not isinstance(values, dict):
+                continue
+            for fval in values.values():
+                if not isinstance(fval, dict) or fval.get("type") != "text":
+                    continue
+                plain = fval.get("plain")
+                if not isinstance(plain, str):
+                    plain = fval.get("value") if isinstance(fval.get("value"), str) else ""
+                key = plain.strip()
+                if key and key not in text_to_entry:
+                    text_to_entry[key] = str(entry_id)
+        return text_to_entry
 
     @staticmethod
     def _build_page_to_entry_map(entries: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
@@ -2639,21 +2734,48 @@ class ConfluenceImporter:
                 if node.node_type == "database" and analyze_database_child_page_stats(node)["skip_child_pages"]:
                     node._skipped_row_child_pages = True
                     self._register_skipped_db_rows(node, confluence_url)
-                elif node.node_type == "database" and self._is_low_rate_text_key_db(node):
-                    node._low_rate_text_key_mode = True
+                elif node.node_type == "database" and self._is_aggregated_db(node):
+                    node._aggregated_mode = True
                     self._register_skipped_db_rows(node, confluence_url, skip_only_bodyless=True)
-                    body_children = [
-                        c for c in (node.children or [])
-                        if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
-                    ]
-                    if body_children:
-                        self._import_children_concurrently(
-                            parent_node=node,
-                            children=body_children,
-                            parent_id=confluence_page_id,
-                            overwrite=overwrite,
-                            allow_sub_parallel=allow_sub_parallel,
-                        )
+                    agg_node_id = f"{node.id}__details"
+                    agg_info = self.checkpoint.get_node_info(agg_node_id) if self.checkpoint else None
+                    if agg_info and agg_info.get("confluence_id"):
+                        agg_id = str(agg_info["confluence_id"])
+                        agg_title = agg_info.get("title") or f"{node.title} - 詳細ページ一覧"
+                        agg_url = agg_info.get("url") or f"{self.client.base_url}/spaces/{self.space_key}/pages/{agg_id}"
+                        node._aggregated_detail_page_id = agg_id
+                        node._aggregated_detail_page_title = agg_title
+                        node._aggregated_detail_page_url = agg_url
+                        self.migration_map[node.id]["aggregated_detail_page_id"] = agg_id
+                        self.migration_map[node.id]["aggregated_detail_page_title"] = agg_title
+                        self.migration_map[node.id]["aggregated_detail_page_url"] = agg_url
+                        body_children = [
+                            c for c in (node.children or [])
+                            if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
+                        ]
+                        with self._lock:
+                            for c in body_children:
+                                anchor = urllib.parse.quote((c.title or "").strip(), safe="")
+                                row_anchor_url = f"{agg_url}#{anchor}" if anchor else agg_url
+                                self.migration_map[c.id] = {
+                                    "confluence_id": agg_id,
+                                    "title": c.title,
+                                    "url": row_anchor_url,
+                                    "node_type": c.node_type,
+                                }
+                        nested_children = [
+                            sub
+                            for c in (node.children or [])
+                            for sub in (getattr(c, "children", None) or [])
+                        ]
+                        if nested_children:
+                            self._import_children_concurrently(
+                                parent_node=node,
+                                children=nested_children,
+                                parent_id=agg_id,
+                                overwrite=overwrite,
+                                allow_sub_parallel=allow_sub_parallel,
+                            )
                 elif node.children:
                     self._import_children_concurrently(
                         parent_node=node,
@@ -2706,35 +2828,114 @@ class ConfluenceImporter:
 
             db_stats = analyze_database_child_page_stats(node)
             skip_row_pages = bool(db_stats["skip_child_pages"])
-            is_low_rate_text_key = (not skip_row_pages) and self._is_low_rate_text_key_db(node)
-            use_text_title = skip_row_pages or is_low_rate_text_key
+            is_individual_mode = (not skip_row_pages) and is_individual_child_pages_database(
+                node, individual_db_child_threshold=self.individual_db_child_threshold
+            )
+            is_aggregated_mode = (not skip_row_pages) and (not is_individual_mode)
+            use_text_title = skip_row_pages or is_aggregated_mode
             node._skipped_row_child_pages = skip_row_pages
-            node._low_rate_text_key_mode = is_low_rate_text_key
+            node._aggregated_mode = is_aggregated_mode
 
-            # 1. 先に子ページ（各行レコード詳細）を作成してリンクURLとIDを確定
+            # 1. 子ページまたは1ページ集約詳細ページを作成してリンクURLとIDを確定
             child_link_map = {}
             unmigrated_children = []
+            agg_page_id: Optional[str] = None
+            agg_page_title: Optional[str] = None
+            agg_page_url: Optional[str] = None
             if skip_row_pages:
                 logger.info(
                     f"Skipping row child page creation for database [{node.title}] "
                     f"(0/{db_stats['total_rows']} rows have substantive body -> title column uses 'text')."
                 )
-            else:
-                if is_low_rate_text_key:
-                    logger.info(
-                        f"Low child-page rate DB [{node.title}] ({db_stats['body_rows']}/{db_stats['total_rows']} rows, "
-                        f"{db_stats['body_ratio_pct']:.1f}% <= {self.db_child_rate_threshold:.1f}%): "
-                        f"using 'text' key column and creating child pages only for rows with substantive body."
+            elif is_aggregated_mode:
+                body_children = [
+                    c for c in (node.children or [])
+                    if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
+                ]
+                logger.info(
+                    f"Aggregated 1-page mode DB [{node.title}] ({len(body_children)}/{db_stats['total_rows']} rows with body): "
+                    f"creating 1 detail page with 'text' key column and hidden 'hyperlink' column."
+                )
+                agg_node_id = f"{node.id}__details"
+                if self.checkpoint and self.checkpoint.is_pass1_done(agg_node_id):
+                    cached_agg = self.checkpoint.get_node_info(agg_node_id)
+                    agg_page_id = str(cached_agg["confluence_id"])
+                    agg_page_title = cached_agg.get("title") or f"{node.title} - 詳細ページ一覧"
+                    agg_page_url = cached_agg.get("url") or f"{self.client.base_url}/spaces/{self.space_key}/pages/{agg_page_id}"
+                else:
+                    agg_page_title, existing_agg = self._resolve_unique_page_title(
+                        base_title=f"{node.title} - 詳細ページ一覧",
+                        notion_node_id=agg_node_id,
+                        allow_existing_overwrite=overwrite,
                     )
+                    if existing_agg and overwrite:
+                        agg_page_id = str(existing_agg["id"])
+                        agg_webui = existing_agg.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
+                        agg_page_url = f"{self.client.base_url}{agg_webui}"
+                    else:
+                        agg_res = self.client.create_page(
+                            space_key=self.space_key,
+                            title=agg_page_title,
+                            body="<p>詳細ページを生成中...</p>",
+                            parent_id=parent_id,
+                        )
+                        agg_page_id = str(agg_res["id"])
+                        agg_webui = agg_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
+                        agg_page_url = f"{self.client.base_url}{agg_webui}"
+                    if self.checkpoint:
+                        self.checkpoint.record_pass1(
+                            node_id=agg_node_id,
+                            confluence_id=agg_page_id,
+                            title=agg_page_title,
+                            url=agg_page_url,
+                            node_type="page",
+                        )
+                    if self.dashboard:
+                        self.dashboard.record_pass1_done(agg_page_title, node_type="page")
+
+                node._aggregated_detail_page_id = agg_page_id
+                node._aggregated_detail_page_title = agg_page_title
+                node._aggregated_detail_page_url = agg_page_url
+                with self._lock:
+                    self.migration_map[agg_node_id] = {
+                        "confluence_id": agg_page_id,
+                        "title": agg_page_title,
+                        "url": agg_page_url,
+                        "node_type": "page",
+                    }
+                    for child in body_children:
+                        anchor = urllib.parse.quote((child.title or "").strip(), safe="")
+                        row_anchor_url = f"{agg_page_url}#{anchor}" if anchor else agg_page_url
+                        child_link_map[child.id] = row_anchor_url
+                        self.migration_map[child.id] = {
+                            "confluence_id": agg_page_id,
+                            "title": child.title,
+                            "url": row_anchor_url,
+                            "node_type": child.node_type,
+                        }
+                nested_children = [
+                    sub
+                    for c in (node.children or [])
+                    for sub in (getattr(c, "children", None) or [])
+                ]
+                if nested_children:
+                    self._import_children_concurrently(
+                        parent_node=node,
+                        children=nested_children,
+                        parent_id=agg_page_id,
+                        overwrite=overwrite,
+                        allow_sub_parallel=allow_sub_parallel,
+                    )
+            else:
+                logger.info(
+                    f"Individual child-page mode DB [{node.title}] ({db_stats['body_rows']}/{db_stats['total_rows']} rows with body <= {self.individual_db_child_threshold})"
+                )
                 for child in node.children:
                     child.parent_db_title = node.title
                     if existing_db_url:
                         child.parent_db_url = existing_db_url
                     if self.is_empty_database_row(child):
                         logger.info(f"Skipping empty database row child page: [{child.title}] (ID: {child.id})")
-                        continue
-                    if is_low_rate_text_key and not database_row_has_substantive_body(child):
-                        logger.debug(f"Skipping bodyless row child page in low-rate text-key DB [{node.title}]: [{child.title}]")
                         continue
                     if self.checkpoint and self.checkpoint.is_pass1_done(child.id):
                         cached = self.checkpoint.get_node_info(child.id)
@@ -2795,7 +2996,7 @@ class ConfluenceImporter:
                     node,
                     child_link_map,
                     use_text_title=use_text_title,
-                    add_hidden_link_col=is_low_rate_text_key,
+                    add_hidden_link_col=is_aggregated_mode,
                 )
 
                 # 3. Confluence Database を新規作成
@@ -2829,7 +3030,7 @@ class ConfluenceImporter:
 
             if skip_row_pages:
                 self._register_skipped_db_rows(node, confluence_url)
-            elif is_low_rate_text_key:
+            elif is_aggregated_mode:
                 self._register_skipped_db_rows(node, confluence_url, skip_only_bodyless=True)
 
             # プライベート移行モード（DBルート作成直後の即時ロック）
@@ -2993,6 +3194,7 @@ class ConfluenceImporter:
             entries = self.client.get_database_entries(confluence_page_id, expected_count=expected, timeout_sec=3)
             logger.info(f"Retrieved {len(entries)} indexed entries from database [{node.title}] (ID: {confluence_page_id})")
             page_to_entry_map = self._build_page_to_entry_map(entries)
+            text_to_entry_map = self._build_text_key_to_entry_map(entries) if is_aggregated_mode else {}
 
             db_web_url = f"{self.client.base_url}/spaces/{self.space_key}/database/{confluence_page_id}"
 
@@ -3004,6 +3206,11 @@ class ConfluenceImporter:
                 child.parent_db_url = db_web_url
                 if child.id not in child_link_map:
                     continue
+                if is_aggregated_mode:
+                    eid = text_to_entry_map.get((child.title or "").strip())
+                    if eid:
+                        child.entry_id = eid
+                    continue
                 with self._lock:
                     c_info = self.migration_map.get(child.id)
                 if c_info:
@@ -3012,8 +3219,7 @@ class ConfluenceImporter:
                         indexed_children.append((child, page_to_entry_map[c_id]))
                     else:
                         pending_children.append(child)
-                        if not is_low_rate_text_key:
-                            pending_child_ids.append(child.id)
+                        pending_child_ids.append(child.id)
 
             if indexed_children:
                 self._embed_row_views_concurrently(indexed_children, db_web_url, confluence_page_id)
@@ -3024,7 +3230,7 @@ class ConfluenceImporter:
                 logger.info(f"[Approach B] Deferred {len(pending_child_ids)} row views for database [{node.title}] (reparented; index resolve via --resume)")
 
             with self._lock:
-                self.migration_map[node.id] = {
+                db_map_entry = {
                     "confluence_id": confluence_page_id,
                     "title": node.title,
                     "url": confluence_url,
@@ -3033,6 +3239,11 @@ class ConfluenceImporter:
                     "views_info": views_info_list,
                     "pending_row_views": pending_child_ids,
                 }
+                if is_aggregated_mode and agg_page_id:
+                    db_map_entry["aggregated_detail_page_id"] = agg_page_id
+                    db_map_entry["aggregated_detail_page_title"] = agg_page_title
+                    db_map_entry["aggregated_detail_page_url"] = agg_page_url
+                self.migration_map[node.id] = db_map_entry
                 if self.checkpoint:
                     self.checkpoint.record_pass1(
                         node_id=node.id,

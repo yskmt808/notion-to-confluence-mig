@@ -22,10 +22,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 import glob
 import zipfile
 from src.extractor import (
-    DEFAULT_DB_CHILD_RATE_THRESHOLD,
     NotionExtractor,
     PageNode,
-    collect_low_child_rate_databases,
     count_migratable_nodes,
     get_node_external_synced_blocks,
     get_node_missing_zip_attachments,
@@ -103,8 +101,7 @@ def print_tree(node: PageNode, depth: int = 0):
 
 def collect_tree_stats(
     node: PageNode,
-    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
-    low_rate_db_text_key: bool = False,
+    individual_db_child_threshold: int = 0,
 ) -> Dict[str, Any]:
     stats = {
         "total": 0,
@@ -130,8 +127,7 @@ def collect_tree_stats(
     # total は実際に作成・移行されるページ数（ダッシュボード母数と完全一致）
     stats["total"] = count_migratable_nodes(
         node,
-        db_child_rate_threshold=db_child_rate_threshold,
-        low_rate_db_text_key=low_rate_db_text_key,
+        individual_db_child_threshold=individual_db_child_threshold,
     )
     return stats
 
@@ -140,8 +136,7 @@ def print_tree_summary(
     root: PageNode,
     verbose: bool = False,
     show_all: bool = False,
-    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
-    low_rate_db_text_key: bool = False,
+    individual_db_child_threshold: int = 0,
 ):
     """
     Notionツリー構造の標準出力を表示する。
@@ -150,8 +145,7 @@ def print_tree_summary(
     """
     stats = collect_tree_stats(
         root,
-        db_child_rate_threshold=db_child_rate_threshold,
-        low_rate_db_text_key=low_rate_db_text_key,
+        individual_db_child_threshold=individual_db_child_threshold,
     )
     threshold = 25
 
@@ -184,8 +178,7 @@ def print_tree_summary(
 
         c_stats = collect_tree_stats(
             child,
-            db_child_rate_threshold=db_child_rate_threshold,
-            low_rate_db_text_key=low_rate_db_text_key,
+            individual_db_child_threshold=individual_db_child_threshold,
         )
         if c_stats["total"] > 1:
             detail_parts = []
@@ -290,7 +283,6 @@ def _print_dry_run_warning_section(
 def print_dry_run_summary(
     tree: PageNode,
     telemetry: SanitizedTelemetry,
-    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
     show_external_warnings: bool = False,
 ):
     """ドライラン結果サマリー（WARNING件数・各種警告検出ページ一覧）を表示する。"""
@@ -299,7 +291,6 @@ def print_dry_run_summary(
     ext_page_total, affected_page_refs = collect_unresolved_external_page_refs(tree)
     missing_att_total, affected_att_pages = collect_missing_zip_attachment_pages(tree)
     unsup_total, affected_unsup_pages = collect_unsupported_element_pages(tree)
-    low_child_dbs = collect_low_child_rate_databases(tree, threshold_pct=db_child_rate_threshold)
     warning_count = telemetry.total_warnings_count
 
     print("--------------------------------------------------")
@@ -315,15 +306,6 @@ def print_dry_run_summary(
     )
     _print_dry_run_warning_section("ZIP未収録の添付ファイル・メディア", missing_att_total, affected_att_pages)
     _print_dry_run_warning_section("未対応要素・外部アプリ埋め込み（フォールバック注記対象）", unsup_total, affected_unsup_pages)
-    if low_child_dbs:
-        print(
-            f"⚠️ 子ページ存在率が閾値 ({db_child_rate_threshold:.1f}%) 未満のデータベースを "
-            f"{len(low_child_dbs)} 件検出しました:"
-        )
-        for st in low_child_dbs:
-            print(f"  - [database] {st['database_title']} (ID: {st['database_id']}):")
-            formatted_msg = str(st.get("message") or "").replace("。", "。\n        ", 1).rstrip()
-            print(f"      ⚠️ {formatted_msg}")
 
 
 def _is_external_link_warning(warning_msg: str) -> bool:
@@ -493,8 +475,7 @@ _RESUMABLE_CLI_OPTIONS = (
     "private",
     "visibility",
     "repair_inpage_links",
-    "db_child_rate_threshold",
-    "low_rate_db_text_key",
+    "individual_db_child_threshold",
     "verbose",
 )
 
@@ -795,15 +776,10 @@ def main():
         help="ページ内リンク修復用の Notion インテグレーション・トークン (環境変数 NOTION_TOKEN または NOTION_API_KEY も利用可能)",
     )
     parser.add_argument(
-        "--db-child-rate-threshold",
-        type=float,
-        default=DEFAULT_DB_CHILD_RATE_THRESHOLD,
-        help="DB行レコードの本文/子ページ存在率がこの値(%%)未満の場合にWARNINGを表示する閾値 (0で無効, デフォルト: 20.0)",
-    )
-    parser.add_argument(
-        "--low-rate-db-text-key",
-        action="store_true",
-        help="DBレコードの子ページ存在率が閾値(--db-child-rate-threshold)以下の場合に、キーカラムをtext型にし、本文あり行のみ子ページを作成してリンク文字列を追加する",
+        "--individual-db-child-threshold",
+        type=int,
+        default=0,
+        help="本文ありレコード数がこの件数以下のDBのみ個別子ページ（従来pageLink方式）で作成する閾値 (デフォルト: 0=全DBで1ページ集約方式)",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -1071,7 +1047,7 @@ def main():
     )
 
     # テレメトリとチェックポイントにツリー情報を記録
-    telemetry.record_tree(tree, db_child_rate_threshold=args.db_child_rate_threshold)
+    telemetry.record_tree(tree)
     if not args.verify_only:
         checkpoint.source_info = build_checkpoint_source_info(
             args,
@@ -1101,8 +1077,7 @@ def main():
         tree,
         verbose=args.verbose,
         show_all=args.show_all_pages,
-        db_child_rate_threshold=args.db_child_rate_threshold,
-        low_rate_db_text_key=args.low_rate_db_text_key,
+        individual_db_child_threshold=args.individual_db_child_threshold,
     )
 
     if args.dry_run:
@@ -1111,7 +1086,6 @@ def main():
         print_dry_run_summary(
             tree,
             telemetry,
-            db_child_rate_threshold=args.db_child_rate_threshold,
             show_external_warnings=args.show_external_warnings,
         )
         print("💡 DRY RUN モードのため、Confluence への移行はスキップされました。")
@@ -1125,11 +1099,7 @@ def main():
     def _run_step3_verification(confluence_client, target_mapping):
         step3_start = datetime.now(resolved_tz)
         print(f"🔍 [Step 3/3] テキストベース移行整合性を自動検証中... (開始: {step3_start.strftime('%H:%M:%S')})")
-        verifier = (
-            MigrationVerifier(confluence_client)
-            if args.db_child_rate_threshold == DEFAULT_DB_CHILD_RATE_THRESHOLD
-            else MigrationVerifier(confluence_client, db_child_rate_threshold=args.db_child_rate_threshold)
-        )
+        verifier = MigrationVerifier(confluence_client)
         page_id_map = {nid: item["confluence_id"] for nid, item in target_mapping.items() if item.get("confluence_id")}
         results = verifier.verify_tree(tree, page_id_map, conf_parent_id)
         step3_end = datetime.now(resolved_tz)
@@ -1194,8 +1164,7 @@ def main():
         prune_blocks_on_pass2=(args.no_verify and not args.repair_inpage_links),
         title_prefix=title_prefix,
         external_mapping=args.external_mapping,
-        db_child_rate_threshold=args.db_child_rate_threshold,
-        low_rate_db_text_key=args.low_rate_db_text_key,
+        individual_db_child_threshold=args.individual_db_child_threshold,
         verify_resume_remote=not (args.resume and args.no_verify),
     )
 

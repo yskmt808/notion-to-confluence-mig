@@ -525,8 +525,7 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
                 self._run_main([
                     "--zip", zpath,
                     "--checkpoint", cp_path,
-                    "--low-rate-db-text-key",
-                    "--db-child-rate-threshold", "15.0",
+                    "--individual-db-child-threshold", "25",
                     "--new-tree",
                     "--no-overwrite",
                     "--no-verify",
@@ -543,8 +542,7 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         with open(cp_path, "r", encoding="utf-8") as f:
             cp_data = json.load(f)
         cli_opts = cp_data.get("source_info", {}).get("cli_options", {})
-        self.assertTrue(cli_opts.get("low_rate_db_text_key"))
-        self.assertEqual(cli_opts.get("db_child_rate_threshold"), 15.0)
+        self.assertEqual(cli_opts.get("individual_db_child_threshold"), 25)
         self.assertTrue(cli_opts.get("new_tree"))
         self.assertTrue(cli_opts.get("no_overwrite"))
         self.assertTrue(cli_opts.get("no_verify"))
@@ -576,12 +574,11 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
                 "--page-workers", "2",
             ], env=self.CONFLUENCE_ENV)
 
-            self.assertIn("low_rate_db_text_key", out)
+            self.assertIn("individual_db_child_threshold", out)
             self.assertEqual(mock_importer_cls.call_args.kwargs["page_workers"], 2)
             self.assertEqual(mock_importer_cls.call_args.kwargs["metadata_template"], "")
             self.assertEqual(str(mock_importer_cls.call_args.kwargs["timezone"]), "UTC")
-            self.assertTrue(mock_importer_cls.call_args.kwargs["low_rate_db_text_key"])
-            self.assertEqual(mock_importer_cls.call_args.kwargs["db_child_rate_threshold"], 15.0)
+            self.assertEqual(mock_importer_cls.call_args.kwargs["individual_db_child_threshold"], 25)
             self.assertFalse(mock_importer_cls.call_args.kwargs["verify_resume_remote"])
             self.assertFalse(mock_importer.import_tree.call_args.kwargs["overwrite"])
             self.assertIsNone(mock_importer.import_tree.call_args.kwargs["parent_id"])
@@ -623,7 +620,7 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
 
             mock_importer_cls.assert_not_called()
             mock_client_cls.assert_called_once()
-            mock_verifier_cls.assert_called_once_with(mock_client_cls.return_value, db_child_rate_threshold=12.5)
+            mock_verifier_cls.assert_called_once_with(mock_client_cls.return_value)
             mock_verifier.verify_tree.assert_called_once()
             _, page_id_map, parent_id = mock_verifier.verify_tree.call_args.args
             self.assertEqual(page_id_map, {"11111111111111111111111111111111": "88888"})

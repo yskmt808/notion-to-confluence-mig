@@ -42,8 +42,8 @@ class TestOutputSummarizer(unittest.TestCase):
         self.assertEqual(stats["database_rows"], 10)
         self.assertEqual(stats["max_depth"], 4)
 
-        # 本文あり行を1件追加すると通常モードでは11行全て作成対象 (2 + 1 + 11 = 14)
-        # low_rate_db_text_key=True 時は1/11(9.1% <= 20%) のため本文あり1行のみ算入 (2 + 1 + 1 = 4)
+        # 本文あり行を1件追加するとデフォルト（1ページ集約方式）では DB + 集約ページ1枚 (2 + 1 + 1 = 4)
+        # individual_db_child_threshold=1 指定時は11行全て作成対象 (2 + 1 + 11 = 14)
         db1.children.append(
             PageNode(
                 id="row_body",
@@ -52,10 +52,10 @@ class TestOutputSummarizer(unittest.TestCase):
                 blocks=[{"id": "b1", "type": "paragraph", "paragraph": {"rich_text": [{"plain_text": "詳細"}]}}],
             )
         )
-        self.assertEqual(collect_tree_stats(root)["total"], 14)
+        self.assertEqual(collect_tree_stats(root)["total"], 4)
         self.assertEqual(
-            collect_tree_stats(root, db_child_rate_threshold=20.0, low_rate_db_text_key=True)["total"],
-            4,
+            collect_tree_stats(root, individual_db_child_threshold=1)["total"],
+            14,
         )
 
     def test_tree_summary_switches_on_threshold(self):

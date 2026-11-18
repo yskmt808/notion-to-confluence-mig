@@ -249,35 +249,27 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
             orig_cwd = os.getcwd()
             os.chdir(tmpdir)
             try:
-                # 1. デフォルト閾値 (20.0%): 1/10 = 10.0% < 20.0% -> WARNING 表示
+                # 1. デフォルト (--individual-db-child-threshold 0): 1ページ集約方式 (警告なし・正常完了)
                 buf_default = io.StringIO()
                 with patch("sys.argv", ["migrate.py", "--zip", zip_path, "--dry-run", "--no-dashboard", "--checkpoint", cp_default]), \
                      redirect_stdout(buf_default):
                     migrate.main()
                 out_default = buf_default.getvalue()
-                self.assertIn("子ページ存在率が閾値 (20.0%) 未満", out_default)
-                self.assertIn("1/10件, 10.0% < 20.0%", out_default)
+                self.assertNotIn("子ページ存在率が閾値", out_default)
+                self.assertIn("DRY RUN モードのため", out_default)
 
-                # 2. --db-child-rate-threshold 10.0: 10.0% < 10.0% は False -> 警告なし
-                cp_10 = os.path.join(tmpdir, "cp_10.json")
-                buf_10 = io.StringIO()
-                with patch("sys.argv", ["migrate.py", "--zip", zip_path, "--dry-run", "--no-dashboard", "--db-child-rate-threshold", "10", "--checkpoint", cp_10]), \
-                     redirect_stdout(buf_10):
+                # 2. --individual-db-child-threshold 1: 閾値以下なので個別子ページ方式が選択可能
+                cp_1 = os.path.join(tmpdir, "cp_1.json")
+                buf_1 = io.StringIO()
+                with patch("sys.argv", ["migrate.py", "--zip", zip_path, "--dry-run", "--no-dashboard", "--individual-db-child-threshold", "1", "--checkpoint", cp_1]), \
+                     redirect_stdout(buf_1):
                     migrate.main()
-                out_10 = buf_10.getvalue()
-                self.assertNotIn("子ページ存在率が閾値", out_10)
-
-                # 3. --db-child-rate-threshold 0: 無効化
-                cp_0 = os.path.join(tmpdir, "cp_0.json")
-                buf_0 = io.StringIO()
-                with patch("sys.argv", ["migrate.py", "--zip", zip_path, "--dry-run", "--no-dashboard", "--db-child-rate-threshold", "0", "--checkpoint", cp_0]), \
-                     redirect_stdout(buf_0):
-                    migrate.main()
-                self.assertNotIn("子ページ存在率が閾値", buf_0.getvalue())
+                out_1 = buf_1.getvalue()
+                self.assertIn("DRY RUN モードのため", out_1)
             finally:
                 os.chdir(orig_cwd)
 
-        # Telemetry のみでの境界値確認
+        # Telemetry & collect_tree_stats の確認 (デフォルト1ページ集約=2, 個別子ページ=11)
         db = PageNode(
             id="db-t",
             title="Sparse",
@@ -285,9 +277,10 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
             properties={"schema": {"名前": {"type": "title"}}},
             children=[_make_row(f"rt{i}", f"R{i}", has_body=(i == 1)) for i in range(1, 11)],
         )
+        self.assertEqual(migrate.collect_tree_stats(db)["total"], 2)
+        self.assertEqual(migrate.collect_tree_stats(db, individual_db_child_threshold=1)["total"], 11)
         tel = SanitizedTelemetry()
-        tel.record_tree(db, db_child_rate_threshold=20.0)
-        self.assertEqual(tel.low_child_rate_databases_count, 1)
+        tel.record_tree(db)
         self.assertEqual(tel.skipped_bodyless_dbs_count, 0)
 
     def test_skipped_db_rows_excluded_from_dashboard_and_pass2_node_counts(self):
@@ -328,21 +321,22 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         pass2_skipped_titles = {c.args[0] for c in mock_dashboard.record_pass2_skip.call_args_list}
         self.assertEqual(pass2_skipped_titles, {"Root", "マスタDB"})
 
-    def test_low_rate_db_text_key_option_creates_only_body_rows_and_appends_link_to_text_key(self):
-        """TCK_00034: low_rate_db_text_key有効かつ存在率が閾値以下の場合、キーカラムがtext型になり本文あり行のみ子ページ作成・リンク文字列追加されること。"""
+    def test_default_aggregated_1page_mode_creates_single_detail_page_with_anchor_and_entryid_links(self):
+        """TCK_00036: デフォルトで1ページ集約方式となり、textキー+非表示hyperlink列(#見出しアンカー)+?entryId=戻りリンク(静的プロパティ表なし)が出力されること。"""
         rows = [_make_row("r_body", "本文あり行", has_body=True)] + [
             _make_row(f"r_nob_{i}", f"本文なし行{i}", has_body=False) for i in range(1, 10)
-        ]  # 1/10 = 10.0% <= 20.0%
-        db_low = PageNode(
-            id="db-low-text",
-            title="低存在率DB",
+        ]
+        db_agg = PageNode(
+            id="db-agg-1",
+            title="集約対象DB",
             node_type="database",
             properties={"schema": {"名前": {"type": "title"}, "メモ": {"type": "rich_text"}}},
             children=rows,
         )
-        root = PageNode(id="root-low", title="Root", node_type="page", children=[db_low])
+        root = PageNode(id="root-agg", title="Root", node_type="page", children=[db_agg])
 
         created_pages = []
+        updated_pages = []
         created_dbs = []
         mock_client = MagicMock()
         mock_client.base_url = "https://example.atlassian.net/wiki"
@@ -355,19 +349,26 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
             created_pages.append({"id": pid, "title": title})
             return {"id": pid, "_links": {"webui": f"/spaces/{space_key}/pages/{pid}"}}
 
+        def fake_update_page(page_id, space_key, title, body, current_version, parent_id=None):
+            updated_pages.append({"id": page_id, "title": title, "body": body})
+            return {"id": page_id}
+
         def fake_create_db(space_id, title, parent_id, csv_body):
             created_dbs.append({"title": title, "csv_body": csv_body})
-            return {"id": "db_low_1", "_links": {"webui": "/spaces/D/database/db_low_1"}}
+            return {"id": "db_agg_conf_1", "_links": {"webui": "/spaces/D/database/db_agg_conf_1"}}
 
         mock_client.create_page.side_effect = fake_create_page
+        mock_client.update_page.side_effect = fake_update_page
         mock_client.create_database.side_effect = fake_create_db
         mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
-        mock_client.get_database_entries.return_value = []
+        mock_client.get_database_entries.return_value = [
+            {"id": "entry-agg-1", "values": {"f_title": {"type": "text", "plain": "本文あり行"}}}
+        ]
         mock_client.get_page_by_id.return_value = {
             "id": "p_2",
-            "title": "本文あり行",
-            "ancestors": [{"id": "db_low_1"}],
-            "body": {"storage": {"value": "<p>Body text for 本文あり行</p>"}, "view": {"value": "<p>Body text for 本文あり行</p>"}},
+            "title": "集約対象DB - 詳細ページ一覧",
+            "ancestors": [{"id": "p_1"}],
+            "body": {"storage": {"value": "<p>agg</p>"}, "view": {"value": "<p>agg</p>"}},
             "version": {"number": 1},
         }
         mock_client.auth = ("user", "tok")
@@ -379,36 +380,43 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
             "tok",
             space_key="D",
             dashboard=mock_dashboard,
-            db_child_rate_threshold=20.0,
-            low_rate_db_text_key=True,
         )
         importer.client = mock_client
 
         mapping = importer.import_tree(root, parent_id="parent-0", overwrite=False)
 
-        # 1. Root(1) + 低存在率DB(1) + 本文あり行(1) = 3 ノードのみ作成・算入
+        # 1. Root(1) + 集約詳細ページ(1) + 集約対象DB(1) = 3 ノード作成
         mock_dashboard.start.assert_called_once_with(3)
         created_titles = [p["title"] for p in created_pages]
-        self.assertEqual(created_titles, ["Root", "本文あり行"])
-        self.assertEqual(len(mapping), 3)
+        self.assertEqual(created_titles, ["Root", "集約対象DB - 詳細ページ一覧"])
 
-        # 2. DB CSVのキーカラムが text 型、右隣に非表示のリンク型カラム(詳細ページ)が配置され、本文あり行のみURLが入ること
+        # 2. DB CSVのキーカラムが text 型、右隣に非表示の hyperlink カラム(詳細ページ)が配置され、#アンカー付きURLが入ること
         csv_body = created_dbs[0]["csv_body"]
         self.assertIn("名前,text,", csv_body)
-        self.assertIn("詳細ページ,confluence-page-link,", csv_body)
+        self.assertIn("詳細ページ,hyperlink,", csv_body)
         self.assertIn('すべてのデータ,table,"","","詳細ページ"', csv_body)
-        self.assertIn('本文あり行,https://example.atlassian.net/wiki/spaces/D/pages/p_2,""', csv_body)
+        self.assertIn("https://example.atlassian.net/wiki/spaces/D/pages/p_2#", csv_body)
         self.assertIn('本文なし行1,"",""', csv_body)
 
-        # 3. MigrationVerifier でもスキップ行で FAIL せず PASS になること
+        # 3. Pass 2で更新された集約ページに?entryId=戻りリンクがあり、静的プロパティ折りたたみ表がないこと
+        agg_updates = [u for u in updated_pages if u["id"] == "p_2"]
+        self.assertEqual(len(agg_updates), 1)
+        agg_body = agg_updates[0]["body"]
+        self.assertIn("<h2>本文あり行</h2>", agg_body)
+        self.assertIn("db_agg_conf_1?entryId=entry-agg-1", agg_body)
+        self.assertIn("DBの該当レコードを直接開く", agg_body)
+        self.assertNotIn("データベースプロパティ", agg_body)
+        self.assertNotIn("レコードプロパティ・行編集", agg_body)
+
+        # 4. MigrationVerifier でも PASS になること
         fake_db_res = MagicMock(ok=True)
-        fake_db_res.json.return_value = {"id": "db_low_1", "title": "低存在率DB", "parentId": "p_1"}
+        fake_db_res.json.return_value = {"id": "db_agg_conf_1", "title": "集約対象DB", "parentId": "p_1"}
         mock_client.get_page_by_id.side_effect = lambda pid, expand=None: (
             {"id": "p_1", "title": "Root", "ancestors": [{"id": "parent-0"}], "body": {"storage": {"value": "<p>r</p>"}, "view": {"value": "<p>r</p>"}}}
             if pid == "p_1"
-            else {"id": "p_2", "title": "本文あり行", "ancestors": [{"id": "db_low_1"}], "body": {"storage": {"value": "<p>Body text for 本文あり行</p>"}, "view": {"value": "<p>Body text for 本文あり行</p>"}}}
+            else {"id": "p_2", "title": "集約対象DB - 詳細ページ一覧", "ancestors": [{"id": "p_1"}], "body": {"storage": {"value": agg_body}, "view": {"value": agg_body}}}
         )
-        verifier = MigrationVerifier(mock_client, db_child_rate_threshold=20.0)
+        verifier = MigrationVerifier(mock_client)
         page_id_map = {nid: item["confluence_id"] for nid, item in mapping.items()}
         with patch("src.verifier.requests.get", return_value=fake_db_res):
             results = verifier.verify_tree(root, page_id_map, "parent-0")

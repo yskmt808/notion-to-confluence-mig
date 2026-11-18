@@ -2346,9 +2346,9 @@ class NotionToConfluenceConverter:
             if cand_col in existing_names:
                 cand_col = "詳細ページリンク"
             hidden_link_col_name = cand_col
-            # キーカラム(index 0)の右(index 1)に非表示のリンク型カラムを配置
-            fields.insert(1, (hidden_link_col_name, "confluence-page-link", ""))
-            field_type_map[hidden_link_col_name] = "confluence-page-link"
+            # キーカラム(index 0)の右(index 1)に非表示のハイパーリンク型カラムを配置（アンカー付きURLを保持）
+            fields.insert(1, (hidden_link_col_name, "hyperlink", ""))
+            field_type_map[hidden_link_col_name] = "hyperlink"
 
         field_lines = ["<fields>", "field_name,type,configuration"]
         for f_name, f_type, f_cfg in fields:
@@ -2696,38 +2696,19 @@ class NotionToConfluenceConverter:
             )
             parts.append(nav_panel)
 
-        # 2. プロパティ一覧テーブルのHTML生成
-        prop_rows = []
-        for k, prop in row_node.properties.items():
-            formatted_val = self.format_property_for_confluence(prop)
-            prop_rows.append(
-                f'<tr><th style="width: 150px; background-color: #f4f5f7;">{html.escape(k)}</th><td>{formatted_val}</td></tr>'
-            )
-        details_table = ""
-        if prop_rows:
-            details_table = (
-                f'<table class="wrapped"><tbody>{"".join(prop_rows)}</tbody></table>'
-            )
-
-        # 3. 折りたたみマクロ（Expand）内にネイティブ行ビューまたはフォールバックプロパティテーブルを格納
-        #    （右側プレビュー領域での展開崩れを防止し、単独閲覧時にクリックして編集・確認可能にする）
-        expand_body_parts = []
+        # 2. ネイティブ行ビュー（entry_embed_url）がある場合のみ折りたたみマクロを配置
+        #    （非連動の静的プロパティ一覧テーブルは出力しない）
         if entry_embed_url:
             escaped_embed_url = html.escape(entry_embed_url)
-            expand_body_parts.append(
-                f'<p><a href="{escaped_embed_url}" data-layout="center" data-width="100.00" data-card-appearance="embed">{escaped_embed_url}</a></p>'
+            expand_body = (
+                f'<p><a href="{escaped_embed_url}" data-layout="center" data-width="100.00" '
+                f'data-card-appearance="embed">{escaped_embed_url}</a></p>'
             )
-        elif details_table:
-            expand_body_parts.append(details_table)
-        else:
-            expand_body_parts.append("<p>レコードプロパティはありません。</p>")
-
-        if expand_body_parts:
             expand_macro = (
                 f'<ac:structured-macro ac:name="expand">'
                 f'<ac:parameter ac:name="title">📋 レコードプロパティ・行編集 (クリックして展開)</ac:parameter>'
                 f'<ac:rich-text-body>'
-                f'{"".join(expand_body_parts)}'
+                f'{expand_body}'
                 f'</ac:rich-text-body>'
                 f'</ac:structured-macro>'
             )
@@ -2739,4 +2720,42 @@ class NotionToConfluenceConverter:
             parts.append('<h2>📄 レコード詳細本文</h2>')
             parts.append(self.blocks_to_storage_format(row_node.blocks))
 
+        return "\n".join(parts)
+
+    def generate_aggregated_database_details_html(
+        self,
+        db_node: PageNode,
+        db_web_url: str,
+        row_entries: List[Tuple[PageNode, Optional[str]]],
+    ) -> str:
+        """1ページ集約方式用の詳細まとめページHTML（TOC＋各レコードH2見出し＋?entryId=戻りリンク＋本文）を生成する。"""
+        escaped_db_title = html.escape(db_node.title or "")
+        escaped_db_url = html.escape(db_web_url)
+        parts: List[str] = [
+            f'<p>📊 <strong>親データベース</strong>: <a href="{escaped_db_url}">{escaped_db_title}</a></p>',
+            '<ac:structured-macro ac:name="toc" />',
+            "<hr />",
+        ]
+        for row_node, entry_id in row_entries:
+            self.current_node_id = getattr(row_node, "id", None)
+            self.current_page_title = getattr(row_node, "title", None)
+            heading = html.escape(row_node.title or "(無題)")
+            parts.append(f"<h2>{heading}</h2>")
+            if entry_id:
+                pin_url = html.escape(f"{db_web_url}?entryId={entry_id}")
+                parts.append(
+                    f'<p style="color: #42526E; font-size: 13px;">'
+                    f'📌 <a href="{pin_url}">DBの該当レコードを直接開く</a>'
+                    f' ／ 📊 <a href="{escaped_db_url}">DBトップを開く</a>'
+                    f'</p>'
+                )
+            else:
+                parts.append(
+                    f'<p style="color: #42526E; font-size: 13px;">'
+                    f'📊 <a href="{escaped_db_url}">DBトップを開く</a>'
+                    f'</p>'
+                )
+            if row_node.blocks:
+                parts.append(self.blocks_to_storage_format(row_node.blocks))
+            parts.append("<hr />")
         return "\n".join(parts)
