@@ -586,6 +586,60 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
             self.assertFalse(mock_importer.import_tree.call_args.kwargs["overwrite"])
             self.assertIsNone(mock_importer.import_tree.call_args.kwargs["parent_id"])
 
+    def test_verify_only_runs_step3_without_import_even_after_no_verify(self):
+        """--no-verify 完了後のチェックポイントに対し、--verify-only が Step 2 をスキップして Step 3 検証のみを実行すること。"""
+        zpath = os.path.join(self.tmpdir, "export.zip")
+        _create_minimal_zip(zpath, "Verify Only Page")
+        cp_path = os.path.join(self.tmpdir, "cp_verify_only.json")
+
+        # 1. --no-verify で移行完了したチェックポイントを模擬作成
+        cp = MigrationCheckpoint(checkpoint_path=cp_path)
+        cp.source_info = {
+            "use_zip": True,
+            "zip_paths": [zpath],
+            "cli_options": {
+                "zip_paths": [zpath],
+                "no_verify": True,
+                "db_child_rate_threshold": 12.5,
+                "new_tree": True,
+            },
+        }
+        cp.record_pass1("11111111111111111111111111111111", "88888", "[HTML] Verify Only Page", "https://example/88888", "page")
+        cp.mark_completed()
+
+        # 2. --verify-only 実行: ConfluenceImporter は呼ばれず、MigrationVerifier.verify_tree が呼ばれること
+        with patch("migrate.ConfluenceImporter") as mock_importer_cls, \
+             patch("migrate.MigrationVerifier") as mock_verifier_cls, \
+             patch("src.importer.ConfluenceClient") as mock_client_cls:
+            mock_verifier = mock_verifier_cls.return_value
+            mock_verifier.verify_tree.return_value = [
+                {"title": "[HTML] Verify Only Page", "node_type": "page", "status": "OK", "details": ""}
+            ]
+
+            out, _ = self._run_main([
+                "--verify-only",
+                "--checkpoint", cp_path,
+            ], env=self.CONFLUENCE_ENV)
+
+            mock_importer_cls.assert_not_called()
+            mock_client_cls.assert_called_once()
+            mock_verifier_cls.assert_called_once_with(mock_client_cls.return_value, db_child_rate_threshold=12.5)
+            mock_verifier.verify_tree.assert_called_once()
+            _, page_id_map, parent_id = mock_verifier.verify_tree.call_args.args
+            self.assertEqual(page_id_map, {"11111111111111111111111111111111": "88888"})
+            self.assertIsNone(parent_id)
+            self.assertIn("検証のみモード完了", out)
+
+        # チェックポイントの no_verify=True 等が上書きされていないこと
+        with open(cp_path, "r", encoding="utf-8") as f:
+            after_cp = json.load(f)
+        self.assertTrue(after_cp["source_info"]["cli_options"]["no_verify"])
+
+        # 3. チェックポイント未存在時はエラー終了
+        with self.assertRaises(SystemExit) as cm:
+            self._run_main(["--verify-only", "--checkpoint", os.path.join(self.tmpdir, "missing.json")], env=self.CONFLUENCE_ENV)
+        self.assertEqual(cm.exception.code, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
