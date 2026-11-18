@@ -1005,6 +1005,7 @@ class ConfluenceImporter:
         external_mapping: Optional[Union[str, List[str]]] = None,
         db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
         low_rate_db_text_key: bool = False,
+        verify_resume_remote: bool = True,
     ):
         self.space_key = space_key
         self.checkpoint = checkpoint
@@ -1021,6 +1022,7 @@ class ConfluenceImporter:
             float(db_child_rate_threshold) if db_child_rate_threshold is not None else DEFAULT_DB_CHILD_RATE_THRESHOLD
         )
         self.low_rate_db_text_key = bool(low_rate_db_text_key)
+        self.verify_resume_remote = bool(verify_resume_remote)
         self._current_user_account_id: Optional[str] = None
         from src.timezone_util import resolve_timezone, format_iso_datetime
         self.timezone = resolve_timezone(timezone)
@@ -2592,12 +2594,15 @@ class ConfluenceImporter:
             confluence_page_id = cached["confluence_id"]
             saved_title = cached.get("title") or node.title
 
-            # Confluenceサーバー上に実在するか確認 (存在しない場合はチェックポイントを解除して再作成)
-            remote_item = (
-                self.client.get_database_by_id(confluence_page_id)
-                if node.node_type == "database"
-                else self.client.get_page_by_id(confluence_page_id)
-            )
+            # Confluenceサーバー上に実在するか確認 (verify_resume_remote=False 時はチェックポイントを信頼してAPI確認を省略)
+            if self.verify_resume_remote:
+                remote_item = (
+                    self.client.get_database_by_id(confluence_page_id)
+                    if node.node_type == "database"
+                    else self.client.get_page_by_id(confluence_page_id)
+                )
+            else:
+                remote_item = {"id": confluence_page_id}
             if not remote_item:
                 logger.warning(
                     f"[RESUME] Cached Confluence ID {confluence_page_id} for [{node.title}] (Node ID: {node.id}) "

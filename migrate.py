@@ -675,6 +675,11 @@ def main():
         help="移行後のテキストベース自動整合性検証をスキップする",
     )
     parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="移行処理（Step 2）を実行せず、チェックポイントに基づいてStep 3の整合性検証のみを実行する",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="中断された移行処理をチェックポイントから再開する (Task B.6)",
@@ -813,16 +818,21 @@ def main():
     telemetry = SanitizedTelemetry()
     checkpoint = MigrationCheckpoint(checkpoint_path=args.checkpoint, save_interval_sec=2.0, max_pending_changes=50)
 
-    if args.resume:
+    if args.resume or args.verify_only:
         loaded = checkpoint.load()
         if not loaded:
             print(f"❌ エラー: チェックポイントファイル '{args.checkpoint}' が見つからないか読み込めません。")
             sys.exit(1)
-        print(f"🔄 チェックポイントから移行を再開します: {len(checkpoint.nodes)} 件のノードが記録済み (前回の状態: {checkpoint.status})")
+        if args.verify_only:
+            print(f"🔍 チェックポイントから整合性検証（Step 3）のみを実行します: {len(checkpoint.nodes)} 件のノードが記録済み (状態: {checkpoint.status})")
+        else:
+            print(f"🔄 チェックポイントから移行を再開します: {len(checkpoint.nodes)} 件のノードが記録済み (前回の状態: {checkpoint.status})")
 
         # 前回の実行パラメータ（全CLIオプション）をチェックポイントから自動復元
         saved_source = checkpoint.source_info or {}
         restored_opts = restore_cli_options_from_checkpoint(args, parser, saved_source)
+        if args.verify_only:
+            args.no_verify = False
         if restored_opts:
             if "verbose" in restored_opts and args.verbose:
                 setup_logger(args.verbose)
@@ -1062,29 +1072,30 @@ def main():
 
     # テレメトリとチェックポイントにツリー情報を記録
     telemetry.record_tree(tree, db_child_rate_threshold=args.db_child_rate_threshold)
-    checkpoint.source_info = build_checkpoint_source_info(
-        args,
-        use_zip=use_zip,
-        zip_files=zip_files,
-        title_prefix=title_prefix,
-        notion_page_id=notion_page_id,
-        conf_parent_id=conf_parent_id,
-        conf_space=conf_space,
-        private_mode=private_mode,
-    )
-    checkpoint.space_key = conf_space or ""
-    checkpoint.parent_id = conf_parent_id
-    try:
-        checkpoint.save()
-    except CheckpointWriteError as e:
-        logging.error(f"チェックポイントの初期保存に失敗したため即時停止します: {e}")
-        print(f"❌ エラー: チェックポイントファイル '{args.checkpoint}' への書き込みに失敗しました: {e}")
-        telemetry.record_error(e, context="Step 1 Checkpoint Save")
-        if args.generate_debug_report:
-            json_p = os.path.join(args.debug_report_dir, "debug_report.json")
-            md_p = os.path.join(args.debug_report_dir, "debug_report.md")
-            telemetry.save_reports(json_path=json_p, md_path=md_p)
-        sys.exit(1)
+    if not args.verify_only:
+        checkpoint.source_info = build_checkpoint_source_info(
+            args,
+            use_zip=use_zip,
+            zip_files=zip_files,
+            title_prefix=title_prefix,
+            notion_page_id=notion_page_id,
+            conf_parent_id=conf_parent_id,
+            conf_space=conf_space,
+            private_mode=private_mode,
+        )
+        checkpoint.space_key = conf_space or ""
+        checkpoint.parent_id = conf_parent_id
+        try:
+            checkpoint.save()
+        except CheckpointWriteError as e:
+            logging.error(f"チェックポイントの初期保存に失敗したため即時停止します: {e}")
+            print(f"❌ エラー: チェックポイントファイル '{args.checkpoint}' への書き込みに失敗しました: {e}")
+            telemetry.record_error(e, context="Step 1 Checkpoint Save")
+            if args.generate_debug_report:
+                json_p = os.path.join(args.debug_report_dir, "debug_report.json")
+                md_p = os.path.join(args.debug_report_dir, "debug_report.md")
+                telemetry.save_reports(json_path=json_p, md_path=md_p)
+            sys.exit(1)
 
     print_tree_summary(
         tree,
@@ -1109,6 +1120,42 @@ def main():
             md_p = os.path.join(args.debug_report_dir, "debug_report.md")
             telemetry.save_reports(json_path=json_p, md_path=md_p)
             print(f"📋 サニタイズド診断レポートを出力しました: {json_p}, {md_p}")
+        return
+
+    def _run_step3_verification(confluence_client, target_mapping):
+        step3_start = datetime.now(resolved_tz)
+        print(f"🔍 [Step 3/3] テキストベース移行整合性を自動検証中... (開始: {step3_start.strftime('%H:%M:%S')})")
+        verifier = (
+            MigrationVerifier(confluence_client)
+            if args.db_child_rate_threshold == DEFAULT_DB_CHILD_RATE_THRESHOLD
+            else MigrationVerifier(confluence_client, db_child_rate_threshold=args.db_child_rate_threshold)
+        )
+        page_id_map = {nid: item["confluence_id"] for nid, item in target_mapping.items() if item.get("confluence_id")}
+        results = verifier.verify_tree(tree, page_id_map, conf_parent_id)
+        step3_end = datetime.now(resolved_tz)
+        elapsed = (step3_end - step3_start).total_seconds()
+        print(f"✓ Step 3 完了: 所要時間 {elapsed:.2f} 秒\n")
+        print_verification_results(results, verbose=args.verbose, show_all=args.show_all_pages)
+        return results, elapsed
+
+    if args.verify_only:
+        from src.importer import ConfluenceClient
+        verify_client = ConfluenceClient(conf_url, conf_user, conf_token)
+        mapping = checkpoint.get_migration_map()
+        if not mapping:
+            print("⚠️ 警告: チェックポイントに検証対象の移行済みノードが記録されていません。")
+        _, step3_elapsed = _run_step3_verification(verify_client, mapping)
+        end_time = datetime.now(resolved_tz)
+        total_elapsed = (end_time - start_time).total_seconds()
+        telemetry.record_timing("step1_extract_seconds", step1_elapsed)
+        telemetry.record_timing("step3_verify_seconds", step3_elapsed)
+        telemetry.record_timing("total_seconds", total_elapsed)
+        if args.generate_debug_report:
+            json_p = os.path.join(args.debug_report_dir, "debug_report.json")
+            md_p = os.path.join(args.debug_report_dir, "debug_report.md")
+            telemetry.save_reports(json_path=json_p, md_path=md_p)
+            print(f"📋 サニタイズド診断レポートを出力しました: {json_p}, {md_p}")
+        print(f"🎉 検証のみモード完了 (抽出: {step1_elapsed:.2f}s | 検証: {step3_elapsed:.2f}s | 合計: {total_elapsed:.2f}s)")
         return
 
     # Step 2: Confluenceへインポート
@@ -1149,6 +1196,7 @@ def main():
         external_mapping=args.external_mapping,
         db_child_rate_threshold=args.db_child_rate_threshold,
         low_rate_db_text_key=args.low_rate_db_text_key,
+        verify_resume_remote=not (args.resume and args.no_verify),
     )
 
     def _safe_mark_interrupted():
@@ -1258,21 +1306,7 @@ def main():
     step3_elapsed = 0.0
     verify_results = []
     if not args.no_verify:
-        step3_start = datetime.now(resolved_tz)
-        print(f"🔍 [Step 3/3] テキストベース移行整合性を自動検証中... (開始: {step3_start.strftime('%H:%M:%S')})")
-        verifier = (
-            MigrationVerifier(importer.client)
-            if args.db_child_rate_threshold == DEFAULT_DB_CHILD_RATE_THRESHOLD
-            else MigrationVerifier(importer.client, db_child_rate_threshold=args.db_child_rate_threshold)
-        )
-        page_id_map = {nid: item["confluence_id"] for nid, item in mapping.items()}
-        verify_results = verifier.verify_tree(tree, page_id_map, conf_parent_id)
-
-        step3_end = datetime.now(resolved_tz)
-        step3_elapsed = (step3_end - step3_start).total_seconds()
-        print(f"✓ Step 3 完了: 所要時間 {step3_elapsed:.2f} 秒\n")
-
-        print_verification_results(verify_results, verbose=args.verbose, show_all=args.show_all_pages)
+        verify_results, step3_elapsed = _run_step3_verification(importer.client, mapping)
 
     end_time = datetime.now(resolved_tz)
     total_elapsed = (end_time - start_time).total_seconds()
