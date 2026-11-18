@@ -275,6 +275,72 @@ class TestDatabaseConcurrencyAndResume(unittest.TestCase):
         self.assertIn(f'<a href="{expected_db_url}">課題リスト　(1)</a>', final_body)
         self.assertIn(f"{expected_db_url}?entryId=entry-imm-1", final_body)
 
+    def test_db_import_handles_null_pagelink_value_and_null_values_in_entries(self):
+        """get_database_entries の pageLink.value や values が null(None) でも 'NoneType' object is not iterable で落ちないこと。"""
+        row = PageNode(
+            id="row-null-1",
+            title="課題A",
+            node_type="database_row",
+            properties={"ステータス": {"type": "select", "select": {"name": "未着手"}, "value": "未着手"}},
+            blocks=[{"id": "b1", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": "詳細本文"}, "plain_text": "詳細本文"}]}}],
+        )
+        db = PageNode(
+            id="db-null-1",
+            title="1 0 課題DB",
+            node_type="database",
+            properties={"schema": {"ステータス": {"type": "select"}}},
+            children=[row],
+        )
+        root = PageNode(id="root-null-1", title="親ページ", node_type="page", children=[db])
+
+        importer = ConfluenceImporter("https://example.atlassian.net/wiki", "user", "token", "TEST", page_workers=1)
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_space_id.return_value = "space-1"
+        mock_client.get_page_by_title.return_value = None
+        mock_client.get_database_by_title.return_value = None
+        mock_client.create_page.side_effect = [
+            {"id": "conf-root-null", "_links": {"webui": "/spaces/TEST/pages/conf-root-null"}},
+            {"id": "conf-row-null", "_links": {"webui": "/spaces/TEST/pages/conf-row-null"}},
+        ]
+        mock_client.create_database.return_value = {
+            "id": "conf-db-null",
+            "_links": {"webui": "/spaces/TEST/database/conf-db-null"},
+        }
+        mock_client.get_page_by_id.return_value = {"id": "dummy", "version": {"number": 1}}
+        mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = [
+            {"id": "entry-null-val", "values": {"f1": {"type": "pageLink", "value": None}}},
+            {"id": "entry-null-values", "values": None},
+            {"id": "entry-valid", "values": {"f1": {"type": "pageLink", "value": [{"contentId": "conf-row-null"}]}}},
+        ]
+        importer.client = mock_client
+
+        importer.import_tree(root, parent_id="space-home", overwrite=True)
+
+        row_updates = [
+            c.kwargs for c in mock_client.update_page.call_args_list
+            if c.kwargs.get("page_id") == "conf-row-null"
+        ]
+        self.assertGreaterEqual(len(row_updates), 2)
+        self.assertIn("entryId=entry-valid", row_updates[-1]["body"])
+
+    @patch("src.importer.requests.get")
+    def test_client_get_database_entries_and_views_handle_null_results(self, mock_get):
+        """APIレスポンスが {"results": null} を返しても get_database_entries / get_database_views が [] を返すこと。"""
+        from src.importer import ConfluenceClient
+
+        mock_resp = MagicMock()
+        mock_resp.ok = True
+        mock_resp.json.return_value = {"results": None}
+        mock_get.return_value = mock_resp
+
+        client = ConfluenceClient("https://example.atlassian.net/wiki", "user", "token")
+        entries = client.get_database_entries("db-1", expected_count=0, timeout_sec=0)
+        views = client.get_database_views("db-1", retries=1, delay=0)
+        self.assertEqual(entries, [])
+        self.assertEqual(views, [])
+
 
 if __name__ == "__main__":
     unittest.main()

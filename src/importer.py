@@ -735,7 +735,9 @@ class ConfluenceClient:
                     if not res.ok:
                         break
                     data = res.json()
-                    page_results = data.get("results", [])
+                    page_results = data.get("results") or []
+                    if not isinstance(page_results, list):
+                        page_results = []
                     all_results.extend(page_results)
                     next_link = (data.get("_links") or {}).get("next")
                     if next_link and page_results:
@@ -763,7 +765,9 @@ class ConfluenceClient:
             try:
                 res = requests.get(url, auth=self.auth, timeout=15)
                 if res.ok:
-                    results = res.json().get("results", [])
+                    results = res.json().get("results") or []
+                    if not isinstance(results, list):
+                        results = []
                     if results or attempt == retries - 1:
                         return results
                 elif res.status_code == 404 and attempt < retries - 1:
@@ -1925,6 +1929,33 @@ class ConfluenceImporter:
             for n in all_nodes:
                 self._resolve_and_update_single_node(n)
 
+    @staticmethod
+    def _build_page_to_entry_map(entries: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
+        """Confluence DB エントリ一覧から pageLink の contentId -> entryId マップを構築する。"""
+        page_to_entry_map: Dict[str, str] = {}
+        for e in entries or []:
+            if not isinstance(e, dict):
+                continue
+            entry_id = e.get("id")
+            if not entry_id:
+                continue
+            values = e.get("values") or {}
+            if not isinstance(values, dict):
+                continue
+            for fval in values.values():
+                if not isinstance(fval, dict) or fval.get("type") != "pageLink":
+                    continue
+                items = fval.get("value") or []
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    cid = item.get("contentId")
+                    if cid:
+                        page_to_entry_map[str(cid)] = entry_id
+        return page_to_entry_map
+
     def _embed_row_views_concurrently(
         self,
         indexed_items: List[Tuple[PageNode, str]],
@@ -2072,14 +2103,7 @@ class ConfluenceImporter:
                 logger.info(f"[Resume] Checking indexed entries for database [{node.title}] (ID: {db_conf_id}, pending: {len(pending_ids)} pages)...")
                 # In resume / Pass 2, allow up to 25 seconds for Confluence background indexing
                 entries = self.client.get_database_entries(db_conf_id, expected_count=expected, timeout_sec=25)
-                page_to_entry_map = {}
-                for e in entries:
-                    for fid, fval in e.get("values", {}).items():
-                        if isinstance(fval, dict) and fval.get("type") == "pageLink":
-                            for item in fval.get("value", []):
-                                cid = item.get("contentId")
-                                if cid:
-                                    page_to_entry_map[str(cid)] = e["id"]
+                page_to_entry_map = self._build_page_to_entry_map(entries)
 
                 db_web_url = f"{self.client.base_url}/spaces/{self.space_key}/database/{db_conf_id}"
                 resolved_items = []
@@ -2963,14 +2987,7 @@ class ConfluenceImporter:
             logger.info(f"Checking database [{node.title}] entries index (expecting {expected} entries, non-blocking check)...")
             entries = self.client.get_database_entries(confluence_page_id, expected_count=expected, timeout_sec=3)
             logger.info(f"Retrieved {len(entries)} indexed entries from database [{node.title}] (ID: {confluence_page_id})")
-            page_to_entry_map = {}
-            for e in entries:
-                for fid, fval in e.get("values", {}).items():
-                    if isinstance(fval, dict) and fval.get("type") == "pageLink":
-                        for item in fval.get("value", []):
-                            cid = item.get("contentId")
-                            if cid:
-                                page_to_entry_map[str(cid)] = e["id"]
+            page_to_entry_map = self._build_page_to_entry_map(entries)
 
             db_web_url = f"{self.client.base_url}/spaces/{self.space_key}/database/{confluence_page_id}"
 
