@@ -509,6 +509,82 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
             self.assertEqual(cm.exception.code, 1)
             mock_notion_ext.assert_not_called()
 
+    def test_resume_persists_and_restores_all_cli_options(self):
+        """--low-rate-db-text-key を含む全CLIオプションがチェックポイントに保存され、--resume で復元・上書きできること。"""
+        zpath = os.path.join(self.tmpdir, "export.zip")
+        _create_minimal_zip(zpath, "Resume Opts Page")
+        cp_path = os.path.join(self.tmpdir, "cp_opts.json")
+
+        # 1. 初回実行（途中で中断した想定でチェックポイントに cli_options を保存）
+        with patch("migrate.ConfluenceImporter") as mock_importer_cls:
+            mock_importer = mock_importer_cls.return_value
+            mock_importer.migration_map = {}
+            mock_importer.import_tree.side_effect = MigrationCancelledException("interrupted")
+
+            with self.assertRaises(SystemExit) as cm:
+                self._run_main([
+                    "--zip", zpath,
+                    "--checkpoint", cp_path,
+                    "--low-rate-db-text-key",
+                    "--db-child-rate-threshold", "15.0",
+                    "--new-tree",
+                    "--no-overwrite",
+                    "--no-verify",
+                    "--no-dashboard",
+                    "--show-all-pages",
+                    "--show-external-warnings",
+                    "--timezone", "UTC",
+                    "--metadata-template", "none",
+                    "--page-workers", "4",
+                    "--notion-token", "ntn_secret_must_not_be_saved",
+                ], env=self.CONFLUENCE_ENV)
+            self.assertEqual(cm.exception.code, 0)
+
+        with open(cp_path, "r", encoding="utf-8") as f:
+            cp_data = json.load(f)
+        cli_opts = cp_data.get("source_info", {}).get("cli_options", {})
+        self.assertTrue(cli_opts.get("low_rate_db_text_key"))
+        self.assertEqual(cli_opts.get("db_child_rate_threshold"), 15.0)
+        self.assertTrue(cli_opts.get("new_tree"))
+        self.assertTrue(cli_opts.get("no_overwrite"))
+        self.assertTrue(cli_opts.get("no_verify"))
+        self.assertTrue(cli_opts.get("no_dashboard"))
+        self.assertTrue(cli_opts.get("show_all_pages"))
+        self.assertTrue(cli_opts.get("show_external_warnings"))
+        self.assertEqual(cli_opts.get("timezone"), "UTC")
+        self.assertEqual(cli_opts.get("metadata_template"), "none")
+        self.assertEqual(cli_opts.get("page_workers"), 4)
+        self.assertNotIn("notion_token", cli_opts)
+        self.assertNotIn("ntn_secret_must_not_be_saved", json.dumps(cp_data))
+
+        # 2. --resume 実行（オプション再指定なしで復元され、--page-workers のみ上書き可能）
+        with patch("migrate.ConfluenceImporter") as mock_importer_cls:
+            mock_importer = mock_importer_cls.return_value
+            mock_importer.migration_map = {
+                "11111111111111111111111111111111": {
+                    "confluence_id": "999",
+                    "title": "Resume Opts Page",
+                    "url": "https://example.atlassian.net/wiki/spaces/DOCS/pages/999",
+                    "node_type": "page",
+                }
+            }
+            mock_importer.import_tree.return_value = mock_importer.migration_map
+
+            out, _ = self._run_main([
+                "--resume",
+                "--checkpoint", cp_path,
+                "--page-workers", "2",
+            ], env=self.CONFLUENCE_ENV)
+
+            self.assertIn("low_rate_db_text_key", out)
+            self.assertEqual(mock_importer_cls.call_args.kwargs["page_workers"], 2)
+            self.assertEqual(mock_importer_cls.call_args.kwargs["metadata_template"], "")
+            self.assertEqual(str(mock_importer_cls.call_args.kwargs["timezone"]), "UTC")
+            self.assertTrue(mock_importer_cls.call_args.kwargs["low_rate_db_text_key"])
+            self.assertEqual(mock_importer_cls.call_args.kwargs["db_child_rate_threshold"], 15.0)
+            self.assertFalse(mock_importer.import_tree.call_args.kwargs["overwrite"])
+            self.assertIsNone(mock_importer.import_tree.call_args.kwargs["parent_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

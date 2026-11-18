@@ -469,6 +469,153 @@ def print_homonym_warnings(homonym_warnings: List[Dict[str, Any]]):
     print("")
 
 
+_RESUMABLE_CLI_OPTIONS = (
+    "notion_page_id",
+    "zip_paths",
+    "zip_dir",
+    "title_prefix",
+    "new_tree",
+    "confluence_parent_id",
+    "no_overwrite",
+    "no_verify",
+    "page_workers",
+    "generate_debug_report",
+    "debug_report_dir",
+    "enrich_via_api",
+    "import_worksheet",
+    "external_mapping",
+    "timezone",
+    "no_dashboard",
+    "user_mapping",
+    "metadata_template",
+    "show_all_pages",
+    "show_external_warnings",
+    "private",
+    "visibility",
+    "repair_inpage_links",
+    "db_child_rate_threshold",
+    "low_rate_db_text_key",
+    "verbose",
+)
+
+
+def _get_explicit_cli_dests(parser: argparse.ArgumentParser, argv: Optional[List[str]] = None) -> set:
+    """コマンドライン引数 (argv) で明示的に指定されたオプションの dest 名集合を返す。"""
+    tokens = sys.argv[1:] if argv is None else argv
+    option_to_dest: Dict[str, str] = {}
+    for action in parser._actions:
+        for opt in action.option_strings:
+            option_to_dest[opt] = action.dest
+
+    explicit: set = set()
+    for token in tokens:
+        if token == "--":
+            break
+        if not token.startswith("-") or token == "-":
+            continue
+        opt_name = token.split("=", 1)[0]
+        if opt_name in option_to_dest:
+            explicit.add(option_to_dest[opt_name])
+        elif not opt_name.startswith("--") and len(opt_name) > 2:
+            # 短縮オプションの結合 (-vp など) にも対応
+            for ch in opt_name[1:]:
+                short_opt = f"-{ch}"
+                if short_opt in option_to_dest:
+                    explicit.add(option_to_dest[short_opt])
+    return explicit
+
+
+def restore_cli_options_from_checkpoint(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    saved_source: Dict[str, Any],
+    argv: Optional[List[str]] = None,
+) -> List[str]:
+    """チェックポイントの source_info から前回の CLI オプションを args に復元する（明示指定された引数は上書きしない）。"""
+    if not isinstance(saved_source, dict):
+        return []
+
+    explicit_dests = _get_explicit_cli_dests(parser, argv=argv)
+    for dest in _RESUMABLE_CLI_OPTIONS:
+        if hasattr(args, dest) and getattr(args, dest) != parser.get_default(dest):
+            explicit_dests.add(dest)
+
+    # --zip / --zip-dir のいずれかが明示指定された場合は、もう片方をチェックポイントから復元しない
+    zip_explicit = bool({"zip_paths", "zip_dir"} & explicit_dests)
+    # --private / --visibility のいずれかが明示指定された場合は、公開範囲の上書きを防ぐ
+    visibility_explicit = bool({"private", "visibility"} & explicit_dests)
+
+    saved_cli = saved_source.get("cli_options")
+    saved_cli_dict = saved_cli if isinstance(saved_cli, dict) else {}
+
+    restored: List[str] = []
+    for dest in _RESUMABLE_CLI_OPTIONS:
+        if dest in explicit_dests:
+            continue
+        if dest in ("zip_paths", "zip_dir") and zip_explicit:
+            continue
+        if dest in ("private", "visibility") and visibility_explicit:
+            continue
+
+        if dest in saved_cli_dict:
+            val = saved_cli_dict[dest]
+        elif dest in saved_source:
+            val = saved_source[dest]
+        else:
+            continue
+
+        if val is None and getattr(args, dest, None) is None:
+            continue
+        if getattr(args, dest, None) != val:
+            setattr(args, dest, val)
+            restored.append(dest)
+
+    # 旧形式チェックポイント（cli_options 未保存、private_mode のみ保存）への後方互換フォールバック
+    if not visibility_explicit and "private" not in saved_cli_dict and "visibility" not in saved_cli_dict:
+        if saved_source.get("private_mode") and not getattr(args, "private", False):
+            args.private = True
+            args.visibility = "private"
+            restored.append("private_mode")
+
+    return restored
+
+
+def build_checkpoint_source_info(
+    args: argparse.Namespace,
+    *,
+    use_zip: bool,
+    zip_files: List[str],
+    title_prefix: Optional[str],
+    notion_page_id: Optional[str],
+    conf_parent_id: Optional[str],
+    conf_space: Optional[str],
+    private_mode: bool,
+) -> Dict[str, Any]:
+    """チェックポイントに保存する source_info（全再開可能 CLI オプションを含む）を構築する。"""
+    cli_options: Dict[str, Any] = {}
+    for dest in _RESUMABLE_CLI_OPTIONS:
+        if hasattr(args, dest):
+            cli_options[dest] = getattr(args, dest)
+
+    # 解決済みの識別子・プレフィックスも反映しておく
+    cli_options["title_prefix"] = title_prefix
+    cli_options["notion_page_id"] = notion_page_id
+    cli_options["confluence_parent_id"] = conf_parent_id
+
+    return {
+        "use_zip": use_zip,
+        "zip_paths": zip_files,
+        "zip_dir": args.zip_dir,
+        "title_prefix": title_prefix,
+        "notion_page_id": notion_page_id,
+        "confluence_parent_id": conf_parent_id,
+        "space_key": conf_space,
+        "page_workers": args.page_workers,
+        "private_mode": private_mode,
+        "cli_options": cli_options,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Notion to Confluence Migration Tool")
     parser.add_argument(
@@ -673,28 +820,14 @@ def main():
             sys.exit(1)
         print(f"🔄 チェックポイントから移行を再開します: {len(checkpoint.nodes)} 件のノードが記録済み (前回の状態: {checkpoint.status})")
 
-        # 前回の実行パラメータをチェックポイントから自動復元
+        # 前回の実行パラメータ（全CLIオプション）をチェックポイントから自動復元
         saved_source = checkpoint.source_info or {}
-        if not args.zip_dir and not args.zip_paths:
-            if saved_source.get("zip_dir"):
-                args.zip_dir = saved_source["zip_dir"]
-                logging.info(f"[Resume] チェックポイントから --zip-dir '{args.zip_dir}' を自動復元しました。")
-            elif saved_source.get("zip_paths"):
-                args.zip_paths = saved_source["zip_paths"]
-                logging.info(f"[Resume] チェックポイントから --zip '{args.zip_paths}' を自動復元しました。")
-        if args.title_prefix is None and saved_source.get("title_prefix") is not None:
-            args.title_prefix = saved_source["title_prefix"]
-            logging.info(f"[Resume] チェックポイントから --title-prefix '{args.title_prefix}' を自動復元しました。")
-        if not args.notion_page_id and saved_source.get("notion_page_id"):
-            args.notion_page_id = saved_source["notion_page_id"]
-        if not args.confluence_parent_id and saved_source.get("confluence_parent_id"):
-            args.confluence_parent_id = saved_source["confluence_parent_id"]
-        if saved_source.get("page_workers") and args.page_workers == 8:
-            args.page_workers = saved_source["page_workers"]
-        if not args.private and args.visibility is None and saved_source.get("private_mode"):
-            args.private = True
-            args.visibility = "private"
-            logging.info("[Resume] チェックポイントから private_mode=True (--visibility private) を自動復元しました。")
+        restored_opts = restore_cli_options_from_checkpoint(args, parser, saved_source)
+        if restored_opts:
+            if "verbose" in restored_opts and args.verbose:
+                setup_logger(args.verbose)
+            logging.info(f"[Resume] チェックポイントから前回のオプションを自動復元しました: {', '.join(restored_opts)}")
+            print(f"   復元された前回オプション: {', '.join(restored_opts)}")
 
     # SIGINT/SIGTERM 安全中断ハンドラーの登録 (Task B.7)
     def _on_cancel_checkpoint():
@@ -929,17 +1062,16 @@ def main():
 
     # テレメトリとチェックポイントにツリー情報を記録
     telemetry.record_tree(tree, db_child_rate_threshold=args.db_child_rate_threshold)
-    checkpoint.source_info = {
-        "use_zip": use_zip,
-        "zip_paths": zip_files,
-        "zip_dir": args.zip_dir,
-        "title_prefix": title_prefix,
-        "notion_page_id": notion_page_id,
-        "confluence_parent_id": conf_parent_id,
-        "space_key": conf_space,
-        "page_workers": args.page_workers,
-        "private_mode": private_mode,
-    }
+    checkpoint.source_info = build_checkpoint_source_info(
+        args,
+        use_zip=use_zip,
+        zip_files=zip_files,
+        title_prefix=title_prefix,
+        notion_page_id=notion_page_id,
+        conf_parent_id=conf_parent_id,
+        conf_space=conf_space,
+        private_mode=private_mode,
+    )
     checkpoint.space_key = conf_space or ""
     checkpoint.parent_id = conf_parent_id
     try:
