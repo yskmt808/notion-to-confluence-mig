@@ -328,6 +328,92 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         pass2_skipped_titles = {c.args[0] for c in mock_dashboard.record_pass2_skip.call_args_list}
         self.assertEqual(pass2_skipped_titles, {"Root", "マスタDB"})
 
+    def test_low_rate_db_text_key_option_creates_only_body_rows_and_appends_link_to_text_key(self):
+        """TCK_00034: low_rate_db_text_key有効かつ存在率が閾値以下の場合、キーカラムがtext型になり本文あり行のみ子ページ作成・リンク文字列追加されること。"""
+        rows = [_make_row("r_body", "本文あり行", has_body=True)] + [
+            _make_row(f"r_nob_{i}", f"本文なし行{i}", has_body=False) for i in range(1, 10)
+        ]  # 1/10 = 10.0% <= 20.0%
+        db_low = PageNode(
+            id="db-low-text",
+            title="低存在率DB",
+            node_type="database",
+            properties={"schema": {"名前": {"type": "title"}, "メモ": {"type": "rich_text"}}},
+            children=rows,
+        )
+        root = PageNode(id="root-low", title="Root", node_type="page", children=[db_low])
+
+        created_pages = []
+        created_dbs = []
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_space_id.return_value = "space-1"
+        mock_client.get_page_by_title.return_value = None
+        mock_client.get_database_by_title.return_value = None
+
+        def fake_create_page(space_key, title, body, parent_id=None):
+            pid = f"p_{len(created_pages) + 1}"
+            created_pages.append({"id": pid, "title": title})
+            return {"id": pid, "_links": {"webui": f"/spaces/{space_key}/pages/{pid}"}}
+
+        def fake_create_db(space_id, title, parent_id, csv_body):
+            created_dbs.append({"title": title, "csv_body": csv_body})
+            return {"id": "db_low_1", "_links": {"webui": "/spaces/D/database/db_low_1"}}
+
+        mock_client.create_page.side_effect = fake_create_page
+        mock_client.create_database.side_effect = fake_create_db
+        mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = []
+        mock_client.get_page_by_id.return_value = {
+            "id": "p_2",
+            "title": "本文あり行",
+            "ancestors": [{"id": "db_low_1"}],
+            "body": {"storage": {"value": "<p>Body text for 本文あり行</p>"}, "view": {"value": "<p>Body text for 本文あり行</p>"}},
+            "version": {"number": 1},
+        }
+        mock_client.auth = ("user", "tok")
+
+        mock_dashboard = MagicMock()
+        importer = ConfluenceImporter(
+            "https://example.atlassian.net/wiki",
+            "user",
+            "tok",
+            space_key="D",
+            dashboard=mock_dashboard,
+            db_child_rate_threshold=20.0,
+            low_rate_db_text_key=True,
+        )
+        importer.client = mock_client
+
+        mapping = importer.import_tree(root, parent_id="parent-0", overwrite=False)
+
+        # 1. Root(1) + 低存在率DB(1) + 本文あり行(1) = 3 ノードのみ作成・算入
+        mock_dashboard.start.assert_called_once_with(3)
+        created_titles = [p["title"] for p in created_pages]
+        self.assertEqual(created_titles, ["Root", "本文あり行"])
+        self.assertEqual(len(mapping), 3)
+
+        # 2. DB CSVのキーカラムが text 型で、本文あり行にはリンク文字列が追記され、本文なし行はタイトルのみであること
+        csv_body = created_dbs[0]["csv_body"]
+        self.assertIn("名前,text,", csv_body)
+        self.assertNotIn("confluence-page-link", csv_body)
+        self.assertIn("本文あり行 (https://example.atlassian.net/wiki/spaces/D/pages/p_2)", csv_body)
+        self.assertIn("本文なし行1,", csv_body)
+        self.assertNotIn("本文なし行1 (", csv_body)
+
+        # 3. MigrationVerifier でもスキップ行で FAIL せず PASS になること
+        fake_db_res = MagicMock(ok=True)
+        fake_db_res.json.return_value = {"id": "db_low_1", "title": "低存在率DB", "parentId": "p_1"}
+        mock_client.get_page_by_id.side_effect = lambda pid, expand=None: (
+            {"id": "p_1", "title": "Root", "ancestors": [{"id": "parent-0"}], "body": {"storage": {"value": "<p>r</p>"}, "view": {"value": "<p>r</p>"}}}
+            if pid == "p_1"
+            else {"id": "p_2", "title": "本文あり行", "ancestors": [{"id": "db_low_1"}], "body": {"storage": {"value": "<p>Body text for 本文あり行</p>"}, "view": {"value": "<p>Body text for 本文あり行</p>"}}}
+        )
+        verifier = MigrationVerifier(mock_client, db_child_rate_threshold=20.0)
+        page_id_map = {nid: item["confluence_id"] for nid, item in mapping.items()}
+        with patch("src.verifier.requests.get", return_value=fake_db_res):
+            results = verifier.verify_tree(root, page_id_map, "parent-0")
+        self.assertFalse(any(r["status"] == "FAIL" for r in results), f"Unexpected FAIL: {results}")
+
 
 if __name__ == "__main__":
     unittest.main()

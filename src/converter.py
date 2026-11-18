@@ -2363,6 +2363,9 @@ class NotionToConfluenceConverter:
                 if not row_title_val:
                     title_prop = child.properties.get(key_col_name)
                     row_title_val = self._format_prop_for_csv(title_prop, key_col_name, child.title)
+                child_link = str(page_link_map.get(child.id, "")).strip()
+                if child_link:
+                    row_title_val = f"{row_title_val} ({child_link})" if row_title_val else child_link
                 row_cells.append(self._escape_csv_cell(row_title_val))
             else:
                 child_link = str(page_link_map.get(child.id, "")).strip()

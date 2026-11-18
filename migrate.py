@@ -622,6 +622,11 @@ def main():
         help="DB行レコードの本文/子ページ存在率がこの値(%%)未満の場合にWARNINGを表示する閾値 (0で無効, デフォルト: 20.0)",
     )
     parser.add_argument(
+        "--low-rate-db-text-key",
+        action="store_true",
+        help="DBレコードの子ページ存在率が閾値(--db-child-rate-threshold)以下の場合に、キーカラムをtext型にし、本文あり行のみ子ページを作成してリンク文字列を追加する",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="詳細ログを出力する",
@@ -977,6 +982,8 @@ def main():
         prune_blocks_on_pass2=(args.no_verify and not args.repair_inpage_links),
         title_prefix=title_prefix,
         external_mapping=args.external_mapping,
+        db_child_rate_threshold=args.db_child_rate_threshold,
+        low_rate_db_text_key=args.low_rate_db_text_key,
     )
 
     def _safe_mark_interrupted():

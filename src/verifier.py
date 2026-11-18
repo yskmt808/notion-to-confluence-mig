@@ -16,6 +16,7 @@ from src.extractor import (
     DEFAULT_DB_CHILD_RATE_THRESHOLD,
     PageNode,
     analyze_database_child_page_stats,
+    database_row_has_substantive_body,
     format_low_child_rate_warning,
     get_node_external_synced_blocks,
     get_node_missing_zip_attachments,
@@ -806,8 +807,11 @@ class MigrationVerifier:
 
         # 子ページの検証 (本文なしDBで子ページ作成をスキップした行および空行はスキップ)
         if not skip_db_children:
+            low_rate_text_key = bool(getattr(node, "_low_rate_text_key_mode", False))
             for child in node.children:
                 if node.node_type == "database" and is_empty_database_row(child):
+                    continue
+                if node.node_type == "database" and low_rate_text_key and not database_row_has_substantive_body(child):
                     continue
                 results.extend(self.verify_tree(child, page_id_map, this_parent_id, _analyze_root=False))
 

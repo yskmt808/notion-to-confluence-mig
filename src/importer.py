@@ -24,9 +24,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import requests
 from src.extractor import (
+    DEFAULT_DB_CHILD_RATE_THRESHOLD,
     PageNode,
     analyze_database_child_page_stats,
     classify_external_app_url,
+    database_row_has_substantive_body,
     is_broken_or_placeholder_url,
     is_empty_database_row as _shared_is_empty_database_row,
     is_unsupported_page_element_block,
@@ -995,6 +997,8 @@ class ConfluenceImporter:
         prune_blocks_on_pass2: bool = False,
         title_prefix: Optional[str] = None,
         external_mapping: Optional[Union[str, List[str]]] = None,
+        db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
+        low_rate_db_text_key: bool = False,
     ):
         self.space_key = space_key
         self.checkpoint = checkpoint
@@ -1007,6 +1011,10 @@ class ConfluenceImporter:
         self.private_mode = private_mode
         self.prune_blocks_on_pass2 = prune_blocks_on_pass2
         self.title_prefix = title_prefix or ""
+        self.db_child_rate_threshold = (
+            float(db_child_rate_threshold) if db_child_rate_threshold is not None else DEFAULT_DB_CHILD_RATE_THRESHOLD
+        )
+        self.low_rate_db_text_key = bool(low_rate_db_text_key)
         self._current_user_account_id: Optional[str] = None
         from src.timezone_util import resolve_timezone, format_iso_datetime
         self.timezone = resolve_timezone(timezone)
@@ -1625,8 +1633,15 @@ class ConfluenceImporter:
         def _count_tree_nodes(n: PageNode) -> int:
             if n.node_type == "database_row" and self.is_empty_database_row(n):
                 return 0
-            if n.node_type == "database" and analyze_database_child_page_stats(n)["skip_child_pages"]:
-                return 1
+            if n.node_type == "database":
+                if analyze_database_child_page_stats(n)["skip_child_pages"]:
+                    return 1
+                if self._is_low_rate_text_key_db(n):
+                    return 1 + sum(
+                        _count_tree_nodes(c)
+                        for c in n.children
+                        if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
+                    )
             return 1 + sum(_count_tree_nodes(c) for c in n.children)
         total_nodes = _count_tree_nodes(root_node)
         if self.dashboard:
@@ -1872,6 +1887,17 @@ class ConfluenceImporter:
             node.blocks = []
             node.properties = {}
 
+    def _is_low_rate_text_key_db(self, db_node: PageNode) -> bool:
+        """low_rate_db_text_key 有効時に、DBの子ページ存在率が閾値以下（0%超）でtextキー化対象かを判定する。"""
+        if not self.low_rate_db_text_key or self.db_child_rate_threshold <= 0:
+            return False
+        db_stats = analyze_database_child_page_stats(db_node)
+        return bool(
+            db_stats["total_rows"] > 0
+            and db_stats["body_rows"] > 0
+            and db_stats["body_ratio_pct"] <= self.db_child_rate_threshold
+        )
+
     def _resolve_and_update_page_links(self, root_node: PageNode):
         """パス2: 全データベースおよびページの作成完了後、相互リンクおよび埋め込みDBビューを完全に解決して更新する（並行実行）。"""
         all_nodes: List[PageNode] = []
@@ -1879,11 +1905,17 @@ class ConfluenceImporter:
             if n.node_type == "database_row" and self.is_empty_database_row(n):
                 return
             all_nodes.append(n)
-            if n.node_type == "database" and (
-                getattr(n, "_skipped_row_child_pages", False)
-                or analyze_database_child_page_stats(n)["skip_child_pages"]
-            ):
-                return
+            if n.node_type == "database":
+                if (
+                    getattr(n, "_skipped_row_child_pages", False)
+                    or analyze_database_child_page_stats(n)["skip_child_pages"]
+                ):
+                    return
+                if getattr(n, "_low_rate_text_key_mode", False) or self._is_low_rate_text_key_db(n):
+                    for c in n.children:
+                        if not self.is_empty_database_row(c) and database_row_has_substantive_body(c):
+                            _collect(c)
+                    return
             for c in n.children:
                 _collect(c)
         _collect(root_node)
@@ -2485,12 +2517,19 @@ class ConfluenceImporter:
         """データベース行が完全に空レコード（タイトル無題、本文なし、プロパティ値なし）であるかを判定する。"""
         return _shared_is_empty_database_row(row_node)
 
-    def _register_skipped_db_rows(self, db_node: PageNode, db_url: str) -> None:
+    def _register_skipped_db_rows(
+        self,
+        db_node: PageNode,
+        db_url: str,
+        skip_only_bodyless: bool = False,
+    ) -> None:
         """子ページ作成をスキップしたDB行の参照フォールバック情報を converter へ登録する。"""
         if not hasattr(self, "converter") or not hasattr(self.converter, "skipped_db_rows"):
             return
         with self._lock:
             for child in (db_node.children or []):
+                if skip_only_bodyless and database_row_has_substantive_body(child):
+                    continue
                 info = {
                     "title": child.title,
                     "db_id": db_node.id,
@@ -2581,6 +2620,21 @@ class ConfluenceImporter:
                 if node.node_type == "database" and analyze_database_child_page_stats(node)["skip_child_pages"]:
                     node._skipped_row_child_pages = True
                     self._register_skipped_db_rows(node, confluence_url)
+                elif node.node_type == "database" and self._is_low_rate_text_key_db(node):
+                    node._low_rate_text_key_mode = True
+                    self._register_skipped_db_rows(node, confluence_url, skip_only_bodyless=True)
+                    body_children = [
+                        c for c in (node.children or [])
+                        if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
+                    ]
+                    if body_children:
+                        self._import_children_concurrently(
+                            parent_node=node,
+                            children=body_children,
+                            parent_id=confluence_page_id,
+                            overwrite=overwrite,
+                            allow_sub_parallel=allow_sub_parallel,
+                        )
                 elif node.children:
                     self._import_children_concurrently(
                         parent_node=node,
@@ -2633,7 +2687,10 @@ class ConfluenceImporter:
 
             db_stats = analyze_database_child_page_stats(node)
             skip_row_pages = bool(db_stats["skip_child_pages"])
+            is_low_rate_text_key = (not skip_row_pages) and self._is_low_rate_text_key_db(node)
+            use_text_title = skip_row_pages or is_low_rate_text_key
             node._skipped_row_child_pages = skip_row_pages
+            node._low_rate_text_key_mode = is_low_rate_text_key
 
             # 1. 先に子ページ（各行レコード詳細）を作成してリンクURLとIDを確定
             child_link_map = {}
@@ -2644,12 +2701,21 @@ class ConfluenceImporter:
                     f"(0/{db_stats['total_rows']} rows have substantive body -> title column uses 'text')."
                 )
             else:
+                if is_low_rate_text_key:
+                    logger.info(
+                        f"Low child-page rate DB [{node.title}] ({db_stats['body_rows']}/{db_stats['total_rows']} rows, "
+                        f"{db_stats['body_ratio_pct']:.1f}% <= {self.db_child_rate_threshold:.1f}%): "
+                        f"using 'text' key column and creating child pages only for rows with substantive body."
+                    )
                 for child in node.children:
                     child.parent_db_title = node.title
                     if existing_db_url:
                         child.parent_db_url = existing_db_url
                     if self.is_empty_database_row(child):
                         logger.info(f"Skipping empty database row child page: [{child.title}] (ID: {child.id})")
+                        continue
+                    if is_low_rate_text_key and not database_row_has_substantive_body(child):
+                        logger.debug(f"Skipping bodyless row child page in low-rate text-key DB [{node.title}]: [{child.title}]")
                         continue
                     if self.checkpoint and self.checkpoint.is_pass1_done(child.id):
                         cached = self.checkpoint.get_node_info(child.id)
@@ -2709,7 +2775,7 @@ class ConfluenceImporter:
                 csv_body = self.converter.generate_database_csv(
                     node,
                     child_link_map,
-                    use_text_title=skip_row_pages,
+                    use_text_title=use_text_title,
                 )
 
                 # 3. Confluence Database を新規作成
@@ -2743,6 +2809,8 @@ class ConfluenceImporter:
 
             if skip_row_pages:
                 self._register_skipped_db_rows(node, confluence_url)
+            elif is_low_rate_text_key:
+                self._register_skipped_db_rows(node, confluence_url, skip_only_bodyless=True)
 
             # プライベート移行モード（DBルート作成直後の即時ロック）
             self._apply_root_private_restriction(node, confluence_page_id)
@@ -2921,6 +2989,8 @@ class ConfluenceImporter:
             for child in node.children:
                 child.parent_db_title = node.title
                 child.parent_db_url = db_web_url
+                if child.id not in child_link_map:
+                    continue
                 with self._lock:
                     c_info = self.migration_map.get(child.id)
                 if c_info:
@@ -2929,7 +2999,8 @@ class ConfluenceImporter:
                         indexed_children.append((child, page_to_entry_map[c_id]))
                     else:
                         pending_children.append(child)
-                        pending_child_ids.append(child.id)
+                        if not is_low_rate_text_key:
+                            pending_child_ids.append(child.id)
 
             if indexed_children:
                 self._embed_row_views_concurrently(indexed_children, db_web_url, confluence_page_id)
