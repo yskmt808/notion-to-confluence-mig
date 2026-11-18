@@ -648,19 +648,29 @@ class HtmlZipExtractor:
         # データベースの場合、CSVから各行レコードを抽出して子ノードとして追加
         if is_database:
             csv_path = db_csv_map[node_id]
-            self._attach_database_rows(zf, node, csv_path, html_file)
+            self._attach_database_rows(zf, node, csv_path, html_file, db_csv_map=db_csv_map)
             return node
 
         # 通常ページの場合、同名フォルダ内の子ページ/子データベースを走査
+        node.children.extend(self._collect_child_nodes_in_dir(zf, html_file, db_csv_map))
+        return node
+
+    def _collect_child_nodes_in_dir(
+        self,
+        zf: zipfile.ZipFile,
+        parent_html_file: str,
+        db_csv_map: Dict[str, str],
+    ) -> List[PageNode]:
+        """親HTMLファイルと同名のサブフォルダ内にある子ページ(.html)および単独DB(.csv)を再帰構築する。"""
         # Notionエクスポートでは `{タイトル} {ID}.html` に対して `{タイトル}/` というフォルダ内に配下の子ファイルが格納される
-        sub_dir = re.sub(r"\s+[0-9a-fA-F]{32}\.html$", "", html_file)
-        if sub_dir == html_file:
-            sub_dir = os.path.splitext(html_file)[0]
+        sub_dir = re.sub(r"\s+[0-9a-fA-F]{32}\.html$", "", parent_html_file)
+        if sub_dir == parent_html_file:
+            sub_dir = os.path.splitext(parent_html_file)[0]
         sub_dir = sub_dir + "/"
 
         dir_children = getattr(self, "_dir_direct_children", {}).get(sub_dir)
         if not dir_children:
-            alt_sub_dir = os.path.splitext(html_file)[0] + "/"
+            alt_sub_dir = os.path.splitext(parent_html_file)[0] + "/"
             alt_children = getattr(self, "_dir_direct_children", {}).get(alt_sub_dir)
             if alt_children:
                 sub_dir = alt_sub_dir
@@ -669,21 +679,22 @@ class HtmlZipExtractor:
         if dir_children is None:
             dir_children = [
                 f for f in zf.namelist()
-                if f.startswith(sub_dir) and f != html_file and len(f[len(sub_dir):].split("/")) == 1
+                if f.startswith(sub_dir) and f != parent_html_file and len(f[len(sub_dir):].split("/")) == 1
             ]
 
         # .html ファイルを優先して処理し、同一DBに対する単独CSVノードの重複生成を防止する
         sorted_dir_children = sorted(dir_children, key=lambda x: (0 if x.endswith(".html") else 1, x))
         processed_bases = set()
         processed_uuids = set()
+        children_nodes: List[PageNode] = []
         for f in sorted_dir_children:
-            if f != html_file:
+            if f != parent_html_file:
                 base_f = os.path.splitext(f)[0]
                 f_uids = UUID_PATTERN.findall(os.path.basename(f))
                 f_norm_id = normalize_id(f_uids[-1]) if f_uids else None
                 if f.endswith(".html"):
                     child_node = self._build_page_node(zf, f, db_csv_map, parent_dir=sub_dir)
-                    node.children.append(child_node)
+                    children_nodes.append(child_node)
                     processed_bases.add(base_f)
                     if f_norm_id:
                         processed_uuids.add(f_norm_id)
@@ -693,17 +704,22 @@ class HtmlZipExtractor:
                     # 対応するHTMLが存在しない単独CSVデータベースの場合
                     already_processed = base_f in processed_bases or (f_norm_id and f_norm_id in processed_uuids)
                     if not already_processed:
-                        child_db_node = self._build_database_node_from_csv(zf, f)
-                        node.children.append(child_db_node)
+                        child_db_node = self._build_database_node_from_csv(zf, f, db_csv_map=db_csv_map)
+                        children_nodes.append(child_db_node)
                         processed_bases.add(base_f)
                         if f_norm_id:
                             processed_uuids.add(f_norm_id)
                         if getattr(child_db_node, "id", None):
                             processed_uuids.add(normalize_id(child_db_node.id))
 
-        return node
+        return children_nodes
 
-    def _build_database_node_from_csv(self, zf: zipfile.ZipFile, csv_file: str) -> PageNode:
+    def _build_database_node_from_csv(
+        self,
+        zf: zipfile.ZipFile,
+        csv_file: str,
+        db_csv_map: Optional[Dict[str, str]] = None,
+    ) -> PageNode:
         """HTMLファイルが存在しない単独のCSVファイルから直接データベースPageNodeを構築する。"""
         filename = os.path.basename(csv_file)
         base_name = os.path.splitext(filename)[0]
@@ -732,7 +748,7 @@ class HtmlZipExtractor:
 
         # レコードの読み込み（仮想的なHTMLパスを渡して同名フォルダ内の行HTMLも探す）
         fake_html_path = os.path.splitext(csv_file)[0] + ".html"
-        self._attach_database_rows(zf, db_node, csv_file, fake_html_path)
+        self._attach_database_rows(zf, db_node, csv_file, fake_html_path, db_csv_map=db_csv_map)
         logger.info(f"Built database PageNode from standalone CSV: [{db_node.title}] (ID: {db_id}, {len(db_node.children)} rows)")
         return db_node
 
@@ -742,6 +758,7 @@ class HtmlZipExtractor:
         db_node: PageNode,
         csv_path: str,
         db_html_path: str,
+        db_csv_map: Optional[Dict[str, str]] = None,
     ):
         """CSVおよび同名ディレクトリ内の行レコードHTMLファイルを解析し、db_node.childrenに格納する。"""
         raw_csv = zf.read(csv_path).decode("utf-8-sig")
@@ -968,6 +985,7 @@ class HtmlZipExtractor:
             row_comments = []
             row_icon = None
             row_cover = None
+            row_children: List[PageNode] = []
             row_html_props: Dict[str, Dict[str, Any]] = {}
             if row_html_file and (row_html_file in file_set if file_set is not None else row_html_file in zf.namelist()):
                 row_soup = BeautifulSoup(zf.read(row_html_file).decode("utf-8"), "html.parser")
@@ -978,9 +996,12 @@ class HtmlZipExtractor:
                     row_html_props = self._extract_properties_from_table(row_prop_table, col_types_out=col_html_types)
                 row_body = row_soup.find(class_="page-body")
                 if row_body:
-                    row_blocks = self._parse_elements_to_blocks(row_body, zf, os.path.dirname(row_html_file))
+                    row_blocks = self._parse_elements_to_blocks(
+                        row_body, zf, os.path.dirname(row_html_file), db_csv_map=db_csv_map
+                    )
                 row_comments = self._extract_page_comments(row_soup)
                 row_soup.decompose()
+                row_children = self._collect_child_nodes_in_dir(zf, row_html_file, db_csv_map or {})
 
             for col_name, val in clean_row.items():
                 if not col_name or col_name == title_col_name:
@@ -1003,6 +1024,7 @@ class HtmlZipExtractor:
                 "row_comments": row_comments,
                 "row_icon": row_icon,
                 "row_cover": row_cover,
+                "row_children": row_children,
             })
             if idx % 500 == 0:
                 gc.collect()
@@ -1192,7 +1214,7 @@ class HtmlZipExtractor:
                 cover=staged["row_cover"],
                 properties=row_properties,
                 blocks=row_blocks,
-                children=[],
+                children=staged.get("row_children") or [],
                 comments=staged["row_comments"],
                 created_by=row_created_by,
                 last_edited_by=row_last_edited_by,

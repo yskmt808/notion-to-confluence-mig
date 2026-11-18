@@ -958,6 +958,54 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
             importer.client.upload_attachment.assert_called_once()
             importer.client.set_page_cover.assert_called_once_with("9002", "uuid-local-5678", position=75)
 
+    def test_database_row_child_page_inline_database_extracted_and_resolved(self):
+        """TCK_00033: DBレコード子ページ内で定義されたインラインDBおよび子ページがrow_node.childrenに取り込まれ参照解決されること。"""
+        root_id = "11111111111111111111111111111111"
+        parent_db_id = "22222222222222222222222222222222"
+        row_id = "33333333333333333333333333333333"
+        nested_db_id = "44444444444444444444444444444444"
+
+        root_html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Root</title></head>
+<body><article id="{root_id}" class="page sans"><header><h1 class="page-title">Root</h1></header>
+<div class="page-body"><div class="collection-content" id="v-parent"><h4 class="collection-title">親DB</h4></div></div>
+</article></body></html>"""
+
+        row_html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>案件A</title></head>
+<body><article id="{row_id}" class="page sans"><header><h1 class="page-title">案件A</h1></header>
+<div class="page-body"><div class="collection-content" id="v-nested"><h4 class="collection-title">サブタスクDB</h4></div></div>
+</article></body></html>"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zpath = os.path.join(tmpdir, "nested_row_db.zip")
+            with zipfile.ZipFile(zpath, "w") as zf:
+                zf.writestr(f"Root {root_id}.html", root_html)
+                zf.writestr(f"Root/親DB {parent_db_id}.csv", "名前,メモ\n案件A,test\n")
+                zf.writestr(f"Root/親DB/案件A {row_id}.html", row_html)
+                zf.writestr(f"Root/親DB/案件A/サブタスクDB {nested_db_id}.csv", "タスク,状態\nTask1,Open\n")
+
+            tree = HtmlZipExtractor(zpath).extract_tree()
+
+        parent_db = next(c for c in tree.children if c.node_type == "database")
+        self.assertEqual(len(parent_db.children), 1)
+        row_node = parent_db.children[0]
+        self.assertEqual(row_node.title, "案件A")
+
+        # row_node.children にサブタスクDBが構築されていること
+        self.assertEqual(len(row_node.children), 1)
+        nested_db = row_node.children[0]
+        self.assertEqual(nested_db.node_type, "database")
+        self.assertEqual(nested_db.title, "サブタスクDB")
+        self.assertEqual(nested_db.id.replace("-", ""), nested_db_id)
+
+        # row_node 本文内の child_database ブロックが外部DB扱いにならず実DB IDに解決されていること
+        self.assertEqual(row_node.unresolved_external_dbs, [])
+        db_blocks = [b for b in row_node.blocks if b.get("type") == "child_database"]
+        self.assertEqual(len(db_blocks), 1)
+        self.assertEqual(db_blocks[0]["database_id"].replace("-", ""), nested_db_id)
+        self.assertFalse(db_blocks[0].get("_is_unresolved_external_db", False))
+
 
 if __name__ == "__main__":
     unittest.main()
