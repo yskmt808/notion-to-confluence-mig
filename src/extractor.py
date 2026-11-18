@@ -1401,3 +1401,50 @@ class NotionExtractor:
                 raw_val = p.get(p_type)
                 parsed[name] = {"type": p_type or "unknown", "value": str(raw_val) if raw_val is not None else ""}
         return parsed
+
+
+def is_low_rate_text_key_database(
+    db_node: Any,
+    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
+    low_rate_db_text_key: bool = False,
+) -> bool:
+    """low_rate_db_text_key 有効時に、DBの子ページ存在率が閾値以下（0%超）でtextキー化対象かを判定する。"""
+    if not low_rate_db_text_key or db_child_rate_threshold is None or db_child_rate_threshold <= 0:
+        return False
+    db_stats = analyze_database_child_page_stats(db_node)
+    return bool(
+        db_stats["total_rows"] > 0
+        and db_stats["body_rows"] > 0
+        and db_stats["body_ratio_pct"] <= float(db_child_rate_threshold)
+    )
+
+
+def count_migratable_nodes(
+    root_node: Any,
+    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
+    low_rate_db_text_key: bool = False,
+) -> int:
+    """Confluence上で実際に作成・移行されるノード数（ダッシュボード母数と一致）を算出する。"""
+    if not root_node:
+        return 0
+
+    def _count(n: Any) -> int:
+        ntype = getattr(n, "node_type", "")
+        if ntype == "database_row" and is_empty_database_row(n):
+            return 0
+        if ntype == "database":
+            if analyze_database_child_page_stats(n)["skip_child_pages"]:
+                return 1
+            if is_low_rate_text_key_database(
+                n,
+                db_child_rate_threshold=db_child_rate_threshold,
+                low_rate_db_text_key=low_rate_db_text_key,
+            ):
+                return 1 + sum(
+                    _count(c)
+                    for c in (getattr(n, "children", None) or [])
+                    if not is_empty_database_row(c) and database_row_has_substantive_body(c)
+                )
+        return 1 + sum(_count(c) for c in (getattr(n, "children", None) or []))
+
+    return _count(root_node)

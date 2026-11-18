@@ -28,9 +28,11 @@ from src.extractor import (
     PageNode,
     analyze_database_child_page_stats,
     classify_external_app_url,
+    count_migratable_nodes,
     database_row_has_substantive_body,
     is_broken_or_placeholder_url,
     is_empty_database_row as _shared_is_empty_database_row,
+    is_low_rate_text_key_database,
     is_unsupported_page_element_block,
     normalize_db_title,
 )
@@ -1629,21 +1631,12 @@ class ConfluenceImporter:
                             logger.debug(f"Could not auto-create gallery view for DB {db_conf_id}: {e}")
 
         # ダッシュボードの開始 (Task B.10)
-        # 子ページを作成しないDB（skip_child_pages）配下の行および空DB行は移行対象ページ数から除外する
-        def _count_tree_nodes(n: PageNode) -> int:
-            if n.node_type == "database_row" and self.is_empty_database_row(n):
-                return 0
-            if n.node_type == "database":
-                if analyze_database_child_page_stats(n)["skip_child_pages"]:
-                    return 1
-                if self._is_low_rate_text_key_db(n):
-                    return 1 + sum(
-                        _count_tree_nodes(c)
-                        for c in n.children
-                        if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
-                    )
-            return 1 + sum(_count_tree_nodes(c) for c in n.children)
-        total_nodes = _count_tree_nodes(root_node)
+        # 実際に作成されるノード数（skip_child_pages / low_rate_db_text_key / 空DB行を除外）を母数とする
+        total_nodes = count_migratable_nodes(
+            root_node,
+            db_child_rate_threshold=self.db_child_rate_threshold,
+            low_rate_db_text_key=self.low_rate_db_text_key,
+        )
         if self.dashboard:
             self.dashboard.start(total_nodes)
             self.dashboard.set_main_task(f"Pass 1: 事前マッピング・タイトル初期化中...")
@@ -1889,13 +1882,10 @@ class ConfluenceImporter:
 
     def _is_low_rate_text_key_db(self, db_node: PageNode) -> bool:
         """low_rate_db_text_key 有効時に、DBの子ページ存在率が閾値以下（0%超）でtextキー化対象かを判定する。"""
-        if not self.low_rate_db_text_key or self.db_child_rate_threshold <= 0:
-            return False
-        db_stats = analyze_database_child_page_stats(db_node)
-        return bool(
-            db_stats["total_rows"] > 0
-            and db_stats["body_rows"] > 0
-            and db_stats["body_ratio_pct"] <= self.db_child_rate_threshold
+        return is_low_rate_text_key_database(
+            db_node,
+            db_child_rate_threshold=self.db_child_rate_threshold,
+            low_rate_db_text_key=self.low_rate_db_text_key,
         )
 
     def _resolve_and_update_page_links(self, root_node: PageNode):

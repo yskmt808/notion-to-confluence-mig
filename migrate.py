@@ -26,6 +26,7 @@ from src.extractor import (
     NotionExtractor,
     PageNode,
     collect_low_child_rate_databases,
+    count_migratable_nodes,
     get_node_external_synced_blocks,
     get_node_missing_zip_attachments,
     get_node_unresolved_external_dbs,
@@ -100,7 +101,11 @@ def print_tree(node: PageNode, depth: int = 0):
         print_tree(child, depth + 1)
 
 
-def collect_tree_stats(node: PageNode) -> Dict[str, Any]:
+def collect_tree_stats(
+    node: PageNode,
+    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
+    low_rate_db_text_key: bool = False,
+) -> Dict[str, Any]:
     stats = {
         "total": 0,
         "pages": 0,
@@ -111,12 +116,10 @@ def collect_tree_stats(node: PageNode) -> Dict[str, Any]:
 
     def _traverse(n: PageNode, depth: int):
         if n.node_type == "database":
-            stats["total"] += 1
             stats["databases"] += 1
         elif n.node_type == "database_row":
             stats["database_rows"] += 1
         else:
-            stats["total"] += 1
             stats["pages"] += 1
         if depth > stats["max_depth"]:
             stats["max_depth"] = depth
@@ -124,16 +127,32 @@ def collect_tree_stats(node: PageNode) -> Dict[str, Any]:
             _traverse(child, depth + 1)
 
     _traverse(node, 1)
+    # total は実際に作成・移行されるページ数（ダッシュボード母数と完全一致）
+    stats["total"] = count_migratable_nodes(
+        node,
+        db_child_rate_threshold=db_child_rate_threshold,
+        low_rate_db_text_key=low_rate_db_text_key,
+    )
     return stats
 
 
-def print_tree_summary(root: PageNode, verbose: bool = False, show_all: bool = False):
+def print_tree_summary(
+    root: PageNode,
+    verbose: bool = False,
+    show_all: bool = False,
+    db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
+    low_rate_db_text_key: bool = False,
+):
     """
     Notionツリー構造の標準出力を表示する。
     ページ数が多数（25件超）の場合は、端末画面の圧迫を防ぐため
     主要セクションとノード種別内訳をサマライズして表示する。
     """
-    stats = collect_tree_stats(root)
+    stats = collect_tree_stats(
+        root,
+        db_child_rate_threshold=db_child_rate_threshold,
+        low_rate_db_text_key=low_rate_db_text_key,
+    )
     threshold = 25
 
     if stats["total"] <= threshold or verbose or show_all:
@@ -147,7 +166,8 @@ def print_tree_summary(root: PageNode, verbose: bool = False, show_all: bool = F
     if stats["databases"]:
         print(f"  • 📊 データベース    : {stats['databases']} 件")
     if stats["database_rows"]:
-        print(f"  • 📋 データベース行  : {stats['database_rows']} 件")
+        creatable_rows = max(0, stats["total"] - stats["pages"] - stats["databases"])
+        print(f"  • 📋 データベース行  : {stats['database_rows']} 件 (うち子ページ作成対象: {creatable_rows} 件)")
     print(f"  • 階層の最大深度    : {stats['max_depth']} 階層")
     print("")
 
@@ -162,7 +182,11 @@ def print_tree_summary(root: PageNode, verbose: bool = False, show_all: bool = F
         prefix = "└── " if is_last else "├── "
         c_type_emoji = "📊" if child.node_type == "database" else ("📋" if child.node_type == "database_row" else "📄")
 
-        c_stats = collect_tree_stats(child)
+        c_stats = collect_tree_stats(
+            child,
+            db_child_rate_threshold=db_child_rate_threshold,
+            low_rate_db_text_key=low_rate_db_text_key,
+        )
         if c_stats["total"] > 1:
             detail_parts = []
             if c_stats["pages"]:
@@ -930,7 +954,13 @@ def main():
             telemetry.save_reports(json_path=json_p, md_path=md_p)
         sys.exit(1)
 
-    print_tree_summary(tree, verbose=args.verbose, show_all=args.show_all_pages)
+    print_tree_summary(
+        tree,
+        verbose=args.verbose,
+        show_all=args.show_all_pages,
+        db_child_rate_threshold=args.db_child_rate_threshold,
+        low_rate_db_text_key=args.low_rate_db_text_key,
+    )
 
     if args.dry_run:
         if homonym_warnings:

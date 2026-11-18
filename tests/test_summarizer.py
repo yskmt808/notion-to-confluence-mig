@@ -35,12 +35,28 @@ class TestOutputSummarizer(unittest.TestCase):
         root.children.append(sub1)
 
         stats = collect_tree_stats(root)
-        # ノード数(total)はDBレコード(database_row)を含まない (pages=2 + databases=1 = 3)
+        # 本文なしDB行は作成されないため total=3 (pages=2 + databases=1)
         self.assertEqual(stats["total"], 3)
         self.assertEqual(stats["pages"], 2)
         self.assertEqual(stats["databases"], 1)
         self.assertEqual(stats["database_rows"], 10)
         self.assertEqual(stats["max_depth"], 4)
+
+        # 本文あり行を1件追加すると通常モードでは11行全て作成対象 (2 + 1 + 11 = 14)
+        # low_rate_db_text_key=True 時は1/11(9.1% <= 20%) のため本文あり1行のみ算入 (2 + 1 + 1 = 4)
+        db1.children.append(
+            PageNode(
+                id="row_body",
+                title="本文ありタスク",
+                node_type="database_row",
+                blocks=[{"id": "b1", "type": "paragraph", "paragraph": {"rich_text": [{"plain_text": "詳細"}]}}],
+            )
+        )
+        self.assertEqual(collect_tree_stats(root)["total"], 14)
+        self.assertEqual(
+            collect_tree_stats(root, db_child_rate_threshold=20.0, low_rate_db_text_key=True)["total"],
+            4,
+        )
 
     def test_tree_summary_switches_on_threshold(self):
         root = PageNode(id="root", title="大規模ルート", node_type="page")
