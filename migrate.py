@@ -5,6 +5,7 @@ Notion からページツリー・DBを取得し、Confluence 上へ同一階層
 """
 
 import os
+import re
 import sys
 import json
 import logging
@@ -239,13 +240,20 @@ def _print_dry_run_warning_section(
     header_label: str,
     total_count: int,
     affected_pages: List[Tuple[PageNode, List[Dict[str, Any]]]],
+    show_details: bool = True,
+    detail_hint: Optional[str] = None,
 ):
     if total_count <= 0:
         return
+    suffix = ":" if show_details else "（詳細はデフォルト非表示）"
     print(
         f"⚠️ {header_label}を {total_count} 件検出しました"
-        f"（対象ページ: {len(affected_pages)} 件）:"
+        f"（対象ページ: {len(affected_pages)} 件）{suffix}"
     )
+    if not show_details:
+        if detail_hint:
+            print(f"   💡 {detail_hint}")
+        return
     for node, items in affected_pages:
         print(f"  - [{node.node_type}] {node.title} (ID: {node.id}): {len(items)} 件")
         for item in items:
@@ -258,6 +266,7 @@ def print_dry_run_summary(
     tree: PageNode,
     telemetry: SanitizedTelemetry,
     db_child_rate_threshold: float = DEFAULT_DB_CHILD_RATE_THRESHOLD,
+    show_external_warnings: bool = False,
 ):
     """ドライラン結果サマリー（WARNING件数・各種警告検出ページ一覧）を表示する。"""
     ext_total, affected_pages = collect_external_synced_pages(tree)
@@ -272,7 +281,13 @@ def print_dry_run_summary(
     print(f"ドライラン結果サマリー: WARNING {warning_count} 件")
     _print_dry_run_warning_section("HTMLエクスポート未収録の外部同期ブロック", ext_total, affected_pages)
     _print_dry_run_warning_section("移行対象外（ZIP未収録）の外部データベース参照", ext_db_total, affected_db_pages)
-    _print_dry_run_warning_section("移行対象外（ZIP未収録）の外部ページ参照", ext_page_total, affected_page_refs)
+    _print_dry_run_warning_section(
+        "移行対象外（ZIP未収録）の外部ページ参照",
+        ext_page_total,
+        affected_page_refs,
+        show_details=show_external_warnings,
+        detail_hint="詳細を表示するには `--show-external-warnings` を指定して `--dry-run` を実行してください。",
+    )
     _print_dry_run_warning_section("ZIP未収録の添付ファイル・メディア", missing_att_total, affected_att_pages)
     _print_dry_run_warning_section("未対応要素・外部アプリ埋め込み（フォールバック注記対象）", unsup_total, affected_unsup_pages)
     if low_child_dbs:
@@ -284,6 +299,13 @@ def print_dry_run_summary(
             print(f"  - [database] {st['database_title']} (ID: {st['database_id']}): ⚠️ {st['message']}")
 
 
+def _is_external_link_warning(warning_msg: str) -> bool:
+    return (
+        "移行対象外（ZIP未収録）の外部ページ参照を検出しました" in warning_msg
+        or "移行対象外（ZIP未収録）の外部データベース参照を検出しました" in warning_msg
+    )
+
+
 def print_verification_results(verify_results: List[Dict[str, Any]], verbose: bool = False, show_all: bool = False):
     """整合性検証結果をサマライズ表示する。"""
     pass_count = sum(1 for r in verify_results if r["status"] == "PASS")
@@ -291,36 +313,63 @@ def print_verification_results(verify_results: List[Dict[str, Any]], verbose: bo
     fail_count = sum(1 for r in verify_results if r["status"] == "FAIL")
     total_warning_items = sum(len(r.get("warnings", [])) for r in verify_results)
 
+    ext_page_warn_pages = 0
+    ext_page_warn_items = 0
+    ext_db_warn_pages = 0
+    ext_db_warn_items = 0
+    for r in verify_results:
+        for w in r.get("warnings", []):
+            m_items = re.search(r"\((\d+)\s*件\)", w)
+            cnt = int(m_items.group(1)) if m_items else 1
+            if "移行対象外（ZIP未収録）の外部ページ参照を検出しました" in w:
+                ext_page_warn_pages += 1
+                ext_page_warn_items += cnt
+            elif "移行対象外（ZIP未収録）の外部データベース参照を検出しました" in w:
+                ext_db_warn_pages += 1
+                ext_db_warn_items += cnt
+
     print("--------------------------------------------------")
     print(f"検証サマリー: 合計 {len(verify_results)} ページ | 正常: {pass_count} | 警告: {warn_count} | 失敗: {fail_count}")
     if total_warning_items > 0:
         print(f"  ⚠️ 検出された警告詳細: {total_warning_items} 件")
+    if ext_page_warn_items > 0:
+        print(f"  ⚠️ 移行対象外（ZIP未収録）の外部ページ参照警告: {ext_page_warn_items} 件 (対象ページ: {ext_page_warn_pages} 件)")
+    if ext_db_warn_items > 0:
+        print(f"  ⚠️ 移行対象外（ZIP未収録）の外部データベース参照警告: {ext_db_warn_items} 件 (対象ページ: {ext_db_warn_pages} 件)")
 
     if verbose or show_all:
         for r in verify_results:
+            other_warnings = [w for w in r.get("warnings", []) if not _is_external_link_warning(w)]
             icon = "✅" if r["status"] == "PASS" else ("⚠️" if r["status"] == "WARN" else "❌")
             print(f"{icon} [{r['status']}] {r['title']} (ID: {r['page_id']})")
             for chk in r["checks_passed"]:
                 if verbose:
                     print(f"     ✓ {chk}")
-            for w in r["warnings"]:
+            for w in other_warnings:
                 print(f"     ⚠️ {w}")
             for iss in r["issues"]:
                 print(f"     ❌ {iss}")
     else:
-        # デフォルトは問題（警告・失敗）のあるページのみを抽出して報告し、PASS個別行は非表示
-        abnormal_results = [r for r in verify_results if r["status"] != "PASS"]
+        # デフォルトは問題（外部リンク警告以外の警告・失敗）のあるページのみを抽出して報告し、PASS個別行や外部リンク詳細は非表示
+        abnormal_results = [
+            r for r in verify_results
+            if r.get("issues") or any(not _is_external_link_warning(w) for w in r.get("warnings", []))
+        ]
         if abnormal_results:
             print(f"\n⚠️ 確認・対応が必要なページ ({len(abnormal_results)} 件):")
             for r in abnormal_results:
-                icon = "⚠️" if r["status"] == "WARN" else "❌"
+                other_warnings = [w for w in r.get("warnings", []) if not _is_external_link_warning(w)]
+                icon = "❌" if r.get("issues") else "⚠️"
                 print(f"{icon} [{r['status']}] {r['title']} (ID: {r['page_id']})")
-                for w in r["warnings"]:
+                for w in other_warnings:
                     print(f"     ⚠️ {w}")
                 for iss in r["issues"]:
                     print(f"     ❌ {iss}")
         else:
-            print("✅ 全ページが整合性検証に完全合格しました（警告・エラーなし）。")
+            if ext_page_warn_items > 0 or ext_db_warn_items > 0:
+                print("✅ 外部リンク警告以外の重大な警告・エラーはありません。")
+            else:
+                print("✅ 全ページが整合性検証に完全合格しました（警告・エラーなし）。")
         print("💡 全ページの個別検証項目を表示するには `--verbose` または `--show-all-pages` を指定してください。")
 
 
@@ -440,6 +489,11 @@ def main():
         "--dry-run",
         action="store_true",
         help="Confluenceへの送信を行わず、抽出と変換のプレビューのみ実行する",
+    )
+    parser.add_argument(
+        "--show-external-warnings",
+        action="store_true",
+        help="--dry-run 時に外部参照（ZIP未収録ページ/DBリンク）警告のページ別詳細を表示する（デフォルトは件数のみ）",
     )
     parser.add_argument(
         "--no-verify",
@@ -873,7 +927,12 @@ def main():
     if args.dry_run:
         if homonym_warnings:
             print_homonym_warnings(homonym_warnings)
-        print_dry_run_summary(tree, telemetry, db_child_rate_threshold=args.db_child_rate_threshold)
+        print_dry_run_summary(
+            tree,
+            telemetry,
+            db_child_rate_threshold=args.db_child_rate_threshold,
+            show_external_warnings=args.show_external_warnings,
+        )
         print("💡 DRY RUN モードのため、Confluence への移行はスキップされました。")
         if args.generate_debug_report:
             json_p = os.path.join(args.debug_report_dir, "debug_report.json")

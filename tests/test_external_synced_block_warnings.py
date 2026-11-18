@@ -870,6 +870,89 @@ class TestUnifiedMissingAndUnsupportedWarningsPlanA(unittest.TestCase):
         self.assertNotIn("外部ページ参照（ZIP未収録）", storage)
         self.assertIn("SharePoint Excel", storage)
 
+    def test_page_mention_links_detected_and_warnings_hidden_by_default_except_dry_run_flag(self):
+        """TCK_00031: ページメンションリンク(app.notion.com及びmention[page])をZIP外警告対象に含め、デフォルト非表示・--show-external-warnings時のみdry-run詳細出力・Step3は件数のみにすること。"""
+        from src.extractor import mark_unresolved_external_references
+
+        ext_mention_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        api_mention_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        doc = _build_html_doc(
+            "Mention Warning Page",
+            f"""
+            <p><a href="https://app.notion.com/p/{ext_mention_id.replace('-', '')}">外部メンションページ</a></p>
+            """,
+            page_id="12345678-1234-1234-1234-123456789012",
+        )
+        zpath = os.path.join(self.tmpdir, "mention_warn.zip")
+        with zipfile.ZipFile(zpath, "w") as zf:
+            zf.writestr("Mention Warning Page 12345678123412341234123456789012.html", doc)
+
+        # 1. app.notion.com リンクおよび mention[type=page] が両方 ZIP外ページ参照として検出されること
+        tree = HtmlZipExtractor(zpath).extract_tree()
+        self.assertEqual(len(tree.unresolved_external_pages), 1)
+        self.assertEqual(tree.unresolved_external_pages[0]["target_title"], "外部メンションページ")
+
+        api_node = PageNode(
+            id="22222222-2222-2222-2222-222222222222",
+            title="API Mention Page",
+            node_type="page",
+            blocks=[
+                {
+                    "id": "b-mention-1",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [
+                            {
+                                "type": "mention",
+                                "plain_text": "外部APIメンション",
+                                "mention": {"type": "page", "page": {"id": api_mention_id}},
+                            }
+                        ]
+                    },
+                }
+            ],
+        )
+        mark_unresolved_external_references(api_node)
+        self.assertEqual(len(api_node.unresolved_external_pages), 1)
+        self.assertEqual(api_node.unresolved_external_pages[0]["kind"], "page_mention")
+        self.assertEqual(api_node.unresolved_external_pages[0]["target_title"], "外部APIメンション")
+
+        # 2. --dry-run デフォルトでは詳細が非表示で件数サマリーのみ出力されること
+        cp_path = os.path.join(self.tmpdir, "cp_m1.json")
+        out_default, _ = self._run_main(["--zip", zpath, "--dry-run", "--no-dashboard", "--checkpoint", cp_path])
+        self.assertIn("移行対象外（ZIP未収録）の外部ページ参照を 1 件検出しました", out_default)
+        self.assertIn("--show-external-warnings", out_default)
+        self.assertNotIn("外部メンションページ", out_default)
+
+        # 3. --dry-run --show-external-warnings 指定時のみ詳細が出力されること
+        cp_path2 = os.path.join(self.tmpdir, "cp_m2.json")
+        out_detail, _ = self._run_main([
+            "--zip", zpath, "--dry-run", "--no-dashboard", "--show-external-warnings", "--checkpoint", cp_path2
+        ])
+        self.assertIn("移行対象外（ZIP未収録）の外部ページ参照を 1 件検出しました", out_detail)
+        self.assertIn("外部メンションページ", out_detail)
+
+        # 4. Step 3 (print_verification_results) では外部リンク警告は件数のみ表示され個別ページ行に出ないこと
+        verify_results = [
+            {
+                "page_id": "9001",
+                "title": "Mention Warning Page",
+                "status": "WARN",
+                "checks_passed": [],
+                "warnings": ["移行対象外（ZIP未収録）の外部ページ参照を検出しました (3 件) [参照先: A, B, C]"],
+                "issues": [],
+            }
+        ]
+        import io
+        from contextlib import redirect_stdout
+        buf_v = io.StringIO()
+        with redirect_stdout(buf_v):
+            migrate.print_verification_results(verify_results, verbose=False, show_all=False)
+        v_out = buf_v.getvalue()
+        self.assertIn("移行対象外（ZIP未収録）の外部ページ参照警告: 3 件 (対象ページ: 1 件)", v_out)
+        self.assertNotIn("[参照先: A, B, C]", v_out)
+        self.assertNotIn("[WARN] Mention Warning Page", v_out)
+
 
 if __name__ == "__main__":
     unittest.main()

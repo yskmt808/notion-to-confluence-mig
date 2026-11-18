@@ -588,12 +588,28 @@ def is_notion_page_link_target(href: Optional[str], page_id: Optional[str] = Non
     is_http = parsed.scheme.lower() in ("http", "https")
     if is_http:
         host = (parsed.hostname or "").lower()
-        if any(h in host for h in ("notion.so", "notion.site")):
+        if any(h in host for h in ("notion.so", "notion.site", "notion.com")):
             return bool(page_id) or bool(_INLINE_UUID_RE.search(clean_href))
         return False
     if page_id:
         return True
     return path_lower.endswith(".html") or bool(_INLINE_UUID_RE.search(clean_href))
+
+
+def _extract_rich_text_page_ref(rt: Dict[str, Any]) -> Tuple[str, Optional[str], str, str]:
+    """rich_text要素から (href, page_id, plain_text, kind) を抽出する。mention(page) も対象とする。"""
+    link_obj = (rt.get("text") or {}).get("link") if isinstance(rt.get("text"), dict) else None
+    href = (link_obj.get("url") if isinstance(link_obj, dict) else None) or rt.get("href") or ""
+    item_page_id = rt.get("page_id")
+    kind = "inline_link"
+    mention_obj = rt.get("mention") if rt.get("type") == "mention" and isinstance(rt.get("mention"), dict) else None
+    if mention_obj and mention_obj.get("type") == "page":
+        page_m = mention_obj.get("page") or {}
+        if isinstance(page_m, dict) and page_m.get("id"):
+            item_page_id = item_page_id or page_m.get("id")
+        kind = "page_mention"
+    plain = str(rt.get("plain_text") or (rt.get("text") or {}).get("content", "") or "").strip()
+    return href, item_page_id, plain, kind
 
 
 def _iter_block_rich_text_lists(block: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
@@ -692,15 +708,12 @@ def collect_unresolved_external_pages_from_blocks(
                         or f"移行対象外（ZIP未収録）の外部ページリンク (ID: {page_id}) を参照しています{via_suffix}",
                     })
 
-        # インラインリンク (rich_text) の未収録ページ参照
+        # インラインリンク・ページメンション (rich_text) の未収録ページ参照
         for rt_list in _iter_block_rich_text_lists(b):
             for rt in rt_list:
                 if not isinstance(rt, dict):
                     continue
-                link_obj = (rt.get("text") or {}).get("link") if isinstance(rt.get("text"), dict) else None
-                href = (link_obj.get("url") if isinstance(link_obj, dict) else None) or rt.get("href") or ""
-                item_page_id = rt.get("page_id")
-                plain = str(rt.get("plain_text") or (rt.get("text") or {}).get("content", "") or "").strip()
+                href, item_page_id, plain, ref_kind = _extract_rich_text_page_ref(rt)
 
                 if known_node_ids is not None or known_node_titles is not None:
                     if not is_notion_page_link_target(href, item_page_id):
@@ -730,7 +743,7 @@ def collect_unresolved_external_pages_from_blocks(
                         "target_id": str(item_page_id or ""),
                         "target_title": label,
                         "href": href,
-                        "kind": "inline_link",
+                        "kind": ref_kind,
                         "via_synced_block": rt_via_sync,
                         "message": rt.get("_external_page_warning")
                         or f"移行対象外（ZIP未収録）の外部ページ '{label}' への文中リンクを含んでいます{rt_via_suffix}",
@@ -966,14 +979,12 @@ def mark_unresolved_external_references(root_node: Any) -> int:
                             f"移行対象外（ZIP未収録）の外部ページリンク (ID: {page_id}) を参照しています{via_suffix}"
                         )
 
-                # 3. 外部ページ参照フラグの更新 (文中インラインリンク)
+                # 3. 外部ページ参照フラグの更新 (文中インラインリンク・ページメンション)
                 for rt_list in _iter_block_rich_text_lists(b):
                     for rt in rt_list:
                         if not isinstance(rt, dict):
                             continue
-                        link_obj = (rt.get("text") or {}).get("link") if isinstance(rt.get("text"), dict) else None
-                        href = (link_obj.get("url") if isinstance(link_obj, dict) else None) or rt.get("href") or ""
-                        item_page_id = rt.get("page_id")
+                        href, item_page_id, plain, _ = _extract_rich_text_page_ref(rt)
                         if not is_notion_page_link_target(href, item_page_id):
                             rt.pop("_is_unresolved_external_page", None)
                             rt.pop("_external_page_warning", None)
@@ -984,7 +995,6 @@ def mark_unresolved_external_references(root_node: Any) -> int:
                         if href:
                             for m in _INLINE_UUID_RE.findall(href):
                                 c_ids.append(m.replace("-", "").lower())
-                        plain = str(rt.get("plain_text") or (rt.get("text") or {}).get("content", "") or "").strip()
                         if _match_node_ref(
                             c_ids,
                             plain if not c_ids else "",
@@ -1023,12 +1033,12 @@ def mark_unresolved_external_references(root_node: Any) -> int:
         if node_total > 0:
             total_unresolved += node_total
             if ext_dbs:
-                logger.warning(
+                logger.debug(
                     f"Unresolved external database reference detected in [{getattr(node, 'title', '')}] "
                     f"({getattr(node, 'id', '')}): {len(ext_dbs)} item(s)"
                 )
             if ext_pages:
-                logger.warning(
+                logger.debug(
                     f"Unresolved external page reference detected in [{getattr(node, 'title', '')}] "
                     f"({getattr(node, 'id', '')}): {len(ext_pages)} item(s)"
                 )
