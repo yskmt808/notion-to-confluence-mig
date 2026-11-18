@@ -296,7 +296,9 @@ def print_dry_run_summary(
             f"{len(low_child_dbs)} 件検出しました:"
         )
         for st in low_child_dbs:
-            print(f"  - [database] {st['database_title']} (ID: {st['database_id']}): ⚠️ {st['message']}")
+            print(f"  - [database] {st['database_title']} (ID: {st['database_id']}):")
+            formatted_msg = str(st.get("message") or "").replace("。", "。\n        ", 1).rstrip()
+            print(f"      ⚠️ {formatted_msg}")
 
 
 def _is_external_link_warning(warning_msg: str) -> bool:
