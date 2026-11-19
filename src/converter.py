@@ -2252,16 +2252,20 @@ class NotionToConfluenceConverter:
                     break
         if not key_col_name:
             key_col_name = "リンク"
+        key_col_name = unicodedata.normalize("NFC", str(key_col_name)).strip() or "リンク"
 
         key_col_type = "text" if use_text_title else "confluence-page-link"
         fields: List[Tuple[str, str, str]] = [(key_col_name, key_col_type, "")]
+        seen_field_names: Set[str] = {key_col_name.lower()}
 
         prop_names = []
         if schema:
             for p_name, p_info in schema.items():
                 p_type = p_info.get("type", "rich_text")
-                if p_name == key_col_name or p_type == "title":
+                clean_p_name = unicodedata.normalize("NFC", str(p_name)).strip()
+                if not clean_p_name or clean_p_name.lower() in seen_field_names or p_type == "title":
                     continue
+                seen_field_names.add(clean_p_name.lower())
                 if p_type in ("select", "status", "multi_select"):
                     conf_type = "tag"
                 elif p_type == "checkbox":
@@ -2301,6 +2305,9 @@ class NotionToConfluenceConverter:
 
                     if p_name == key_col_name or p_type == "title":
                         continue
+                    clean_p_name = unicodedata.normalize("NFC", str(p_name)).strip()
+                    if not clean_p_name or clean_p_name.lower() in seen_field_names:
+                        continue
 
                     if p_name not in all_col_names:
                         all_col_names.append(p_name)
@@ -2311,6 +2318,10 @@ class NotionToConfluenceConverter:
                         col_types[p_name] = p_type
 
             for p_name in all_col_names:
+                clean_p_name = unicodedata.normalize("NFC", str(p_name)).strip()
+                if not clean_p_name or clean_p_name.lower() in seen_field_names:
+                    continue
+                seen_field_names.add(clean_p_name.lower())
                 p_type = col_types.get(p_name, "text")
                 if p_name in col_has_multiline:
                     conf_type = "text"

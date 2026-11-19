@@ -502,6 +502,44 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         self.assertIn('ri:filename="Untitled.png"', agg_body)
         self.assertIn('ri:filename="r2_Untitled.png"', agg_body)
 
+    def test_generate_database_csv_deduplicates_normalized_field_names(self):
+        """項番 などキーカラムと同名（空白差含む）のプロパティがあっても <fields> に重複出力されないこと。"""
+        from src.converter import NotionToConfluenceConverter
+
+        row = PageNode(
+            id="r-dup-1",
+            title="1",
+            node_type="database_row",
+            properties={
+                "項番": {"type": "title", "value": "1"},
+                "項番 ": {"type": "rich_text", "value": "1"},
+                "メモ": {"type": "rich_text", "value": "ok"},
+            },
+        )
+        db = PageNode(
+            id="db-dup",
+            title="重複カラムテストDB",
+            node_type="database",
+            properties={
+                "title_column": "項番",
+                "schema": {
+                    "項番": {"type": "title"},
+                    "項番 ": {"type": "rich_text"},
+                    "メモ": {"type": "rich_text"},
+                },
+            },
+            children=[row],
+        )
+        csv_body = NotionToConfluenceConverter().generate_database_csv(
+            db,
+            page_link_map={"r-dup-1": "https://example/p#1"},
+            use_text_title=True,
+            add_hidden_link_col=True,
+        )
+        fields_section = csv_body.split("</fields>")[0]
+        self.assertEqual(fields_section.count("項番,"), 1)
+        self.assertIn("メモ,text,", fields_section)
+
 
 if __name__ == "__main__":
     unittest.main()
