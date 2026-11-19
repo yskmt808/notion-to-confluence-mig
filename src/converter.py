@@ -1785,13 +1785,20 @@ class NotionToConfluenceConverter:
                     if note_html:
                         output.append(note_html)
                 elif b.get("_attachment_uploaded", True):
-                    safe_fn_cdata = display_label.replace("]]>", "]]]]><![CDATA[>")
-                    output.append(
-                        f'<p><ac:link>'
-                        f'<ri:attachment ri:filename="{html.escape(filename)}" />'
-                        f'<ac:plain-text-link-body><![CDATA[📎 {safe_fn_cdata} (添付ファイルをダウンロード)]]></ac:plain-text-link-body>'
-                        f'</ac:link></p>{caption_html}'
-                    )
+                    if filename.lower().endswith((".ppt", ".pptx")):
+                        output.append(
+                            f'<ac:structured-macro ac:name="viewppt">'
+                            f'<ac:parameter ac:name="name"><ri:attachment ri:filename="{html.escape(filename)}" /></ac:parameter>'
+                            f'</ac:structured-macro>{caption_html}'
+                        )
+                    else:
+                        safe_fn_cdata = display_label.replace("]]>", "]]]]><![CDATA[>")
+                        output.append(
+                            f'<p><ac:link>'
+                            f'<ri:attachment ri:filename="{html.escape(filename)}" />'
+                            f'<ac:plain-text-link-body><![CDATA[📎 {safe_fn_cdata} (添付ファイルをダウンロード)]]></ac:plain-text-link-body>'
+                            f'</ac:link></p>{caption_html}'
+                        )
                 elif file_url and file_url.startswith(("http://", "https://")):
                     output.append(
                         f'<p>📎 <a href="{html.escape(file_url)}">添付ファイルを開く: {html.escape(display_label)}</a></p>{caption_html}'

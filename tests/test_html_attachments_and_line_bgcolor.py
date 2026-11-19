@@ -1006,6 +1006,47 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         self.assertEqual(db_blocks[0]["database_id"].replace("-", ""), nested_db_id)
         self.assertFalse(db_blocks[0].get("_is_unresolved_external_db", False))
 
+    def test_powerpoint_file_uses_viewppt_macro_while_other_files_remain_links(self):
+        """PowerPoint(.ppt/.pptx)のみviewpptプレビューマクロになり、他ファイルは添付リンクのまま出力されること"""
+        blocks = [
+            {
+                "id": "b-pptx",
+                "type": "file",
+                "file": {"type": "file", "file": {"url": "deck.pptx"}, "caption": []},
+                "_attachment_filename": "deck.pptx",
+                "_display_name": "deck.pptx",
+                "_attachment_uploaded": True,
+            },
+            {
+                "id": "b-ppt",
+                "type": "file",
+                "file": {"type": "file", "file": {"url": "legacy.ppt"}, "caption": []},
+                "_attachment_filename": "legacy.ppt",
+                "_display_name": "legacy.ppt",
+                "_attachment_uploaded": True,
+            },
+            {
+                "id": "b-docx",
+                "type": "file",
+                "file": {"type": "file", "file": {"url": "spec.docx"}, "caption": []},
+                "_attachment_filename": "spec.docx",
+                "_display_name": "spec.docx",
+                "_attachment_uploaded": True,
+            },
+        ]
+        storage_xml = self.converter.blocks_to_storage_format(blocks)
+        assert_valid_storage_xml(self, storage_xml)
+        self.assertIn(
+            '<ac:structured-macro ac:name="viewppt"><ac:parameter ac:name="name"><ri:attachment ri:filename="deck.pptx" /></ac:parameter></ac:structured-macro>',
+            storage_xml,
+        )
+        self.assertIn(
+            '<ac:structured-macro ac:name="viewppt"><ac:parameter ac:name="name"><ri:attachment ri:filename="legacy.ppt" /></ac:parameter></ac:structured-macro>',
+            storage_xml,
+        )
+        self.assertIn('<ac:link><ri:attachment ri:filename="spec.docx" />', storage_xml)
+        self.assertIn('<![CDATA[📎 spec.docx (添付ファイルをダウンロード)]]>', storage_xml)
+
 
 if __name__ == "__main__":
     unittest.main()
