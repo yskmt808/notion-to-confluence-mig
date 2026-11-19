@@ -279,6 +279,41 @@ class TestDbTriage(unittest.TestCase):
         self.assertIn('href="https://example.atlassian.net/wiki/spaces/S/pages/999#raw1"', html_out)
         self.assertIn("<td>raw2</td>", html_out)
 
+    def test_html_extractor_resolves_short_uuid_db_row_directory(self):
+        """同名DB衝突時にNotionが生成する `<DB名> <先頭4桁>-<末尾4桁>/` 配下の行HTMLを正しく読み込むこと"""
+        import zipfile
+        from src.html_extractor import HtmlZipExtractor
+        from src.importer import database_row_has_substantive_body
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "short_uuid_db.zip")
+            db1_id = "4157be77284d8021b09ef9e9a1a7475d"
+            db2_id = "4167be77284d80199cbee3bfa907e63e"
+            row_id = "41d7be77284d8079a310e1733e48a15a"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr(
+                    "親ページ 4137be77284d801d9fcfc13c0989f376.html",
+                    '<html><body><article><header><h1 class="page-title">親ページ</h1></header><div class="page-body"></div></article></body></html>',
+                )
+                zf.writestr(
+                    f"親ページ/同じ名前 {db1_id}.csv",
+                    "名前\nItemA\n",
+                )
+                zf.writestr(
+                    f"親ページ/同じ名前 {db2_id}.csv",
+                    "名前\nraw6\n",
+                )
+                zf.writestr(
+                    f"親ページ/同じ名前 4167-e63e/raw6 {row_id}.html",
+                    f'<html><head><title>raw6</title></head><body><article id="{row_id}" class="page"><header><h1 class="page-title">raw6</h1></header><div class="page-body"><p>詳細テスト</p></div></article></body></html>',
+                )
+
+            tree = HtmlZipExtractor(zip_path).extract_tree()
+            db2 = next(c for c in tree.children if c.node_type == "database" and c.id.replace("-", "") == db2_id)
+            self.assertEqual(len(db2.children), 1)
+            self.assertEqual(len(db2.children[0].blocks), 1)
+            self.assertTrue(database_row_has_substantive_body(db2.children[0]))
+
 
 if __name__ == "__main__":
     unittest.main()

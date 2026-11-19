@@ -778,10 +778,37 @@ class HtmlZipExtractor:
 
         # 同名ディレクトリ内の各行HTMLファイルをインデックス化
         clean_db_path = re.sub(r"_all\.html$", ".html", db_html_path)
-        base_dir = re.sub(r"\s+[0-9a-fA-F]{32}\.html$", "", clean_db_path)
-        if base_dir.endswith(".html"):
-            base_dir = os.path.splitext(base_dir)[0]
-        base_dir = base_dir.rstrip("/") + "/"
+        base_no_slash = re.sub(r"\s+[0-9a-fA-F]{32}\.html$", "", clean_db_path)
+        if base_no_slash.endswith(".html"):
+            base_no_slash = os.path.splitext(base_no_slash)[0]
+        base_no_slash = base_no_slash.rstrip("/")
+
+        # Notion ZIPでは同名フォルダ衝突時に `<DB名> <UUID先頭4桁>-<UUID末尾4桁>/` が作られるため最優先で探索
+        raw_uid = re.sub(r"[^0-9a-fA-F]", "", str(getattr(db_node, "id", "") or "")).lower()
+        dir_candidates = []
+        if len(raw_uid) == 32:
+            dir_candidates.append(f"{base_no_slash} {raw_uid[:4]}-{raw_uid[-4:]}/")
+            dir_candidates.append(f"{base_no_slash} {raw_uid}/")
+        dir_candidates.append(f"{base_no_slash}/")
+
+        dir_map = getattr(self, "_dir_direct_children", {})
+        base_dir = dir_candidates[-1]
+        row_candidates = None
+        for cand_dir in dir_candidates:
+            if cand_dir in dir_map:
+                base_dir = cand_dir
+                row_candidates = dir_map[cand_dir]
+                break
+        if row_candidates is None:
+            namelist = zf.namelist()
+            for cand_dir in dir_candidates:
+                matched = [f for f in namelist if f.startswith(cand_dir)]
+                if matched:
+                    base_dir = cand_dir
+                    row_candidates = matched
+                    break
+        if row_candidates is None:
+            row_candidates = []
 
         def _norm_title_key(t: str) -> str:
             if not t:
@@ -793,10 +820,6 @@ class HtmlZipExtractor:
         row_html_map: Dict[str, str] = {}  # row_id -> html_path
         row_html_by_title: Dict[str, Tuple[str, str]] = {}  # norm_title -> (row_id, html_path)
         row_html_by_stem: Dict[str, Tuple[str, str]] = {}  # norm_stem -> (row_id, html_path)
-
-        row_candidates = getattr(self, "_dir_direct_children", {}).get(base_dir)
-        if row_candidates is None:
-            row_candidates = [f for f in zf.namelist() if f.startswith(base_dir)]
 
         for f in row_candidates:
             if f.endswith(".html"):
