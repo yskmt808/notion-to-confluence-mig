@@ -1991,7 +1991,7 @@ class HtmlZipExtractor:
                 })
 
             # 13. データベースビュー (collection-content)
-            elif "collection-content" in classes or el.find(class_="collection-title"):
+            elif "collection-content" in classes or "collection-content-wrapper" in classes or el.find(class_="collection-title"):
                 collection_el = el if "collection-content" in classes else el.find(class_="collection-content")
                 db_el_id = (
                     collection_el.get("id")

@@ -552,6 +552,7 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
                 "\ufeff項番\u200b": {"type": "title", "value": "1"},
                 "格納先\u200b": {"type": "url", "value": r"\\fileserver\share\project"},
                 "参考URL": {"type": "url", "value": "https://example.com/docs"},
+                "連絡先": {"type": "url", "value": "mailto:user@example.com"},
             },
         )
         db = PageNode(
@@ -564,6 +565,7 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
                     "\ufeff項番\u200b": {"type": "title"},
                     "格納先\u200b": {"type": "url"},
                     "参考URL": {"type": "url"},
+                    "連絡先": {"type": "url"},
                 },
             },
             children=[row1],
@@ -580,6 +582,7 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         self.assertIn("項番,text,", fields_section)
         self.assertIn("格納先,text,", fields_section)
         self.assertIn("参考URL,hyperlink,", fields_section)
+        self.assertIn("連絡先,hyperlink,", fields_section)
         self.assertIn(r"\\fileserver\share\project", csv_body)
 
 

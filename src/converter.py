@@ -2025,7 +2025,14 @@ class NotionToConfluenceConverter:
             if any(ch.isspace() for ch in s_val):
                 return True
             parsed = urllib.parse.urlparse(s_val)
-            if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            scheme = parsed.scheme.lower()
+            if scheme in ("http", "https"):
+                if not parsed.netloc:
+                    return True
+            elif scheme == "mailto":
+                if not parsed.path or "@" not in parsed.path:
+                    return True
+            else:
                 return True
         return False
 
