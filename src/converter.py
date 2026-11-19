@@ -2379,6 +2379,8 @@ class NotionToConfluenceConverter:
                 if not row_title_val:
                     title_prop = child.properties.get(key_col_name)
                     row_title_val = self._format_prop_for_csv(title_prop, key_col_name, child.title)
+                if add_hidden_link_col and safe_link_val and not row_title_val.startswith("📄 "):
+                    row_title_val = f"📄 {row_title_val}"
                 row_cells.append(self._escape_csv_cell(row_title_val))
             else:
                 row_cells.append(self._escape_csv_cell(safe_link_val))

@@ -362,7 +362,7 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         mock_client.create_database.side_effect = fake_create_db
         mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
         mock_client.get_database_entries.return_value = [
-            {"id": "entry-agg-1", "values": {"f_title": {"type": "text", "plain": "本文あり行"}}}
+            {"id": "entry-agg-1", "values": {"f_title": {"type": "text", "plain": "📄 本文あり行"}}}
         ]
         mock_client.get_page_by_id.return_value = {
             "id": "p_2",
@@ -395,7 +395,7 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         self.assertIn("名前,text,", csv_body)
         self.assertIn("詳細ページ,hyperlink,", csv_body)
         self.assertIn('すべてのデータ,table,"","","詳細ページ"', csv_body)
-        self.assertIn("https://example.atlassian.net/wiki/spaces/D/pages/p_2#", csv_body)
+        self.assertIn("📄 本文あり行,https://example.atlassian.net/wiki/spaces/D/pages/p_2#", csv_body)
         self.assertIn('本文なし行1,"",""', csv_body)
 
         # 3. Pass 2で更新された集約ページに?entryId=戻りリンクがあり、静的プロパティ折りたたみ表がないこと

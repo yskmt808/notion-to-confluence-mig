@@ -2033,8 +2033,13 @@ class ConfluenceImporter:
                 if not isinstance(plain, str):
                     plain = fval.get("value") if isinstance(fval.get("value"), str) else ""
                 key = plain.strip()
-                if key and key not in text_to_entry:
-                    text_to_entry[key] = str(entry_id)
+                if key:
+                    if key not in text_to_entry:
+                        text_to_entry[key] = str(entry_id)
+                    if key.startswith("📄 "):
+                        stripped = key[2:].strip()
+                        if stripped and stripped not in text_to_entry:
+                            text_to_entry[stripped] = str(entry_id)
         return text_to_entry
 
     @staticmethod
@@ -2476,9 +2481,16 @@ class ConfluenceImporter:
                             mime_type=mime_type,
                         )
                         if upload_res is not None:
+                            actual_title = filename
+                            if isinstance(upload_res, dict) and isinstance(upload_res.get("results"), list) and upload_res["results"]:
+                                t = upload_res["results"][0].get("title")
+                                if t:
+                                    actual_title = str(t)
+                                    b["_attachment_filename"] = actual_title
+                            uploaded_filenames.add(actual_title)
                             uploaded_filenames.add(filename)
                             b["_attachment_uploaded"] = True
-                            logger.info(f"Successfully uploaded attachment: {filename}")
+                            logger.info(f"Successfully uploaded attachment: {actual_title}")
                         else:
                             b["_attachment_uploaded"] = False
                             logger.warning(f"Attachment upload returned no result for {filename}")
