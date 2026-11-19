@@ -1996,6 +1996,39 @@ class NotionToConfluenceConverter:
             return True
         return False
 
+    @staticmethod
+    def _sanitize_db_field_name(name: Any) -> str:
+        """DBカラム名から不可視文字・制御文字（BOM/ゼロ幅スペース等）を除去して正規化する。"""
+        if name is None:
+            return ""
+        s = unicodedata.normalize("NFC", str(name))
+        s = s.replace("\u00a0", " ")
+        cleaned = "".join(
+            ch for ch in s
+            if unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co")
+        )
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    @classmethod
+    def column_requires_text_for_url(cls, db_node: PageNode, col_name: str) -> bool:
+        """URL型カラムに共有フォルダパス等の非HTTP(S)値が含まれる場合、Confluence text型へフォールバックすべきか判定する。"""
+        for child in getattr(db_node, "children", []) or []:
+            prop = (getattr(child, "properties", None) or {}).get(col_name)
+            if prop is None:
+                continue
+            raw_val = prop.get("value") if isinstance(prop, dict) else prop
+            if raw_val is None:
+                continue
+            s_val = str(raw_val).strip()
+            if not s_val:
+                continue
+            if any(ch.isspace() for ch in s_val):
+                return True
+            parsed = urllib.parse.urlparse(s_val)
+            if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+                return True
+        return False
+
     @classmethod
     def column_requires_text_for_datetime(cls, db_node: PageNode, col_name: str, prop_type: str) -> bool:
         """DBカラムが日時/日付範囲を保持するため Confluence text 型にすべきかを判定する。"""
@@ -2225,7 +2258,10 @@ class NotionToConfluenceConverter:
                 elif p_type == "multi_select":
                     multi_select.append(p_name)
 
-        return single_select, multi_select
+        return (
+            list(dict.fromkeys(self._sanitize_db_field_name(x) for x in single_select if self._sanitize_db_field_name(x))),
+            list(dict.fromkeys(self._sanitize_db_field_name(x) for x in multi_select if self._sanitize_db_field_name(x))),
+        )
 
     def generate_database_csv(
         self,
@@ -2252,17 +2288,17 @@ class NotionToConfluenceConverter:
                     break
         if not key_col_name:
             key_col_name = "リンク"
-        key_col_name = unicodedata.normalize("NFC", str(key_col_name)).strip() or "リンク"
+        key_col_name = self._sanitize_db_field_name(key_col_name) or "リンク"
 
         key_col_type = "text" if use_text_title else "confluence-page-link"
         fields: List[Tuple[str, str, str]] = [(key_col_name, key_col_type, "")]
         seen_field_names: Set[str] = {key_col_name.lower()}
 
-        prop_names = []
+        prop_pairs: List[Tuple[str, str]] = []
         if schema:
             for p_name, p_info in schema.items():
                 p_type = p_info.get("type", "rich_text")
-                clean_p_name = unicodedata.normalize("NFC", str(p_name)).strip()
+                clean_p_name = self._sanitize_db_field_name(p_name)
                 if not clean_p_name or clean_p_name.lower() in seen_field_names or p_type == "title":
                     continue
                 seen_field_names.add(clean_p_name.lower())
@@ -2279,15 +2315,19 @@ class NotionToConfluenceConverter:
                 elif p_type == "number":
                     conf_type = "number"
                 elif p_type == "url":
-                    conf_type = "hyperlink"
+                    conf_type = (
+                        "text"
+                        if self.column_requires_text_for_url(db_node, p_name)
+                        else "hyperlink"
+                    )
                 elif p_type in ("people", "created_by", "last_edited_by") and self.user_mapper and self.user_mapper.mappings:
                     conf_type = "user"
                 else:
                     conf_type = "text"
 
                 cfg = 'number_format:number' if conf_type == "number" else ''
-                fields.append((p_name, conf_type, cfg))
-                prop_names.append(p_name)
+                fields.append((clean_p_name, conf_type, cfg))
+                prop_pairs.append((clean_p_name, p_name))
         elif db_node.children:
             # 全子ノードのプロパティを走査して網羅的なスキーマを構築
             all_col_names: List[str] = []
@@ -2303,10 +2343,8 @@ class NotionToConfluenceConverter:
                         p_type = "text"
                         raw_v = p_val
 
-                    if p_name == key_col_name or p_type == "title":
-                        continue
-                    clean_p_name = unicodedata.normalize("NFC", str(p_name)).strip()
-                    if not clean_p_name or clean_p_name.lower() in seen_field_names:
+                    clean_p_name = self._sanitize_db_field_name(p_name)
+                    if not clean_p_name or clean_p_name.lower() in seen_field_names or p_type == "title":
                         continue
 
                     if p_name not in all_col_names:
@@ -2318,7 +2356,7 @@ class NotionToConfluenceConverter:
                         col_types[p_name] = p_type
 
             for p_name in all_col_names:
-                clean_p_name = unicodedata.normalize("NFC", str(p_name)).strip()
+                clean_p_name = self._sanitize_db_field_name(p_name)
                 if not clean_p_name or clean_p_name.lower() in seen_field_names:
                     continue
                 seen_field_names.add(clean_p_name.lower())
@@ -2338,15 +2376,19 @@ class NotionToConfluenceConverter:
                 elif p_type == "number":
                     conf_type = "number"
                 elif p_type == "url":
-                    conf_type = "hyperlink"
+                    conf_type = (
+                        "text"
+                        if self.column_requires_text_for_url(db_node, p_name)
+                        else "hyperlink"
+                    )
                 elif p_type in ("people", "created_by", "last_edited_by") and self.user_mapper and self.user_mapper.mappings:
                     conf_type = "user"
                 else:
                     conf_type = "text"
 
                 cfg = 'number_format:number' if conf_type == "number" else ''
-                fields.append((p_name, conf_type, cfg))
-                prop_names.append(p_name)
+                fields.append((clean_p_name, conf_type, cfg))
+                prop_pairs.append((clean_p_name, p_name))
 
         field_type_map = {f_name: f_type for f_name, f_type, _ in fields}
 
@@ -2399,10 +2441,12 @@ class NotionToConfluenceConverter:
             if hidden_link_col_name:
                 row_cells.append(self._escape_csv_cell(safe_link_val))
 
-            for p_name in prop_names:
-                prop = child.properties.get(p_name)
-                preserve_time = field_type_map.get(p_name) == "text"
-                val_str = self._format_prop_for_csv(prop, p_name, child.title, preserve_time=preserve_time)
+            for clean_p_name, raw_p_name in prop_pairs:
+                prop = child.properties.get(raw_p_name)
+                if prop is None and clean_p_name != raw_p_name:
+                    prop = child.properties.get(clean_p_name)
+                preserve_time = field_type_map.get(clean_p_name) == "text"
+                val_str = self._format_prop_for_csv(prop, clean_p_name, child.title, preserve_time=preserve_time)
                 row_cells.append(self._escape_csv_cell(val_str))
 
             data_lines.append(",".join(row_cells))

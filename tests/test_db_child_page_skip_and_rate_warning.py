@@ -540,6 +540,48 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         self.assertEqual(fields_section.count("項番,"), 1)
         self.assertIn("メモ,text,", fields_section)
 
+    def test_generate_database_csv_sanitizes_invisible_chars_and_falls_back_non_http_url_to_text(self):
+        """カラム名の不可視制御文字を除去し、共有フォルダパス等を含むURLカラムをtext型へフォールバックすること。"""
+        from src.converter import NotionToConfluenceConverter
+
+        row1 = PageNode(
+            id="r-san-1",
+            title="1",
+            node_type="database_row",
+            properties={
+                "\ufeff項番\u200b": {"type": "title", "value": "1"},
+                "格納先\u200b": {"type": "url", "value": r"\\fileserver\share\project"},
+                "参考URL": {"type": "url", "value": "https://example.com/docs"},
+            },
+        )
+        db = PageNode(
+            id="db-san",
+            title="サニタイズDB",
+            node_type="database",
+            properties={
+                "title_column": "\ufeff項番\u200b",
+                "schema": {
+                    "\ufeff項番\u200b": {"type": "title"},
+                    "格納先\u200b": {"type": "url"},
+                    "参考URL": {"type": "url"},
+                },
+            },
+            children=[row1],
+        )
+        csv_body = NotionToConfluenceConverter().generate_database_csv(
+            db,
+            page_link_map={"r-san-1": "https://example/p#1"},
+            use_text_title=True,
+            add_hidden_link_col=True,
+        )
+        fields_section = csv_body.split("</fields>")[0]
+        self.assertNotIn("\ufeff", csv_body)
+        self.assertNotIn("\u200b", csv_body)
+        self.assertIn("項番,text,", fields_section)
+        self.assertIn("格納先,text,", fields_section)
+        self.assertIn("参考URL,hyperlink,", fields_section)
+        self.assertIn(r"\\fileserver\share\project", csv_body)
+
 
 if __name__ == "__main__":
     unittest.main()
