@@ -2034,10 +2034,13 @@ class HtmlZipExtractor:
                     "configuration": {"group_by": {"property_name": group_field} if group_field else None},
                 }
 
-                # 実DBノードとのタイトル正規化紐付けによる実DB ID補完
+                # 実DBノードとのID一致を最優先し、一致しない場合のみタイトル正規化紐付けを行う
                 real_db_id = None
+                norm_el_id = normalize_id(db_el_id) if db_el_id else ""
+                if norm_el_id and db_csv_map and norm_el_id in db_csv_map:
+                    real_db_id = norm_el_id
                 norm_db_title = normalize_db_title(db_title)
-                if norm_db_title and db_csv_map:
+                if not real_db_id and norm_db_title and db_csv_map:
                     for k, v in db_csv_map.items():
                         # キーが32桁UUID / 正規化UUIDの場合、値(CSVパス)のベース名からタイトル正規化比較
                         base_v = os.path.splitext(os.path.basename(v))[0]
