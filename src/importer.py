@@ -2910,12 +2910,13 @@ class ConfluenceImporter:
                         agg_page_id = str(existing_agg["id"])
                         agg_webui = existing_agg.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
                     else:
-                        agg_res = self.client.create_page(
-                            space_key=self.space_key,
-                            title=agg_title,
-                            body="<p>詳細ページを生成中...</p>",
-                            parent_id=confluence_page_id,
-                        )
+                        with self._get_parent_lock(confluence_page_id):
+                            agg_res = self.client.create_page(
+                                space_key=self.space_key,
+                                title=agg_title,
+                                body="<p>詳細ページを生成中...</p>",
+                                parent_id=confluence_page_id,
+                            )
                         agg_page_id = str(agg_res["id"])
                         agg_webui = agg_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
                     agg_page_url = f"{self.client.base_url}{agg_webui}"
@@ -3059,12 +3060,13 @@ class ConfluenceImporter:
                         agg_webui = existing_agg.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
                         agg_page_url = f"{self.client.base_url}{agg_webui}"
                     else:
-                        agg_res = self.client.create_page(
-                            space_key=self.space_key,
-                            title=agg_page_title,
-                            body="<p>詳細ページを生成中...</p>",
-                            parent_id=parent_id,
-                        )
+                        with self._get_parent_lock(parent_id):
+                            agg_res = self.client.create_page(
+                                space_key=self.space_key,
+                                title=agg_page_title,
+                                body="<p>詳細ページを生成中...</p>",
+                                parent_id=parent_id,
+                            )
                         agg_page_id = str(agg_res["id"])
                         agg_webui = agg_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
                         agg_page_url = f"{self.client.base_url}{agg_webui}"
