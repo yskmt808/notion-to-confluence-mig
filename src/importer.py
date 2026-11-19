@@ -861,6 +861,7 @@ class ConfluenceClient:
         database_id: str,
         group_field: str,
         group_values: List[str],
+        operator: str = "=",
     ) -> List[Dict[str, Any]]:
         """
         データベースのGroup by対象列の各グループ値に対応するフィルタービューを一括作成し、
@@ -886,7 +887,7 @@ class ConfluenceClient:
                 for val in views_to_create:
                     vname = f"{group_field}: {val}"
                     metadata_lines.append(f"add_view,{vname},table")
-                    metadata_lines.append(f'add_filter,{vname},{group_field},"[\'{group_field}\' = \'{val}\']"')
+                    metadata_lines.append(f'add_filter,{vname},{group_field},"[\'{group_field}\' {operator} \'{val}\']"')
                 metadata_lines.append("</metadata>")
                 data_lines = ["<data>", "operation_type,entry_index", "</data>"]
                 csv_body = "\n".join(metadata_lines + data_lines)
@@ -3343,7 +3344,10 @@ class ConfluenceImporter:
                         if f_vals_set:
                             sorted_vals = sorted(list(f_vals_set))
                             logger.info(f"Setting up filtered views for [{node.title}] on field [{f_field}]: {sorted_vals}")
-                            self.client.setup_grouped_database_views(confluence_page_id, f_field, sorted_vals)
+                            if f_field in multi_props:
+                                self.client.setup_grouped_database_views(confluence_page_id, f_field, sorted_vals, operator="contains")
+                            else:
+                                self.client.setup_grouped_database_views(confluence_page_id, f_field, sorted_vals)
 
                 # 最新のビュー一覧を取得してマッピング
                 # 重複ビューがある場合、適切な type (board/gallery/table) を最優先でマッピングする

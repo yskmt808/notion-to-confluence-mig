@@ -482,6 +482,21 @@ class TestDatabaseViews(ClientTestCase):
             self.assertIn(f"add_view,状態: {val},table", csv_body)
             self.assertIn(f"add_filter,状態: {val},状態,\"['状態' = '{val}']\"", csv_body)
 
+    def test_setup_grouped_views_uses_contains_operator_when_specified(self):
+        self.req.get.return_value = R(200, {"version": {"number": 4}})
+        self.req.put.return_value = R(200)
+        after = [{"id": "v1", "name": "タグ: A"}, {"id": "v2", "name": "タグ: B"}]
+        with patch.object(self.client, "get_database_views", side_effect=[[], after]):
+            out = self.client.setup_grouped_database_views("d1", "タグ", ["A", "B"], operator="contains")
+        self.assertEqual(
+            out,
+            [{"label": "A", "saved_view_id": "v1"}, {"label": "B", "saved_view_id": "v2"}],
+        )
+        csv_body = self.req.put.call_args.kwargs["json"]["body"]["value"]
+        for val in ("A", "B"):
+            self.assertIn(f"add_view,タグ: {val},table", csv_body)
+            self.assertIn(f"add_filter,タグ: {val},タグ,\"['タグ' contains '{val}']\"", csv_body)
+
     def test_setup_grouped_views_degrades_to_existing_on_api_failure(self):
         existing = [{"id": "v1", "name": "状態: A"}]
         with patch.object(self.client, "get_database_views", return_value=existing):

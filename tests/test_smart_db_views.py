@@ -176,6 +176,43 @@ class TestSmartDbViews(unittest.TestCase):
         html_out = conv.generate_page_content(ref_page_dev)
         self.assertIn("savedViewId=v-cat-dev", html_out)
 
+    @patch("src.importer.requests")
+    def test_multi_select_field_uses_contains_operator_for_grouped_views(self, mock_requests):
+        """マルチセレクト列のフィルタービュー作成では operator='contains'（「含む」）が使用されること"""
+        importer = self._create_importer()
+        importer.client.create_page.side_effect = lambda **kw: {"id": f"p-{kw['title']}", "_links": {"webui": f"/pages/p-{kw['title']}"}}
+        importer.client.create_database.return_value = {"id": "db-ms", "_links": {"webui": "/spaces/TEST/database/db-ms"}}
+
+        rows = [
+            PageNode(
+                id="row-1",
+                title="Doc 1",
+                node_type="database_row",
+                properties={"タグ": {"type": "multi_select", "value": ["Python", "API"]}},
+            ),
+            PageNode(
+                id="row-2",
+                title="Doc 2",
+                node_type="database_row",
+                properties={"タグ": {"type": "multi_select", "value": ["API"]}},
+            ),
+        ]
+        db_node = PageNode(id="db-node-ms", title="Multi DB", node_type="database", children=rows)
+        ref_page = PageNode(
+            id="page-ms",
+            title="Pythonタグ一覧",
+            node_type="page",
+            blocks=[{"id": "b1", "type": "link_to_page", "link_to_page": {"database_id": "db-node-ms"}}],
+        )
+        root = PageNode(id="root-ms", title="Root", node_type="page", children=[db_node, ref_page])
+
+        importer._db_view_requirements = importer._analyze_database_view_requirements(root)
+        importer._import_node_recursive(db_node, parent_id="root-conf", overwrite=False)
+
+        importer.client.setup_grouped_database_views.assert_called_once_with(
+            "db-ms", "タグ", ["Python"], operator="contains"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
