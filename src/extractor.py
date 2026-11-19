@@ -935,12 +935,15 @@ def mark_unresolved_external_references(root_node: Any) -> int:
                     if id_matched or title_matched:
                         b.pop("_is_unresolved_external_db", None)
                         b.pop("_external_db_warning", None)
-                        # 実DB IDが特定できた場合は database_id / data_sources に補完
-                        if matched_db_id:
-                            if not b.get("database_id") or b.get("database_id") not in known_db_ids:
+                        # ID一致していない場合のみ、タイトル一致で特定した実DB IDを補完する
+                        if not id_matched and matched_db_id:
+                            norm_cur_db_id = str(b.get("database_id") or "").replace("-", "").lower()
+                            if not norm_cur_db_id or norm_cur_db_id not in known_db_ids:
                                 b["database_id"] = matched_db_id
                             if data_sources and isinstance(data_sources[0], dict):
-                                data_sources[0]["id"] = matched_db_id
+                                norm_ds_id = str(data_sources[0].get("id") or "").replace("-", "").lower()
+                                if not norm_ds_id or norm_ds_id not in known_db_ids:
+                                    data_sources[0]["id"] = matched_db_id
                     else:
                         db_id = str(b.get("database_id") or b.get("id") or "")
                         db_label = source_name or db_id or "Unknown DB"
