@@ -213,6 +213,134 @@ class TestSmartDbViews(unittest.TestCase):
             "db-ms", "タグ", ["Python"], operator="contains"
         )
 
+    @patch("src.importer.requests")
+    def test_api_views_config_creates_views_with_quick_filters(self, mock_requests):
+        """--enrich-via-api で取得した views_config（quick_filters 含む）が create_database_view で反映されること"""
+        importer = self._create_importer()
+        importer.client.create_database.return_value = {"id": "db-api", "_links": {"webui": "/spaces/TEST/database/db-api"}}
+        importer.client.create_database_view.return_value = {"id": "v-new", "name": "AAAビュー"}
+
+        db_node = PageNode(
+            id="db-node-api",
+            title="同じ名前",
+            node_type="database",
+            properties={
+                "schema": {
+                    "名前": {"id": "title", "type": "title"},
+                    "項番": {"id": "CN>o", "type": "number"},
+                    "選択": {"id": "|jHk", "type": "select"},
+                    "タグ": {"id": "tag1", "type": "multi_select"},
+                },
+                "views_config": [
+                    {
+                        "id": "v-default",
+                        "name": "Untitled",
+                        "type": "table",
+                        "filter": None,
+                        "quick_filters": None,
+                        "sorts": None,
+                        "configuration": {"type": "table", "properties": []},
+                    },
+                    {
+                        "id": "v-nomatch",
+                        "name": "マッチしないView",
+                        "type": "table",
+                        "filter": None,
+                        "quick_filters": {"CN>o": {"number": {"equals": 1000}}},
+                        "sorts": None,
+                        "configuration": {"type": "table", "properties": []},
+                    },
+                    {
+                        "id": "v-aaa",
+                        "name": "AAAビュー",
+                        "type": "table",
+                        "filter": None,
+                        "quick_filters": {
+                            "|jHk": {"select": {"equals": "AAA"}},
+                            "tag1": {"multi_select": {"equals": "Python"}},
+                        },
+                        "sorts": None,
+                        "configuration": {"type": "table", "properties": []},
+                    },
+                ],
+            },
+            children=[
+                PageNode(
+                    id="r1",
+                    title="Row 1",
+                    node_type="database_row",
+                    properties={
+                        "項番": {"type": "number", "value": "1"},
+                        "選択": {"type": "select", "value": "AAA"},
+                        "タグ": {"type": "multi_select", "value": ["Python"]},
+                    },
+                )
+            ],
+        )
+
+        importer._import_node_recursive(db_node, parent_id="root-conf", overwrite=False)
+
+        calls = importer.client.create_database_view.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].kwargs["view_name"], "マッチしないView")
+        self.assertEqual(calls[0].kwargs["filters"], [{"field": "項番", "operator": "=", "value": "1000"}])
+        self.assertEqual(calls[1].kwargs["view_name"], "AAAビュー")
+        self.assertEqual(
+            calls[1].kwargs["filters"],
+            [
+                {"field": "選択", "operator": "=", "value": "AAA"},
+                {"field": "タグ", "operator": "contains", "value": "Python"},
+            ],
+        )
+
+    @patch("src.api_enricher.requests")
+    def test_api_enricher_preserves_view_column_order_and_quick_filters(self, mock_req):
+        """NotionApiEnricher がビューの properties 順に schema を整列し、quick_filters も保持すること"""
+        from src.api_enricher import NotionApiEnricher
+
+        def fake_get(url, headers=None, timeout=15):
+            r = MagicMock()
+            r.status_code = 200
+            r.ok = True
+            if "/v1/databases/" in url:
+                r.json.return_value = {
+                    "properties": {
+                        "作成日時": {"id": "@VEm", "type": "created_time"},
+                        "項番": {"id": "CN>o", "type": "number"},
+                        "名前": {"id": "title", "type": "title"},
+                    }
+                }
+            elif "/v1/views?" in url:
+                r.json.return_value = {"results": [{"id": "v1"}]}
+            elif "/v1/views/v1" in url:
+                r.json.return_value = {
+                    "id": "v1",
+                    "name": "マッチしないView",
+                    "type": "table",
+                    "filter": None,
+                    "quick_filters": {"CN>o": {"number": {"equals": 1000}}},
+                    "sorts": None,
+                    "configuration": {
+                        "properties": [
+                            {"property_id": "CN>o", "property_name": "項番"},
+                            {"property_id": "title", "property_name": "名前"},
+                            {"property_id": "@VEm", "property_name": "作成日時"},
+                        ]
+                    },
+                }
+            return r
+
+        mock_req.get.side_effect = fake_get
+        mock_req.post.return_value = MagicMock(status_code=200, ok=True, json=lambda: {"results": [], "has_more": False})
+
+        enricher = NotionApiEnricher("secret_test")
+        db_node = PageNode(id="4157be77-284d-8021-b09e-f9e9a1a7475d", title="同じ名前", node_type="database")
+        summary = {"databases_enriched": 0, "properties_mapped": 0, "views_enriched": 0, "errors": []}
+        enricher._enrich_database(db_node, summary)
+
+        self.assertEqual(list(db_node.properties["schema"].keys()), ["項番", "名前", "作成日時"])
+        self.assertEqual(db_node.properties["views_config"][0]["quick_filters"], {"CN>o": {"number": {"equals": 1000}}})
+
 
 if __name__ == "__main__":
     unittest.main()

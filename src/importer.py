@@ -1582,6 +1582,176 @@ class ConfluenceImporter:
         _traverse_pages(root_node)
         return reqs
 
+    @staticmethod
+    def _extract_notion_view_filters(
+        view_cfg: Dict[str, Any],
+        prop_id_to_name: Dict[str, str],
+        multi_props: List[str],
+        sanitize_fn: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """Notion Views API の filter / quick_filters を Confluence add_filter 形式へ変換する。"""
+        op_map = {
+            "equals": "=",
+            "does_not_equal": "!=",
+            "contains": "contains",
+            "greater_than": ">",
+            "less_than": "<",
+            "greater_than_or_equal_to": ">=",
+            "less_than_or_equal_to": "<=",
+        }
+        results: List[Dict[str, Any]] = []
+
+        def _resolve_field_name(raw_key: str) -> str:
+            name = prop_id_to_name.get(raw_key, raw_key)
+            if sanitize_fn:
+                name = sanitize_fn(name) or name
+            return name
+
+        def _parse_condition(field_key: str, cond_body: Dict[str, Any]) -> None:
+            if not isinstance(cond_body, dict) or not field_key:
+                return
+            field_name = _resolve_field_name(field_key)
+            for p_type, spec in cond_body.items():
+                if p_type in ("property", "timestamp") or not isinstance(spec, dict):
+                    continue
+                for notion_op, val in spec.items():
+                    if notion_op not in op_map or val is None or isinstance(val, (dict, list)):
+                        continue
+                    conf_op = op_map[notion_op]
+                    if p_type == "multi_select" or field_name in multi_props:
+                        if notion_op in ("equals", "contains"):
+                            conf_op = "contains"
+                    val_str = str(val).lower() if isinstance(val, bool) else str(val)
+                    results.append({"field": field_name, "operator": conf_op, "value": val_str})
+
+        def _walk_filter(node: Any) -> None:
+            if not isinstance(node, dict):
+                return
+            if "and" in node and isinstance(node["and"], list):
+                for item in node["and"]:
+                    _walk_filter(item)
+                return
+            if "or" in node and isinstance(node["or"], list):
+                for item in node["or"]:
+                    _walk_filter(item)
+                return
+            prop_key = node.get("property")
+            if prop_key:
+                _parse_condition(str(prop_key), node)
+
+        _walk_filter(view_cfg.get("filter"))
+        quick_filters = view_cfg.get("quick_filters")
+        if isinstance(quick_filters, dict):
+            for q_key, q_cond in quick_filters.items():
+                if isinstance(q_cond, dict):
+                    _parse_condition(str(q_key), q_cond)
+        return results
+
+    def _apply_api_views_config(
+        self,
+        confluence_page_id: str,
+        node: PageNode,
+        views_config: List[Dict[str, Any]],
+        existing_views: List[Dict[str, Any]],
+        single_props: List[str],
+        multi_props: List[str],
+    ) -> None:
+        """--enrich-via-api で取得した Notion Views API 定義を Confluence データベースへ反映する。"""
+        schema = node.properties.get("schema") or {}
+        prop_id_to_name: Dict[str, str] = {}
+        for pname, pinfo in schema.items():
+            if isinstance(pinfo, dict) and pinfo.get("id"):
+                prop_id_to_name[str(pinfo["id"])] = pname
+        for vc in views_config:
+            for cp in (vc.get("configuration") or {}).get("properties") or []:
+                if isinstance(cp, dict) and cp.get("property_id") and cp.get("property_name"):
+                    prop_id_to_name[str(cp["property_id"])] = str(cp["property_name"])
+
+        existing_names = {v.get("name") for v in existing_views if v.get("name")}
+        existing_board_names = {v.get("name") for v in existing_views if v.get("type") == "board"}
+        has_gallery_view = any(v.get("type") == "gallery" or "ギャラリー" in v.get("name", "") for v in existing_views)
+        sanitize_fn = getattr(self.converter, "_sanitize_db_field_name", None)
+
+        logger.info(f"Applying {len(views_config)} API view configs for [{node.title}]")
+        for vc in views_config:
+            v_name = (vc.get("name") or "").strip() or "Untitled"
+            v_type = (vc.get("type") or "table").strip().lower()
+            v_cfg = vc.get("configuration") or {}
+            filters = self._extract_notion_view_filters(vc, prop_id_to_name, multi_props, sanitize_fn=sanitize_fn)
+
+            sorts: List[Dict[str, Any]] = []
+            for s in vc.get("sorts") or []:
+                if isinstance(s, dict) and s.get("property"):
+                    f_name = prop_id_to_name.get(str(s["property"]), str(s["property"]))
+                    if sanitize_fn:
+                        f_name = sanitize_fn(f_name) or f_name
+                    direction = "desc" if s.get("direction") == "descending" else "asc"
+                    sorts.append({"field": f_name, "direction": direction})
+
+            if v_name in ("Untitled", "Default view") and v_type == "table" and not filters and not sorts:
+                continue
+            if v_name in existing_names:
+                continue
+
+            if v_type == "board":
+                gb = v_cfg.get("group_by")
+                gb_field = None
+                if isinstance(gb, dict):
+                    gb_raw = gb.get("property_name") or gb.get("property_id") or gb.get("property")
+                    if gb_raw:
+                        gb_field = prop_id_to_name.get(str(gb_raw), str(gb_raw))
+                elif isinstance(gb, str) and gb:
+                    gb_field = prop_id_to_name.get(gb, gb)
+                if not gb_field:
+                    gb_field = single_props[0] if single_props else None
+                if gb_field and v_name not in existing_board_names:
+                    url_get = f"{self.client.base_url}/api/v2/databases/{confluence_page_id}"
+                    r_get = requests.get(url_get, auth=self.client.auth, timeout=15)
+                    if r_get.ok:
+                        cur_v = r_get.json().get("version", {}).get("number", 1)
+                        b_csv = f"<metadata>\nadd_view,{v_name},board,{gb_field}\n</metadata>\n<data>\noperation_type,entry_index\n</data>"
+                        requests.put(
+                            url_get,
+                            json={"id": str(confluence_page_id), "version": {"number": cur_v + 1}, "body": {"representation": "csv", "value": b_csv}},
+                            auth=self.client.auth,
+                            timeout=30,
+                        )
+                        existing_names.add(v_name)
+                        existing_board_names.add(v_name)
+                        logger.info(f"Created API board view [{v_name}] on database [{node.title}]")
+                continue
+
+            if v_type == "gallery":
+                if not has_gallery_view:
+                    self.client.create_database_view(
+                        confluence_page_id,
+                        view_name=v_name,
+                        layout="gallery",
+                        filters=filters or None,
+                        sorts=sorts or None,
+                    )
+                    existing_names.add(v_name)
+                    has_gallery_view = True
+                continue
+
+            target_layout = v_type if v_type in ("table", "list") else "table"
+            created = self.client.create_database_view(
+                confluence_page_id,
+                view_name=v_name,
+                layout=target_layout,
+                filters=filters or None,
+                sorts=sorts or None,
+            )
+            if not created and (filters or sorts):
+                # フィルタ/ソート演算子がConfluence側で未対応の場合でもビュー自体は作成する
+                created = self.client.create_database_view(
+                    confluence_page_id,
+                    view_name=v_name,
+                    layout=target_layout,
+                )
+            if created:
+                existing_names.add(v_name)
+
     def import_tree(
         self,
         root_node: PageNode,
@@ -3268,6 +3438,15 @@ class ConfluenceImporter:
                         elif v_layout == "gallery":
                             if not has_gallery_view:
                                 self.client.create_database_view(confluence_page_id, view_name=v_name, layout="gallery")
+                elif node.properties.get("views_config"):
+                    self._apply_api_views_config(
+                        confluence_page_id=confluence_page_id,
+                        node=node,
+                        views_config=node.properties["views_config"],
+                        existing_views=existing_views,
+                        single_props=single_props,
+                        multi_props=multi_props,
+                    )
                 else:
                     norm_db_id = node.id.replace("-", "").lower()
                     db_req = getattr(self, "_db_view_requirements", {}).get(norm_db_id, {})

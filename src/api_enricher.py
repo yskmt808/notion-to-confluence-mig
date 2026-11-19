@@ -237,6 +237,15 @@ class NotionApiEnricher:
         logger.info(f"[API-ENRICH] Fetching exact schema for database [{db_node.title}] ({formatted_id})")
 
         # 1. データベースのプロパティスキーマ取得 (2022-06-28 API)
+        existing_col_order: List[str] = []
+        if db_node.properties.get("schema"):
+            existing_col_order = list(db_node.properties["schema"].keys())
+        elif db_node.children:
+            for c in db_node.children:
+                for pk in (c.properties or {}).keys():
+                    if pk not in existing_col_order:
+                        existing_col_order.append(pk)
+
         url_db = f"https://api.notion.com/v1/databases/{formatted_id}"
         schema = {}
         try:
@@ -275,6 +284,7 @@ class NotionApiEnricher:
                                 "name": vd.get("name"),
                                 "type": vd.get("type"),
                                 "filter": vd.get("filter"),
+                                "quick_filters": vd.get("quick_filters"),
                                 "sorts": vd.get("sorts"),
                                 "configuration": vd.get("configuration", {}),
                             })
@@ -284,6 +294,31 @@ class NotionApiEnricher:
                     logger.info(f"[API-ENRICH] Retrieved {len(views_info)} view configs for [{db_node.title}]: {[v['name'] for v in views_info]}")
         except Exception as ve:
             logger.debug(f"[API-ENRICH] Views API skipped or not available for {db_node.title}: {ve}")
+
+        # 2.5. Notion上の見た目（ビューのproperties順、または既存のHTML/CSV列順）に合わせてschemaキー順を整列
+        if schema:
+            view_prop_order: List[str] = []
+            for vc in views_info:
+                cfg_props = (vc.get("configuration") or {}).get("properties") or []
+                if isinstance(cfg_props, list) and cfg_props:
+                    for cp in cfg_props:
+                        if isinstance(cp, dict) and cp.get("property_name"):
+                            pname = cp["property_name"]
+                            if pname not in view_prop_order:
+                                view_prop_order.append(pname)
+                    if view_prop_order:
+                        break
+            preferred_order = view_prop_order or existing_col_order
+            if preferred_order:
+                ordered_schema: Dict[str, Any] = {}
+                for pname in preferred_order:
+                    if pname in schema and pname not in ordered_schema:
+                        ordered_schema[pname] = schema[pname]
+                for pname, pinfo in schema.items():
+                    if pname not in ordered_schema:
+                        ordered_schema[pname] = pinfo
+                schema = ordered_schema
+                db_node.properties["schema"] = schema
 
         # 3. DB行の people 列・作成者/更新者・日時を一括クエリ取得 (POST /v1/databases/{id}/query, page_size=100)
         if db_node.children:
