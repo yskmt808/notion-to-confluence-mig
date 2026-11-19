@@ -422,6 +422,86 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
             results = verifier.verify_tree(root, page_id_map, "parent-0")
         self.assertFalse(any(r["status"] == "FAIL" for r in results), f"Unexpected FAIL: {results}")
 
+    def test_aggregated_detail_page_uploads_and_disambiguates_row_images(self):
+        """1ページ集約方式で複数行に同名画像(Untitled.png)があっても重複回避して集約ページへアップロード＆埋め込みされること。"""
+        row1 = PageNode(
+            id="r-img-1",
+            title="行1",
+            node_type="database_row",
+            properties={"名前": {"type": "title", "value": "行1"}},
+            blocks=[{
+                "id": "b-img-1",
+                "type": "image",
+                "image": {"type": "file", "file": {"url": "img1/Untitled.png"}, "caption": []},
+                "_attachment_filename": "Untitled.png",
+                "_attachment_bytes": b"PNGDATA_1",
+            }],
+        )
+        row2 = PageNode(
+            id="r-img-2",
+            title="行2",
+            node_type="database_row",
+            properties={"名前": {"type": "title", "value": "行2"}},
+            blocks=[{
+                "id": "b-img-2",
+                "type": "image",
+                "image": {"type": "file", "file": {"url": "img2/Untitled.png"}, "caption": []},
+                "_attachment_filename": "Untitled.png",
+                "_attachment_bytes": b"PNGDATA_2",
+            }],
+        )
+        db = PageNode(
+            id="db-img",
+            title="画像ありDB",
+            node_type="database",
+            properties={"schema": {"名前": {"type": "title"}}},
+            children=[row1, row2],
+        )
+        root = PageNode(id="root-img", title="Root", node_type="page", children=[db])
+
+        created_pages = []
+        updated_pages = []
+        uploaded = []
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_space_id.return_value = "space-1"
+        mock_client.get_page_by_title.return_value = None
+        mock_client.get_database_by_title.return_value = None
+
+        def fake_create_page(space_key, title, body, parent_id=None):
+            pid = f"p_{len(created_pages) + 1}"
+            created_pages.append({"id": pid, "title": title})
+            return {"id": pid, "_links": {"webui": f"/spaces/{space_key}/pages/{pid}"}}
+
+        def fake_update_page(page_id, space_key, title, body, current_version, parent_id=None):
+            updated_pages.append({"id": page_id, "body": body})
+            return {"id": page_id}
+
+        def fake_upload_attachment(page_id, filename, file_bytes, mime_type=None):
+            uploaded.append({"page_id": page_id, "filename": filename, "bytes": file_bytes})
+            return {"id": f"att_{len(uploaded)}"}
+
+        mock_client.create_page.side_effect = fake_create_page
+        mock_client.update_page.side_effect = fake_update_page
+        mock_client.upload_attachment.side_effect = fake_upload_attachment
+        mock_client.create_database.return_value = {"id": "db_img_conf", "_links": {"webui": "/spaces/D/database/db_img_conf"}}
+        mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = []
+        mock_client.get_page_by_id.return_value = {"id": "p_2", "version": {"number": 1}}
+
+        importer = ConfluenceImporter("https://example.atlassian.net/wiki", "user", "tok", space_key="D")
+        importer.client = mock_client
+        importer.import_tree(root, parent_id="parent-0", overwrite=False)
+
+        self.assertEqual(len(uploaded), 2)
+        self.assertEqual([u["page_id"] for u in uploaded], ["p_2", "p_2"])
+        self.assertEqual([u["filename"] for u in uploaded], ["Untitled.png", "r2_Untitled.png"])
+        self.assertEqual([u["bytes"] for u in uploaded], [b"PNGDATA_1", b"PNGDATA_2"])
+
+        agg_body = [u["body"] for u in updated_pages if u["id"] == "p_2"][-1]
+        self.assertIn('ri:filename="Untitled.png"', agg_body)
+        self.assertIn('ri:filename="r2_Untitled.png"', agg_body)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2355,6 +2355,38 @@ class ConfluenceImporter:
             node._cover_uploaded = False
             logger.warning(f"Failed to download/upload cover image {filename}: {e}")
 
+    def _disambiguate_row_attachment_filenames(
+        self,
+        blocks: List[Dict[str, Any]],
+        row_idx: int,
+        used_filenames: Set[str],
+    ):
+        """1ページ集約ページ上で複数行が同名ファイル(例: Untitled.png)を持つ場合にファイル名を重複回避する。"""
+        for b in (blocks or []):
+            if not isinstance(b, dict):
+                continue
+            b_type = b.get("type")
+            if b_type in ("image", "file", "pdf", "video", "audio") or b.get("_attachment_bytes") or b.get("_attachment_zip_path"):
+                base_fn = unicodedata.normalize("NFC", self.converter._get_attachment_filename(b))
+                if base_fn and base_fn in used_filenames:
+                    candidate = f"r{row_idx}_{base_fn}"
+                    suffix = 2
+                    while candidate in used_filenames:
+                        candidate = f"r{row_idx}_{suffix}_{base_fn}"
+                        suffix += 1
+                    b["_attachment_filename"] = candidate
+            if b.get("children_blocks"):
+                self._disambiguate_row_attachment_filenames(b["children_blocks"], row_idx, used_filenames)
+
+    def _process_aggregated_attachments(self, body_children: List[PageNode], agg_page_id: str):
+        """1ページ集約詳細ページ配下の全レコード本文に含まれる画像・添付ファイルを一括アップロードする。"""
+        agg_uploaded_filenames: Set[str] = set()
+        for idx, child in enumerate(body_children, start=1):
+            if not getattr(child, "blocks", None):
+                continue
+            self._disambiguate_row_attachment_filenames(child.blocks, idx, agg_uploaded_filenames)
+            self._process_attachments(child.blocks, agg_page_id, uploaded_filenames=agg_uploaded_filenames)
+
     def _process_attachments(self, blocks: List[Dict[str, Any]], page_id: str, uploaded_filenames: Optional[Set[str]] = None):
         """ブロックツリー内の画像・添付ファイル・メディアをダウンロードし、Confluenceにアップロードする。"""
         if uploaded_filenames is None:
@@ -2764,6 +2796,8 @@ class ConfluenceImporter:
                             c for c in (node.children or [])
                             if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
                         ]
+                        if body_children and not self.checkpoint.is_pass2_done(agg_node_id):
+                            self._process_aggregated_attachments(body_children, agg_id)
                         with self._lock:
                             for c in body_children:
                                 anchor = urllib.parse.quote((c.title or "").strip(), safe="")
@@ -2905,6 +2939,7 @@ class ConfluenceImporter:
                         )
                     if self.dashboard:
                         self.dashboard.record_pass1_done(agg_title, node_type="page")
+                    self._process_aggregated_attachments(body_children, agg_page_id)
                     nested_children = [
                         sub for c in (node.children or []) for sub in (getattr(c, "children", None) or [])
                     ]
@@ -3035,6 +3070,7 @@ class ConfluenceImporter:
                 node._aggregated_detail_page_id = agg_page_id
                 node._aggregated_detail_page_title = agg_page_title
                 node._aggregated_detail_page_url = agg_page_url
+                self._process_aggregated_attachments(body_children, agg_page_id)
                 with self._lock:
                     self.migration_map[agg_node_id] = {
                         "confluence_id": agg_page_id,
