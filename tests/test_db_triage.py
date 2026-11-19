@@ -200,6 +200,85 @@ class TestDbTriage(unittest.TestCase):
             finally:
                 os.chdir(orig_cwd)
 
+    def test_static_table_embed_prefers_uuid_over_same_name_database(self):
+        """static_table (node_type=page) として移行されたDBの埋め込みが同名別DBに奪われないこと"""
+        from src.converter import NotionToConfluenceConverter
+        from src.extractor import PageNode
+
+        conv = NotionToConfluenceConverter()
+        conv.migration_map = {
+            "4157be77-284d-8021-b09e-f9e9a1a7475d": {
+                "node_type": "database",
+                "title": "同じ名前",
+                "url": "https://example.atlassian.net/wiki/spaces/S/database/7110696",
+                "views": {},
+            },
+            "4167be77-284d-8019-9cbe-e3bfa907e63e": {
+                "node_type": "page",
+                "title": "同じ名前 (2)",
+                "url": "https://example.atlassian.net/wiki/spaces/S/pages/7045206",
+            },
+        }
+        page = PageNode(
+            id="parent-1",
+            title="親ページ",
+            node_type="page",
+            blocks=[
+                {
+                    "id": "4167be77-284d-8019-9cbe-e3bfa907e63e",
+                    "type": "child_database",
+                    "is_linked_database": True,
+                    "database_id": "4167be77-284d-8019-9cbe-e3bfa907e63e",
+                    "data_sources": [{"name": "同じ名前", "id": "4167be77-284d-8019-9cbe-e3bfa907e63e"}],
+                    "views": [{"name": "同じ名前", "type": "table"}],
+                }
+            ],
+        )
+        html_out = conv.generate_page_content(page)
+        self.assertIn("https://example.atlassian.net/wiki/spaces/S/pages/7045206", html_out)
+        self.assertNotIn("7110696", html_out)
+
+    def test_static_table_overview_has_no_detailssummary_and_links_only_existing_details(self):
+        """static_tableページにdetailssummaryや壊れた子ページリンクが出ず、詳細がある行のみリンク化されること"""
+        from src.converter import NotionToConfluenceConverter
+        from src.extractor import PageNode
+
+        conv = NotionToConfluenceConverter()
+        conv.migration_map = {
+            "row-with-body": {
+                "confluence_id": "999",
+                "title": "raw1",
+                "url": "https://example.atlassian.net/wiki/spaces/S/pages/999#raw1",
+                "node_type": "database_row",
+            }
+        }
+        db_node = PageNode(
+            id="db-static",
+            title="同じ名前 (2)",
+            node_type="database",
+            properties={"title_column": "名前", "schema": {"名前": {"type": "title"}, "テキスト": {"type": "rich_text"}}},
+            children=[
+                PageNode(
+                    id="row-with-body",
+                    title="raw1",
+                    node_type="database_row",
+                    properties={"名前": {"type": "title", "value": "raw1"}, "テキスト": {"type": "rich_text", "value": "aaa"}},
+                ),
+                PageNode(
+                    id="row-no-body",
+                    title="raw2",
+                    node_type="database_row",
+                    properties={"名前": {"type": "title", "value": "raw2"}, "テキスト": {"type": "rich_text", "value": "bbb"}},
+                ),
+            ],
+        )
+        html_out = conv._generate_database_overview_content(db_node)
+        self.assertNotIn("detailssummary", html_out)
+        self.assertNotIn("動的連動テーブル", html_out)
+        self.assertNotIn("ri:content-title", html_out)
+        self.assertIn('href="https://example.atlassian.net/wiki/spaces/S/pages/999#raw1"', html_out)
+        self.assertIn("<td>raw2</td>", html_out)
+
 
 if __name__ == "__main__":
     unittest.main()

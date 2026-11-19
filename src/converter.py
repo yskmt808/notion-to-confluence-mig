@@ -1295,7 +1295,7 @@ class NotionToConfluenceConverter:
                         for cid in candidate_ids:
                             norm_cid = cid.replace("-", "").lower()
                             for mid, minfo in self.migration_map.items():
-                                if mid.replace("-", "").lower() == norm_cid and minfo.get("node_type") == "database":
+                                if mid.replace("-", "").lower() == norm_cid and minfo.get("node_type") in ("database", "page"):
                                     db_info = minfo
                                     break
                             if db_info:
@@ -1427,9 +1427,9 @@ class NotionToConfluenceConverter:
                     escaped_title = html.escape(db_title)
                     db_url = None
                     if hasattr(self, "migration_map") and self.migration_map:
-                        # Notion ID またはタイトル一致でマッピングされた Confluence Database の URL を検索
+                        # Notion ID またはタイトル一致でマッピングされた Confluence Database / static_table ページの URL を検索
                         m_entry = self.migration_map.get(b.get("id"))
-                        if m_entry and m_entry.get("node_type") == "database":
+                        if m_entry and m_entry.get("node_type") in ("database", "page"):
                             db_url = m_entry.get("url")
                         if not db_url:
                             norm_db_t = normalize_db_title(db_title)
@@ -2572,12 +2572,22 @@ class NotionToConfluenceConverter:
         return main_body + backlinks_html
 
     def _generate_database_overview_content(self, db_node: PageNode) -> str:
-        """データベースをConfluenceページとして表現する際の概要テーブルを生成する。"""
+        """static_table モード等でデータベースをConfluence通常ページの標準テーブルとして出力する。"""
+        has_detail_page = bool(getattr(db_node, "_aggregated_detail_page_url", None))
+        if not has_detail_page and hasattr(self, "migration_map") and self.migration_map:
+            db_entry = self.migration_map.get(db_node.id)
+            if isinstance(db_entry, dict) and db_entry.get("aggregated_detail_page_url"):
+                has_detail_page = True
+
+        info_text = f'<p>Notionデータベース <strong>{html.escape(db_node.title)}</strong> から移行された静的テーブルです。'
+        if has_detail_page:
+            info_text += '本文を持つ行の詳細は集約詳細ページへリンクされています。'
+        info_text += '</p>'
+
         content_parts = [
             '<ac:structured-macro ac:name="info">'
             '<ac:rich-text-body>'
-            f'<p>Notionデータベース <strong>{html.escape(db_node.title)}</strong> から移行されたデータ一覧です。'
-            '各行の詳細は配下の子ページとして格納されています。</p>'
+            f'{info_text}'
             '</ac:rich-text-body>'
             '</ac:structured-macro>'
         ]
@@ -2586,52 +2596,48 @@ class NotionToConfluenceConverter:
             content_parts.append("<p>レコードが存在しません。</p>")
             return "\n".join(content_parts)
 
-        # 全レコードのプロパティキーを収集
-        first_row_props = db_node.children[0].properties
+        # スキーマ順または全レコードのプロパティキーからカラム一覧を収集
+        schema = (db_node.properties or {}).get("schema") or {}
         title_col = (db_node.properties or {}).get("title_column")
+        if not title_col and schema:
+            for p_name, p_info in schema.items():
+                if isinstance(p_info, dict) and p_info.get("type") == "title":
+                    title_col = p_name
+                    break
+        first_row_props = db_node.children[0].properties or {}
         if not title_col:
             title_col = "タスク名" if "タスク名" in first_row_props else (next(iter(first_row_props.keys()), "名前") if first_row_props else "名前")
+
         keys = [title_col]
-        for k in first_row_props.keys():
-            if k not in keys:
-                keys.append(k)
+        if schema:
+            for k in schema.keys():
+                if k not in keys:
+                    keys.append(k)
+        for row in db_node.children:
+            for k in (row.properties or {}).keys():
+                if k not in keys:
+                    keys.append(k)
 
-        # 1. Confluence 動的連動マクロ: Page Properties Report (detailssummary)
-        # 子ページ（database_row）の details マクロと自動リアルタイム同期・連動
-        headings_csv = ",".join(keys)
-        report_macro = (
-            '<h2>📊 動的連動テーブル (Page Properties Report)</h2>'
-            '<p><em>💡 各行（子ページ）のプロパティを編集すると、この親テーブルも自動でリアルタイム連動・更新されます。</em></p>'
-            '<ac:structured-macro ac:name="detailssummary">'
-            '<ac:parameter ac:name="cql">parent = currentContent()</ac:parameter>'
-            f'<ac:parameter ac:name="headings">{html.escape(headings_csv)}</ac:parameter>'
-            '</ac:structured-macro>'
-        )
-        content_parts.append(report_macro)
-
-        # 2. 静的スナップショットテーブル（エクスポートや即時読み込み用のバックアップ）
-        table_html = [
-            '<h2>📋 静的スナップショットテーブル</h2>',
-            '<table class="wrapped"><thead><tr>'
-        ]
+        table_html = ['<table class="wrapped"><thead><tr>']
         for k in keys:
             table_html.append(f'<th>{html.escape(k)}</th>')
         table_html.append('</tr></thead><tbody>')
 
+        mig_map = getattr(self, "migration_map", None) or {}
         for row in db_node.children:
             table_html.append('<tr>')
+            row_entry = mig_map.get(row.id)
+            row_detail_url = row_entry.get("url") if isinstance(row_entry, dict) else None
             for k in keys:
-                prop = row.properties.get(k)
-                if k == "タスク名" or (k == keys[0]):
-                    # Confluenceネイティブ子ページリンクオブジェクト（スマートリンク・プレビュー対応）
+                prop = (row.properties or {}).get(k)
+                if k == title_col or k == keys[0]:
                     record_title = row.title or (prop.get("value") if isinstance(prop, dict) else str(prop or ""))
                     escaped_title = html.escape(record_title)
-                    table_html.append(
-                        f'<td><ac:link ac:card-appearance="inline">'
-                        f'<ri:page ri:content-title="{escaped_title}" />'
-                        f'<ac:link-body>{escaped_title}</ac:link-body>'
-                        f'</ac:link></td>'
-                    )
+                    if row_detail_url:
+                        escaped_url = html.escape(row_detail_url)
+                        table_html.append(f'<td><a href="{escaped_url}">📄 {escaped_title}</a></td>')
+                    else:
+                        table_html.append(f'<td>{escaped_title}</td>')
                 else:
                     formatted_val = self.format_property_for_confluence(prop)
                     table_html.append(f'<td>{formatted_val}</td>')

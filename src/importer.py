@@ -1990,7 +1990,11 @@ class ConfluenceImporter:
                 node.properties = {}
             return
 
-        if node.node_type in ("page", "database_row") and (node.blocks or node.properties):
+        is_static_table_db = (
+            node.node_type == "database"
+            and self._get_db_migration_mode(node) == "static_table"
+        )
+        if (node.node_type in ("page", "database_row") and (node.blocks or node.properties)) or is_static_table_db:
             with self._lock:
                 page_info = self.migration_map.get(node.id)
             if page_info:
