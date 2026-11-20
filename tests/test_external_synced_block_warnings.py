@@ -978,6 +978,115 @@ class TestUnifiedMissingAndUnsupportedWarningsPlanA(unittest.TestCase):
         self.assertEqual(db_blocks[0]["database_id"], db_id)
         self.assertFalse(db_blocks[0].get("_is_unresolved_external_db", False))
 
+    @patch("src.api_enricher.requests")
+    def test_nested_synced_block_api_enrichment_marks_internal_and_external_links(self, mock_req):
+        """enrich_tree でネストされた同期ブロックを展開した後に内部/外部ページリンク判定が実行され、不正な相対リンクにならないこと"""
+        from src.api_enricher import NotionApiEnricher
+        from src.converter import NotionToConfluenceConverter
+
+        root_id = "11111111-1111-1111-1111-111111111111"
+        internal_id = "22222222-2222-2222-2222-222222222222"
+        external_id = "33333333-3333-3333-3333-333333333333"
+        sb_id = "44444444-4444-4444-4444-444444444444"
+        callout_id = "55555555-5555-5555-5555-555555555555"
+
+        def fake_get(url, headers=None, params=None, timeout=15):
+            r = MagicMock()
+            r.status_code = 200
+            r.ok = True
+            if "/v1/users" in url:
+                r.json.return_value = {"results": [], "has_more": False}
+            elif f"/v1/blocks/{root_id}/children" in url:
+                r.json.return_value = {
+                    "results": [
+                        {
+                            "id": sb_id,
+                            "type": "synced_block",
+                            "synced_block": {"synced_from": {"type": "block_id", "block_id": sb_id}},
+                        }
+                    ],
+                    "has_more": False,
+                }
+            elif f"/v1/blocks/{sb_id}/children" in url:
+                r.json.return_value = {
+                    "results": [
+                        {
+                            "id": callout_id,
+                            "type": "callout",
+                            "has_children": True,
+                            "callout": {"rich_text": [{"type": "text", "text": {"content": "枠内"}, "plain_text": "枠内"}]},
+                        }
+                    ],
+                    "has_more": False,
+                }
+            elif f"/v1/blocks/{callout_id}/children" in url:
+                r.json.return_value = {
+                    "results": [
+                        {
+                            "id": "p-links",
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [
+                                    {
+                                        "type": "mention",
+                                        "mention": {"type": "page", "page": {"id": internal_id}},
+                                        "href": f"/{internal_id.replace('-', '')}",
+                                        "plain_text": "内部ページ",
+                                    },
+                                    {
+                                        "type": "mention",
+                                        "mention": {"type": "page", "page": {"id": external_id}},
+                                        "href": f"/{external_id.replace('-', '')}",
+                                        "plain_text": "外部ページ",
+                                    },
+                                ]
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                }
+            return r
+
+        mock_req.get.side_effect = fake_get
+
+        root = PageNode(
+            id=root_id,
+            title="Root",
+            node_type="page",
+            blocks=[
+                {
+                    "id": "ext-sb-slot",
+                    "type": "synced_block",
+                    "_is_external_synced_block": True,
+                    "synced_block": {"synced_from": {"type": "block_id", "block_id": sb_id}},
+                }
+            ],
+            children=[PageNode(id=internal_id, title="内部ページ", node_type="page")],
+        )
+
+        NotionApiEnricher("secret_test").enrich_tree(root)
+
+        nested_p = root.blocks[0]["children_blocks"][0]
+        rt_int, rt_ext = nested_p["paragraph"]["rich_text"]
+        self.assertFalse(rt_int.get("_is_unresolved_external_page", False))
+        self.assertTrue(rt_ext.get("_is_unresolved_external_page", False))
+        self.assertEqual(len(root.unresolved_external_pages), 1)
+
+        conv = NotionToConfluenceConverter()
+        conv.migration_map = {
+            internal_id: {
+                "confluence_id": "2001",
+                "title": "内部ページ",
+                "url": "https://example.atlassian.net/wiki/spaces/S/pages/2001",
+                "node_type": "page",
+            }
+        }
+        out_html = conv.blocks_to_storage_format(root.blocks)
+        self.assertIn('<ri:page ri:content-title="内部ページ" />', out_html)
+        self.assertIn(f'https://www.notion.so/{external_id.replace("-", "")}', out_html)
+        self.assertIn("移行対象外ページ", out_html)
+        self.assertNotIn(f'href="/{external_id.replace("-", "")}"', out_html)
+
 
 if __name__ == "__main__":
     unittest.main()

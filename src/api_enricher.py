@@ -16,6 +16,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from src.extractor import (
     PageNode,
     collect_external_synced_blocks_from_blocks,
+    mark_unresolved_external_references,
     normalize_notion_block,
 )
 from src.user_mapper import UserMappingManager
@@ -224,6 +225,9 @@ class NotionApiEnricher:
 
         # 2.5. ページ内に埋め込まれた Linked View (child_database ブロック) 側のビュー定義も取得・統合
         dumped_linked_views = self._enrich_linked_database_views(root_node, db_nodes_by_norm_id, summary)
+
+        # 2.6. APIで新規展開された同期ブロック内のリンク・DB参照を含め、内部/外部参照判定を再実行
+        mark_unresolved_external_references(root_node)
 
         # 3. 同姓同名検知
         summary["homonym_warnings"] = UserMappingManager.detect_homonyms(
@@ -836,28 +840,34 @@ class NotionApiEnricher:
         if status_code != 200:
             return "error", raw_target, []
 
-        leaf_blocks: List[Dict[str, Any]] = []
-        for cb in children:
+        def _expand_nested_block(cb: Dict[str, Any], cur_visited: Set[str]) -> List[Dict[str, Any]]:
             cb_type = cb.get("type")
             if cb_type == "synced_block":
-                sub_status, sub_target, sub_leaves = self._resolve_synced_block_leaf_children(cb, new_visited)
-                if sub_status == "inaccessible":
-                    return "inaccessible", sub_target or raw_target, []
-                if sub_status == "error":
-                    return "error", sub_target or raw_target, []
-                leaf_blocks.extend(sub_leaves)
-            else:
-                cb_copy = copy.deepcopy(cb)
-                if cb_copy.get("has_children") and not cb_copy.get("children_blocks"):
-                    c_stat, sub_ch = self._fetch_block_children_cached(cb_copy.get("id", ""))
-                    if c_stat == 200 and sub_ch:
-                        for sc in sub_ch:
-                            normalize_notion_block(sc)
-                            sc["_via_synced_block"] = True
-                        cb_copy["children_blocks"] = sub_ch
-                normalize_notion_block(cb_copy)
-                cb_copy["_via_synced_block"] = True
-                leaf_blocks.append(cb_copy)
+                sub_status, sub_target, sub_leaves = self._resolve_synced_block_leaf_children(cb, cur_visited)
+                if sub_status in ("inaccessible", "error"):
+                    raise RuntimeError(f"{sub_status}:{sub_target}")
+                return sub_leaves
+            cb_copy = copy.deepcopy(cb)
+            if cb_copy.get("has_children") and not cb_copy.get("children_blocks"):
+                c_stat, sub_ch = self._fetch_block_children_cached(cb_copy.get("id", ""))
+                if c_stat == 200 and sub_ch:
+                    expanded_sub: List[Dict[str, Any]] = []
+                    for sc in sub_ch:
+                        expanded_sub.extend(_expand_nested_block(sc, cur_visited))
+                    cb_copy["children_blocks"] = expanded_sub
+            normalize_notion_block(cb_copy)
+            cb_copy["_via_synced_block"] = True
+            return [cb_copy]
+
+        leaf_blocks: List[Dict[str, Any]] = []
+        for cb in children:
+            try:
+                leaf_blocks.extend(_expand_nested_block(cb, new_visited))
+            except RuntimeError as re_err:
+                parts = str(re_err).split(":", 1)
+                err_st = parts[0] if parts[0] in ("inaccessible", "error") else "error"
+                err_target = parts[1] if len(parts) > 1 and parts[1] else raw_target
+                return err_st, err_target, []
 
         return "resolved", raw_target, leaf_blocks
 
@@ -963,5 +973,7 @@ class NotionApiEnricher:
 
         if root_node:
             _walk(root_node)
+            if total_changed > 0:
+                mark_unresolved_external_references(root_node)
         return total_changed
 

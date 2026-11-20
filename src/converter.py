@@ -544,6 +544,22 @@ class NotionToConfluenceConverter:
                         continue
 
                     escaped_title = html.escape(target_title)
+                    if item.get("_is_unresolved_external_page"):
+                        m_href = (item.get("href") or "").strip()
+                        if m_href.startswith(("http://", "https://")):
+                            ext_url = m_href
+                        elif m_href.startswith("/"):
+                            ext_url = f"https://www.notion.so{m_href}"
+                        elif norm_id and len(norm_id) == 32:
+                            ext_url = f"https://www.notion.so/{norm_id}"
+                        else:
+                            ext_url = ""
+                        if ext_url:
+                            result.append(f'<a href="{html.escape(ext_url)}">{escaped_title}</a>（⚠️ 移行対象外ページ）')
+                        else:
+                            result.append(f'<span>{escaped_title}（⚠️ 移行対象外ページ）</span>')
+                        continue
+
                     link_html = (
                         f'<ac:link ac:card-appearance="inline">'
                         f'<ri:page ri:content-title="{escaped_title}" />'
@@ -716,7 +732,7 @@ class NotionToConfluenceConverter:
                 elif not target_info and (skipped_info := self._lookup_skipped_db_row(target_uuid)):
                     raw_label = re.sub(r"<[^>]+>", "", (item.get("plain_text") or (item.get("text") or {}).get("content", ""))).strip()
                     escaped = self._render_skipped_db_row_link(skipped_info, label=raw_label or target_title)
-                elif target_info or target_title or (href and href.startswith("#")):
+                elif not item.get("_is_unresolved_external_page") and (target_info or target_title or (href and href.startswith("#"))):
                     disp_title = (target_info.get("title") if target_info else None) or target_title or getattr(self, "current_page_title", "") or escaped
                     escaped_title = html.escape(disp_title)
 
@@ -792,10 +808,14 @@ class NotionToConfluenceConverter:
                 elif item.get("_is_unresolved_external_page"):
                     if href and href.startswith(("http://", "https://")):
                         escaped = f'<a href="{html.escape(href)}">{escaped}</a>（⚠️ 移行対象外ページ）'
+                    elif href and href.startswith("/"):
+                        abs_url = f"https://www.notion.so{href}"
+                        escaped = f'<a href="{html.escape(abs_url)}">{escaped}</a>（⚠️ 移行対象外ページ）'
                     else:
                         escaped = f'<span>{escaped}（⚠️ 移行対象外ページ）</span>'
                 elif href:
-                    escaped = f'<a href="{html.escape(href)}">{escaped}</a>'
+                    safe_href = f"https://www.notion.so{href}" if href.startswith("/") else href
+                    escaped = f'<a href="{html.escape(safe_href)}">{escaped}</a>'
 
             result.append(escaped)
 
