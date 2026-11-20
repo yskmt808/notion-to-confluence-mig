@@ -3,6 +3,7 @@ Notion からページ、ブロック階層、データベースおよびレコ�
 """
 
 import logging
+import math
 import re
 import time
 import unicodedata
@@ -13,6 +14,8 @@ from dataclasses import dataclass, field
 from notion_client import Client
 
 logger = logging.getLogger(__name__)
+
+AGGREGATED_DETAIL_MAX_ROWS_PER_PAGE = 30
 
 
 def normalize_notion_id(raw_id: Optional[str]) -> str:
@@ -1450,7 +1453,8 @@ def count_migratable_nodes(
             override_mode = _get_db_override(n)
             if override_mode == "skip":
                 return 0
-            if analyze_database_child_page_stats(n)["skip_child_pages"]:
+            db_stats = analyze_database_child_page_stats(n)
+            if db_stats["skip_child_pages"]:
                 return 1
             if override_mode == "individual" or (
                 override_mode is None
@@ -1460,13 +1464,14 @@ def count_migratable_nodes(
                 )
             ):
                 return 1 + sum(_count(c) for c in (getattr(n, "children", None) or []))
-            # aggregated または static_table: 本体1枚 + 集約詳細ページ1枚 + レコード配下のネスト子ページ/DB
+            # aggregated または static_table: 本体1枚 + 集約詳細ページ(上限30件で分割) + レコード配下のネスト子ページ/DB
+            detail_page_count = max(1, math.ceil(db_stats["body_rows"] / AGGREGATED_DETAIL_MAX_ROWS_PER_PAGE))
             nested_count = sum(
                 _count(sub)
                 for c in (getattr(n, "children", None) or [])
                 for sub in (getattr(c, "children", None) or [])
             )
-            return 2 + nested_count
+            return 1 + detail_page_count + nested_count
         return 1 + sum(_count(c) for c in (getattr(n, "children", None) or []))
 
     return _count(root_node)

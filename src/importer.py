@@ -25,6 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import requests
 from src.extractor import (
+    AGGREGATED_DETAIL_MAX_ROWS_PER_PAGE,
     PageNode,
     analyze_database_child_page_stats,
     classify_external_app_url,
@@ -41,8 +42,6 @@ from src.checkpoint import CheckpointWriteError
 from src.db_triage import resolve_db_migration_mode
 
 logger = logging.getLogger(__name__)
-
-AGGREGATED_DETAIL_MAX_ROWS_PER_PAGE = 30
 
 
 def split_aggregated_rows_evenly(

@@ -597,6 +597,21 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         self.assertEqual([len(c) for c in split_aggregated_rows_evenly(make_rows(65))], [22, 22, 21])
         self.assertEqual([len(c) for c in split_aggregated_rows_evenly(make_rows(90))], [30, 30, 30])
 
+        from src.extractor import count_migratable_nodes
+        body_rows = [
+            PageNode(
+                id=f"br-{i}",
+                title=f"R{i}",
+                node_type="database_row",
+                blocks=[{"id": f"b-{i}", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "plain_text": "body"}]}}],
+            )
+            for i in range(65)
+        ]
+        db = PageNode(id="db-cnt", title="DB", node_type="database", children=body_rows)
+        root = PageNode(id="root-cnt", title="Root", node_type="page", children=[db])
+        # Root(1) + DB本体(1) + 分割された集約子ページ(3) = 5
+        self.assertEqual(count_migratable_nodes(root), 5)
+
     def test_aggregated_detail_pages_split_and_update_concurrently(self):
         """65件の本文ありDB行が3分割(22/22/21)されて並行作成・Pass 2更新され、各行が正しい分割ページを指すこと。"""
         rows = [
