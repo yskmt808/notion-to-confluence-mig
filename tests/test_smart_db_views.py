@@ -341,6 +341,54 @@ class TestSmartDbViews(unittest.TestCase):
         self.assertEqual(list(db_node.properties["schema"].keys()), ["項番", "名前", "作成日時"])
         self.assertEqual(db_node.properties["views_config"][0]["quick_filters"], {"CN>o": {"number": {"equals": 1000}}})
 
+    def test_api_views_list_type_falls_back_to_table_and_records_warning_on_failure(self):
+        """Notion の 'list' ビューは 'table' へフォールバックし、作成失敗時は telemetry に警告が記録されること"""
+        from src.telemetry import SanitizedTelemetry
+
+        importer = self._create_importer()
+        tel = SanitizedTelemetry()
+        importer.telemetry = tel
+
+        db_node = PageNode(
+            id="db-list",
+            title="リストDB",
+            node_type="database",
+            properties={"schema": {"名前": {"id": "title", "type": "title"}}},
+        )
+
+        # 1. list -> table フォールバック
+        importer.client.create_database_view.return_value = {"id": "v-list", "name": "リスト表示"}
+        importer._apply_api_views_config(
+            confluence_page_id="conf-db-list",
+            node=db_node,
+            views_config=[{"id": "v1", "name": "リスト表示", "type": "list", "configuration": {}}],
+            existing_views=[],
+            single_props=[],
+            multi_props=[],
+        )
+        importer.client.create_database_view.assert_called_once_with(
+            "conf-db-list",
+            view_name="リスト表示",
+            layout="table",
+            filters=None,
+            sorts=None,
+        )
+        self.assertEqual(tel.total_warnings_count, 0)
+
+        # 2. 作成失敗時は telemetry に警告を記録
+        importer.client.create_database_view.reset_mock()
+        importer.client.create_database_view.return_value = None
+        importer._apply_api_views_config(
+            confluence_page_id="conf-db-list",
+            node=db_node,
+            views_config=[{"id": "v2", "name": "失敗ビュー", "type": "list", "configuration": {}}],
+            existing_views=[],
+            single_props=[],
+            multi_props=[],
+        )
+        self.assertEqual(tel.total_warnings_count, 1)
+        self.assertIn("失敗ビュー", tel.warnings[0])
+
 
 if __name__ == "__main__":
     unittest.main()

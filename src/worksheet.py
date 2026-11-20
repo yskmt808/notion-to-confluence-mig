@@ -31,7 +31,6 @@ ALLOWED_VIEW_LAYOUTS = [
     "table",
     "board",
     "gallery",
-    "list",
 ]
 
 

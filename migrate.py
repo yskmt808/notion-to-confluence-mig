@@ -1414,6 +1414,15 @@ def main():
     print(f"結果ログファイル: {result_path}")
     print_result_summary(mapping, result_path, show_all=args.show_all_pages, verbose=args.verbose)
 
+    raw_tel_warnings = getattr(telemetry, "warnings", None)
+    tel_warnings = raw_tel_warnings if isinstance(raw_tel_warnings, list) else []
+    if tel_warnings:
+        print(f"\n⚠️ 移行中の警告 ({len(tel_warnings)} 件):")
+        for tw in tel_warnings[:10]:
+            print(f"  - {tw}")
+        if len(tel_warnings) > 10:
+            print(f"  ... 他 {len(tel_warnings) - 10} 件（詳細はログまたは --generate-debug-report を参照）")
+
     pending_dbs = [item for item in mapping.values() if item.get("node_type") == "database" and item.get("pending_row_views")]
     if pending_dbs:
         print("\nℹ️ [Approach B / 非同期インデックス情報]")

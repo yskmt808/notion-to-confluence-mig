@@ -1711,6 +1711,13 @@ class ConfluenceImporter:
         has_gallery_view = any(v.get("type") == "gallery" or "ギャラリー" in v.get("name", "") for v in existing_views)
         sanitize_fn = getattr(self.converter, "_sanitize_db_field_name", None)
 
+        def _record_view_warning(msg: str) -> None:
+            logger.warning(msg)
+            if self.telemetry:
+                self.telemetry.record_warning(msg)
+            if self.dashboard:
+                self.dashboard.record_warning(msg)
+
         logger.info(f"Applying {len(views_config)} API view configs for [{node.title}]")
         for vc in views_config:
             v_name = (vc.get("name") or "").strip() or "Untitled"
@@ -1749,31 +1756,50 @@ class ConfluenceImporter:
                     if r_get.ok:
                         cur_v = r_get.json().get("version", {}).get("number", 1)
                         b_csv = f"<metadata>\nadd_view,{v_name},board,{gb_field}\n</metadata>\n<data>\noperation_type,entry_index\n</data>"
-                        requests.put(
+                        r_put = requests.put(
                             url_get,
                             json={"id": str(confluence_page_id), "version": {"number": cur_v + 1}, "body": {"representation": "csv", "value": b_csv}},
                             auth=self.client.auth,
                             timeout=30,
                         )
-                        existing_names.add(v_name)
-                        existing_board_names.add(v_name)
-                        logger.info(f"Created API board view [{v_name}] on database [{node.title}]")
+                        if r_put.ok:
+                            existing_names.add(v_name)
+                            existing_board_names.add(v_name)
+                            logger.info(f"Created API board view [{v_name}] on database [{node.title}]")
+                        else:
+                            _record_view_warning(
+                                f"DB [{node.title}] のボードビュー [{v_name}] 作成に失敗しました: HTTP {r_put.status_code} - {r_put.text}"
+                            )
+                    else:
+                        _record_view_warning(
+                            f"DB [{node.title}] のボードビュー [{v_name}] 作成に失敗しました (DB取得 HTTP {r_get.status_code})"
+                        )
                 continue
 
             if v_type == "gallery":
                 if not has_gallery_view:
-                    self.client.create_database_view(
+                    created_g = self.client.create_database_view(
                         confluence_page_id,
                         view_name=v_name,
                         layout="gallery",
                         filters=filters or None,
                         sorts=sorts or None,
                     )
-                    existing_names.add(v_name)
-                    has_gallery_view = True
+                    if created_g:
+                        existing_names.add(v_name)
+                        has_gallery_view = True
+                    else:
+                        _record_view_warning(
+                            f"DB [{node.title}] のギャラリービュー [{v_name}] 作成に失敗しました。"
+                        )
                 continue
 
-            target_layout = v_type if v_type in ("table", "list") else "table"
+            # Confluence Databases API は list / calendar / timeline 等に非対応のため table へフォールバック
+            target_layout = "table"
+            if v_type != "table":
+                logger.info(
+                    f"View [{v_name}] on [{node.title}] has Notion type '{v_type}'; falling back to Confluence 'table' layout."
+                )
             created = self.client.create_database_view(
                 confluence_page_id,
                 view_name=v_name,
@@ -1790,6 +1816,10 @@ class ConfluenceImporter:
                 )
             if created:
                 existing_names.add(v_name)
+            else:
+                _record_view_warning(
+                    f"DB [{node.title}] のビュー [{v_name}] (Notion type: {v_type} -> {target_layout}) の作成に失敗しました。"
+                )
 
     def import_tree(
         self,
