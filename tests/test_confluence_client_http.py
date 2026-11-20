@@ -484,10 +484,13 @@ class TestDatabaseViews(ClientTestCase):
             self.req.put.return_value = R(400, text="bad")
             self.assertIsNone(self.client.create_database_view("d1", "V"))
 
-        # PUT 成功でも作成後の一覧に見つからなければ None
+        # PUT 成功でも作成後の一覧に見つからなければ None (デフォルト) / return_pending_on_put_ok=True なら pending dict
         self.req.put.return_value = R(200)
         with patch.object(self.client, "get_database_views", side_effect=[[], []]):
             self.assertIsNone(self.client.create_database_view("d1", "V"))
+        with patch.object(self.client, "get_database_views", side_effect=[[], []]):
+            pending = self.client.create_database_view("d1", "V", return_pending_on_put_ok=True)
+            self.assertEqual(pending, {"id": None, "name": "V", "_pending_async_index": True})
 
     def test_setup_grouped_views_reuses_existing_without_put(self):
         existing = [{"id": "v1", "name": "状態: A"}, {"id": "v2", "name": "状態: B"}]

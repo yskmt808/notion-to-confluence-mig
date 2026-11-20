@@ -373,6 +373,7 @@ class TestSmartDbViews(unittest.TestCase):
             filters=None,
             sorts=None,
             hidden_fields=None,
+            return_pending_on_put_ok=True,
         )
         self.assertEqual(tel.total_warnings_count, 0)
 
@@ -664,6 +665,7 @@ class TestSmartDbViews(unittest.TestCase):
             filters=None,
             sorts=None,
             hidden_fields=["公開列", "非表示列"],
+            return_pending_on_put_ok=True,
         )
 
     @patch("src.api_enricher.requests")

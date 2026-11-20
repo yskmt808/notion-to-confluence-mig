@@ -836,6 +836,7 @@ class ConfluenceClient:
         filters: Optional[List[Dict[str, Any]]] = None,
         sorts: Optional[List[Dict[str, Any]]] = None,
         hidden_fields: Optional[List[str]] = None,
+        return_pending_on_put_ok: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         Confluence Databases に新しいビュー（フィルタ・ソート・非表示列付き）を自動作成する。
@@ -913,6 +914,12 @@ class ConfluenceClient:
             if (v.get("name") or "").strip() == norm_view_name:
                 logger.info(f"Successfully created view [{view_name}] (ID: {v.get('id')}) on database [{database_id}]")
                 return v
+        if return_pending_on_put_ok:
+            logger.info(
+                f"View [{view_name}] PUT succeeded (HTTP {r_put.status_code}) on database [{database_id}]; "
+                f"view ID will be resolved in Pass 2 refresh (not yet visible in immediate /views response)."
+            )
+            return {"id": None, "name": view_name, "_pending_async_index": True}
         logger.warning(
             f"View [{view_name}] PUT succeeded (HTTP {r_put.status_code}) on database [{database_id}], "
             f"but not found in /views response yet. Returned view names={[v.get('name') for v in new_views]} | metadata={metadata_lines}"
@@ -1834,6 +1841,7 @@ class ConfluenceImporter:
                         filters=filters or None,
                         sorts=sorts or None,
                         hidden_fields=hidden_fields or None,
+                        return_pending_on_put_ok=True,
                     )
                     if created_g:
                         existing_names.add(v_name)
@@ -1861,6 +1869,7 @@ class ConfluenceImporter:
                 filters=filters or None,
                 sorts=sorts or None,
                 hidden_fields=hidden_fields or None,
+                return_pending_on_put_ok=True,
             )
             if not created and (filters or sorts or hidden_fields):
                 # 非同期反映遅れで既に作成済みになっていないか再確認し、重複作成を防ぐ
@@ -1880,6 +1889,7 @@ class ConfluenceImporter:
                         confluence_page_id,
                         view_name=v_name,
                         layout=target_layout,
+                        return_pending_on_put_ok=True,
                     )
                     if not created:
                         refreshed2 = self.client.get_database_views(confluence_page_id)
@@ -1983,8 +1993,10 @@ class ConfluenceImporter:
                 if self.dashboard:
                     self.dashboard.set_main_task(f"Pass 2: データベース最新ビュー再取得中 ({i}/{len(db_items)}: [{ninfo['title']}])")
                 views = self.client.get_database_views(db_conf_id)
-                ninfo["views"] = {v["name"]: v["id"] for v in views}
-                logger.info(f"Refreshed views for database [{ninfo['title']}]: {list(ninfo['views'].keys())}")
+                if views:
+                    ninfo["views"] = {v["name"]: v["id"] for v in views if v.get("name") and v.get("id")}
+                    ninfo["views_info"] = views
+                    logger.info(f"Refreshed views for database [{ninfo['title']}]: {list(ninfo['views'].keys())}")
 
             self.converter.migration_map = self.migration_map
 
