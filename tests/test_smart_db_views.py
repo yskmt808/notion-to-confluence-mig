@@ -766,6 +766,54 @@ class TestSmartDbViews(unittest.TestCase):
         self.assertIn("savedViewId=vid-a", conv.generate_page_content(page_a))
         self.assertIn("savedViewId=vid-b", conv.generate_page_content(page_b))
 
+    def test_verifier_uses_views_config_for_expected_board_and_group_by_warnings(self):
+        """--enrich-via-api で views_config がある場合、Board/Group-by が不要なDBに警告を出さず、Board定義があるDBのみ警告すること"""
+        from src.verifier import MigrationVerifier
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = [{"id": "e1"}]
+
+        verifier = MigrationVerifier(mock_client)
+
+        # 1. ステータス列(2〜7値)があっても views_config に board が無ければ Board/Group-by 警告を出さないこと
+        db_no_board = PageNode(
+            id="db-vb-1",
+            title="テーブルのみDB",
+            node_type="database",
+            properties={
+                "schema": {"名前": {"type": "title"}, "ステータス": {"type": "select"}},
+                "views_config": [{"id": "v1", "name": "Untitled", "type": "table", "configuration": {}}],
+            },
+            children=[
+                PageNode(id="r1", title="R1", node_type="database_row", properties={"ステータス": {"type": "select", "value": "A"}}),
+                PageNode(id="r2", title="R2", node_type="database_row", properties={"ステータス": {"type": "select", "value": "B"}}),
+            ],
+        )
+        with patch("src.verifier.requests.get", return_value=MagicMock(ok=True, status_code=200, json=lambda: {"id": "conf-1", "title": "テーブルのみDB"})):
+            res1 = verifier.verify_database_node(db_no_board, "conf-1")
+        self.assertFalse(any("Board view layout" in w for w in res1["warnings"]))
+        self.assertFalse(any("Group by filtered views" in w for w in res1["warnings"]))
+
+        # 2. views_config に board があるのに Confluence に無い場合は Board 警告が出ること
+        db_with_board = PageNode(
+            id="db-vb-2",
+            title="ボードありDB",
+            node_type="database",
+            properties={
+                "schema": {"名前": {"type": "title"}, "ステータス": {"type": "select"}},
+                "views_config": [{"id": "v2", "name": "カンバン", "type": "board", "configuration": {"group_by": "ステータス"}}],
+            },
+            children=[
+                PageNode(id="r3", title="R3", node_type="database_row", properties={"ステータス": {"type": "select", "value": "A"}}),
+            ],
+        )
+        with patch("src.verifier.requests.get", return_value=MagicMock(ok=True, status_code=200, json=lambda: {"id": "conf-2", "title": "ボードありDB"})):
+            res2 = verifier.verify_database_node(db_with_board, "conf-2")
+        self.assertTrue(any("Board view layout" in w for w in res2["warnings"]))
+        self.assertFalse(any("Group by filtered views" in w for w in res2["warnings"]))
+
 
 if __name__ == "__main__":
     unittest.main()

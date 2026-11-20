@@ -728,6 +728,22 @@ class MigrationVerifier:
             expects_gallery = any(cv.get("layout") == "gallery" for cv in confirmed_views)
             return expects_board, expects_gallery, False
 
+        views_config = props.get("views_config")
+        if views_config:
+            single_props_api, _ = NotionToConfluenceConverter().get_select_field_configurations(node)
+            expects_board = any(
+                (vc.get("type") or "").strip().lower() == "board"
+                and bool((vc.get("configuration") or {}).get("group_by") or single_props_api)
+                for vc in views_config
+                if isinstance(vc, dict)
+            )
+            expects_gallery = any(
+                (vc.get("type") or "").strip().lower() == "gallery"
+                for vc in views_config
+                if isinstance(vc, dict)
+            )
+            return expects_board, expects_gallery, False
+
         single_props, multi_props = NotionToConfluenceConverter().get_select_field_configurations(node)
         norm_db_id = (getattr(node, "id", "") or "").replace("-", "").lower()
         db_req = (self._db_view_requirements or {}).get(norm_db_id, {})
