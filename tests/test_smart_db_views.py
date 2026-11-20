@@ -506,6 +506,91 @@ class TestSmartDbViews(unittest.TestCase):
             self.assertEqual(db_entry["views"][0]["name"], "AAAビュー")
             self.assertEqual(db_entry["views"][0]["quick_filters"], {"|jHk": {"select": {"equals": "AAA"}}})
 
+    @patch("src.api_enricher.requests")
+    def test_api_enricher_fetches_linked_view_configs_from_page_blocks_and_converter_uses_view_name(self, mock_req):
+        """ページ埋め込みの Linked View ブロックIDからも Views API を取得し、埋め込み先ビュー名・savedViewId に反映されること"""
+        import json
+        import os
+        import tempfile
+        from src.api_enricher import NotionApiEnricher
+
+        db_id = "4157be77-284d-8021-b09e-f9e9a1a7475d"
+        linked_block_id = "41d7be77-284d-804c-bf7d-e626bec1d556"
+
+        def fake_get(url, headers=None, timeout=15):
+            r = MagicMock()
+            r.status_code = 200
+            r.ok = True
+            if "/v1/users" in url:
+                r.json.return_value = {"results": [], "has_more": False}
+            elif f"/v1/databases/{db_id}" in url:
+                r.json.return_value = {"properties": {"名前": {"id": "title", "type": "title"}}}
+            elif f"/v1/views?database_id={db_id}" in url:
+                r.json.return_value = {"results": [{"id": "v-orig"}]}
+            elif "/v1/views/v-orig" in url:
+                r.json.return_value = {"id": "v-orig", "name": "Untitled", "type": "table", "configuration": {}}
+            elif f"/v1/views?database_id={linked_block_id}" in url:
+                r.json.return_value = {"results": [{"id": "v-linked-1"}]}
+            elif "/v1/views/v-linked-1" in url:
+                r.json.return_value = {
+                    "id": "v-linked-1",
+                    "name": "埋め込み固有View",
+                    "type": "table",
+                    "data_source_id": "ds-1",
+                    "filter": None,
+                    "quick_filters": {"title": {"title": {"equals": "abc"}}},
+                    "sorts": None,
+                    "configuration": {},
+                }
+            return r
+
+        mock_req.get.side_effect = fake_get
+        mock_req.post.return_value = MagicMock(status_code=200, ok=True, json=lambda: {"results": [], "has_more": False})
+
+        db_node = PageNode(id=db_id, title="元DB", node_type="database")
+        page_node = PageNode(
+            id="page-1",
+            title="埋め込み先ページ",
+            node_type="page",
+            blocks=[
+                {
+                    "id": linked_block_id,
+                    "type": "child_database",
+                    "is_linked_database": True,
+                    "database_id": db_id,
+                    "data_sources": [{"name": "元DB", "id": db_id}],
+                    "views": [{"name": "元DB", "type": "table"}],
+                }
+            ],
+        )
+        root = PageNode(id="root-lv", title="Root", node_type="page", children=[db_node, page_node])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dump_file = os.path.join(tmpdir, "dump.json")
+            NotionApiEnricher("secret_test").enrich_tree(root, dump_path=dump_file)
+            with open(dump_file, "r", encoding="utf-8") as f:
+                dump_data = json.load(f)
+            self.assertEqual(len(dump_data["linked_database_views"]), 1)
+            self.assertEqual(dump_data["linked_database_views"][0]["block_id"], linked_block_id)
+
+        # 元DBの views_config に「埋め込み固有View」がマージされ、ブロックの views も更新されていること
+        merged_names = [v["name"] for v in db_node.properties["views_config"]]
+        self.assertIn("埋め込み固有View", merged_names)
+        self.assertEqual(page_node.blocks[0]["views"][0]["name"], "埋め込み固有View")
+
+        # Converter が「すべてのデータ」よりも一致ビュー名「埋め込み固有View」の savedViewId を優先すること
+        conv = NotionToConfluenceConverter()
+        conv.migration_map = {
+            db_id: {
+                "node_type": "database",
+                "url": "https://example.atlassian.net/wiki/spaces/TEST/database/999",
+                "views": {"すべてのデータ": "vid-all", "埋め込み固有View": "vid-linked"},
+                "views_info": [],
+            }
+        }
+        out_html = conv.generate_page_content(page_node)
+        self.assertIn("savedViewId=vid-linked", out_html)
+
 
 if __name__ == "__main__":
     unittest.main()

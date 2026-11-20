@@ -1392,9 +1392,10 @@ class NotionToConfluenceConverter:
                         elif "完了" in v_name:
                             target_view_id = next((vid for name, vid in conf_views.items() if "完了" in name), None)
                         else:
-                            target_view_id = next((vid for name, vid in conf_views.items() if "すべてのデータ" in name or "default" in name.lower()), None)
-                            if not target_view_id and v_name in conf_views:
+                            if v_name and v_name in conf_views:
                                 target_view_id = conf_views[v_name]
+                            if not target_view_id:
+                                target_view_id = next((vid for name, vid in conf_views.items() if "すべてのデータ" in name or "default" in name.lower()), None)
                             if not target_view_id and conf_views:
                                 target_view_id = next(iter(conf_views.values()), None)
 

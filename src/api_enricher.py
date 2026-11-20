@@ -205,28 +205,25 @@ class NotionApiEnricher:
         self._fetch_workspace_users(summary)
 
         # 2. ツリー走査（DB補完＋未展開同期ブロックのピンポイント解決＋全ノードのユーザー補完）
-        dumped_databases: List[Dict[str, Any]] = []
+        db_nodes_by_norm_id: Dict[str, PageNode] = {}
+        db_nodes_order: List[PageNode] = []
 
         def traverse(node: PageNode):
             if node.node_type == "database":
                 self._enrich_database(node, summary)
-                if dump_path:
-                    schema = (node.properties or {}).get("schema") or {}
-                    views_cfg = (node.properties or {}).get("views_config") or []
-                    dumped_databases.append({
-                        "database_id": node.id,
-                        "title": node.title,
-                        "row_count": len(node.children or []),
-                        "column_order": list(schema.keys()),
-                        "properties": schema,
-                        "views": views_cfg,
-                    })
+                norm_db = (node.id or "").replace("-", "").lower()
+                if norm_db:
+                    db_nodes_by_norm_id[norm_db] = node
+                db_nodes_order.append(node)
             self._enrich_node_external_synced_blocks(node, summary)
             self._enrich_node_users(node, summary)
             for child in node.children:
                 traverse(child)
 
         traverse(root_node)
+
+        # 2.5. ページ内に埋め込まれた Linked View (child_database ブロック) 側のビュー定義も取得・統合
+        dumped_linked_views = self._enrich_linked_database_views(root_node, db_nodes_by_norm_id, summary)
 
         # 3. 同姓同名検知
         summary["homonym_warnings"] = UserMappingManager.detect_homonyms(
@@ -235,7 +232,19 @@ class NotionApiEnricher:
         )
 
         if dump_path:
-            self._write_enrichment_dump(dump_path, summary, dumped_databases)
+            dumped_databases: List[Dict[str, Any]] = []
+            for db_n in db_nodes_order:
+                schema = (db_n.properties or {}).get("schema") or {}
+                views_cfg = (db_n.properties or {}).get("views_config") or []
+                dumped_databases.append({
+                    "database_id": db_n.id,
+                    "title": db_n.title,
+                    "row_count": len(db_n.children or []),
+                    "column_order": list(schema.keys()),
+                    "properties": schema,
+                    "views": views_cfg,
+                })
+            self._write_enrichment_dump(dump_path, summary, dumped_databases, linked_database_views=dumped_linked_views)
 
         logger.info(
             f"API Enrichment completed: {summary['databases_enriched']} databases enriched, "
@@ -249,6 +258,7 @@ class NotionApiEnricher:
         dump_path: str,
         summary: Dict[str, Any],
         databases: List[Dict[str, Any]],
+        linked_database_views: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """取得したDBプロパティ・View定義の詳細をJSONファイルに出力する。"""
         parent_dir = os.path.dirname(os.path.abspath(dump_path))
@@ -258,10 +268,133 @@ class NotionApiEnricher:
             "dumped_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "summary": summary,
             "databases": databases,
+            "linked_database_views": linked_database_views or [],
         }
         with open(dump_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         logger.info(f"[API-ENRICH] Dumped API enrichment details ({len(databases)} DBs) to: {dump_path}")
+
+    @staticmethod
+    def _format_uuid(raw_id: str) -> str:
+        clean = (raw_id or "").replace("-", "")
+        if len(clean) == 32:
+            return f"{clean[:8]}-{clean[8:12]}-{clean[12:16]}-{clean[16:20]}-{clean[20:]}"
+        return raw_id
+
+    def _fetch_views_for_database_id(self, raw_id: str, label: str = "") -> List[Dict[str, Any]]:
+        """指定した database_id / Linked View block_id に対して Notion Views API を呼び出す。"""
+        formatted_id = self._format_uuid(raw_id)
+        views_info: List[Dict[str, Any]] = []
+        try:
+            url_views = f"https://api.notion.com/v1/views?database_id={formatted_id}"
+            res_v = requests.get(url_views, headers=self.headers_v2, timeout=15)
+            if res_v.status_code == 200:
+                raw_views = res_v.json().get("results", [])
+                for v in raw_views:
+                    vid = v.get("id")
+                    if vid:
+                        v_detail = requests.get(f"https://api.notion.com/v1/views/{vid}", headers=self.headers_v2, timeout=15)
+                        if v_detail.ok:
+                            vd = v_detail.json()
+                            views_info.append({
+                                "id": vd.get("id"),
+                                "name": vd.get("name"),
+                                "type": vd.get("type"),
+                                "data_source_id": vd.get("data_source_id"),
+                                "filter": vd.get("filter"),
+                                "quick_filters": vd.get("quick_filters"),
+                                "sorts": vd.get("sorts"),
+                                "configuration": vd.get("configuration", {}),
+                            })
+        except Exception as ve:
+            logger.debug(f"[API-ENRICH] Views API skipped or not available for {label or formatted_id}: {ve}")
+        return views_info
+
+    def _enrich_linked_database_views(
+        self,
+        root_node: PageNode,
+        db_nodes_by_norm_id: Dict[str, PageNode],
+        summary: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """ページ本文中の Linked View (child_database ブロック) からビュー定義を取得し、埋め込みと元DBへ統合する。"""
+        linked_dumps: List[Dict[str, Any]] = []
+        fetched_block_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+        def _walk_blocks(blocks: List[Dict[str, Any]], page_title: str) -> None:
+            for b in blocks or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "child_database" and not b.get("_is_unresolved_external_db"):
+                    block_id = str(b.get("id") or "").strip()
+                    target_id = str(
+                        b.get("database_id")
+                        or ((b.get("data_sources") or [{}])[0].get("id") if b.get("data_sources") else "")
+                        or ""
+                    ).strip()
+                    norm_bid = block_id.replace("-", "").lower()
+                    norm_tid = target_id.replace("-", "").lower()
+                    if norm_bid and norm_tid and norm_bid != norm_tid:
+                        if norm_bid not in fetched_block_cache:
+                            fetched_block_cache[norm_bid] = self._fetch_views_for_database_id(
+                                block_id, label=f"linked view on [{page_title}]"
+                            )
+                        linked_views = fetched_block_cache[norm_bid]
+                        if linked_views:
+                            summary["views_enriched"] += len(linked_views)
+                            b["views"] = [
+                                {
+                                    "id": lv.get("id"),
+                                    "name": lv.get("name"),
+                                    "type": lv.get("type") or "table",
+                                    "configuration": lv.get("configuration") or {},
+                                }
+                                for lv in linked_views
+                            ]
+                            target_db = db_nodes_by_norm_id.get(norm_tid)
+                            if target_db is not None:
+                                existing_cfg = target_db.properties.setdefault("views_config", [])
+                                existing_names = {
+                                    (ev.get("name") or "").strip()
+                                    for ev in existing_cfg
+                                    if isinstance(ev, dict) and ev.get("name")
+                                }
+                                existing_ids = {
+                                    ev.get("id")
+                                    for ev in existing_cfg
+                                    if isinstance(ev, dict) and ev.get("id")
+                                }
+                                for lv in linked_views:
+                                    lv_name = (lv.get("name") or "").strip()
+                                    if lv.get("id") in existing_ids or (lv_name and lv_name in existing_names):
+                                        continue
+                                    merged = dict(lv)
+                                    merged["source_block_id"] = block_id
+                                    existing_cfg.append(merged)
+                                    if lv_name:
+                                        existing_names.add(lv_name)
+                                    if lv.get("id"):
+                                        existing_ids.add(lv.get("id"))
+                            linked_dumps.append({
+                                "page_title": page_title,
+                                "block_id": block_id,
+                                "target_database_id": target_id,
+                                "views": linked_views,
+                            })
+                            logger.info(
+                                f"[API-ENRICH] Retrieved {len(linked_views)} linked view(s) on [{page_title}] "
+                                f"(block={block_id}): {[lv.get('name') for lv in linked_views]}"
+                            )
+                if b.get("children_blocks"):
+                    _walk_blocks(b["children_blocks"], page_title)
+
+        def _walk_nodes(node: PageNode) -> None:
+            if getattr(node, "blocks", None):
+                _walk_blocks(node.blocks, node.title or "")
+            for c in getattr(node, "children", None) or []:
+                _walk_nodes(c)
+
+        _walk_nodes(root_node)
+        return linked_dumps
 
     def _enrich_database(self, db_node: PageNode, summary: Dict[str, Any]):
         """単一データベースのスキーマ・ビュー定義・行ユーザー/監査情報をAPI取得してノードへ統合する。"""
