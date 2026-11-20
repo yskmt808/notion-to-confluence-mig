@@ -706,6 +706,14 @@ def main():
         help="Notion APIを併用してDBのプロパティ型スキーマとビュー属性をピンポイントで補完する (Task B.3)",
     )
     parser.add_argument(
+        "--dump-api-enrichment",
+        type=str,
+        nargs="?",
+        const="reports/api_enrichment_dump.json",
+        default=None,
+        help="デバッグ用: --enrich-via-api で取得したDBプロパティ・View定義の詳細をJSONファイルにダンプする (デフォルト: reports/api_enrichment_dump.json)",
+    )
+    parser.add_argument(
         "--export-worksheet",
         type=str,
         nargs="?",
@@ -1004,14 +1012,22 @@ def main():
     if args.enrich_via_api:
         print("⚡ [Task B.3] Notion APIからDBプロパティスキーマ・ビュー属性をピンポイント取得中...")
         enricher = NotionApiEnricher(token=notion_token)
-        enrich_summary = enricher.enrich_tree(tree)
+        if args.dump_api_enrichment:
+            enrich_summary = enricher.enrich_tree(tree, dump_path=args.dump_api_enrichment)
+        else:
+            enrich_summary = enricher.enrich_tree(tree)
         ws_u = getattr(enricher, "workspace_users", None)
         if isinstance(ws_u, list):
             workspace_users = ws_u
         user_msg = ""
         if enrich_summary.get("users_fetched") or enrich_summary.get("users_enriched"):
             user_msg = f", {enrich_summary.get('users_fetched', 0)} 名のユーザーキャッシュ ({enrich_summary.get('users_enriched', 0)} 箇所補完)"
-        print(f"✓ API補完完了: {enrich_summary['databases_enriched']} 件のデータベース, {enrich_summary['properties_mapped']} 件の正確なカラム型をマージしました{user_msg}\n")
+        print(f"✓ API補完完了: {enrich_summary['databases_enriched']} 件のデータベース, {enrich_summary['properties_mapped']} 件の正確なカラム型をマージしました{user_msg}")
+        if args.dump_api_enrichment:
+            print(f"📝 API補完詳細ダンプを出力しました: {args.dump_api_enrichment}")
+        print()
+    elif args.dump_api_enrichment:
+        print("ℹ️ --dump-api-enrichment は --enrich-via-api 指定時のみ出力されます。")
     elif use_zip and notion_token and collect_external_synced_pages(tree)[0] > 0:
         NotionApiEnricher(token=notion_token).enrich_external_synced_blocks(tree)
 

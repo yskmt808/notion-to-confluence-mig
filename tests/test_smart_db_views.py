@@ -445,6 +445,67 @@ class TestSmartDbViews(unittest.TestCase):
             ],
         )
 
+    @patch("src.api_enricher.requests")
+    def test_api_enricher_dumps_properties_and_views_to_json(self, mock_req):
+        """enrich_tree(dump_path=...) でプロパティ・カラム順・View定義詳細がJSON出力されること"""
+        import json
+        import os
+        import tempfile
+        from src.api_enricher import NotionApiEnricher
+
+        def fake_get(url, headers=None, timeout=15):
+            r = MagicMock()
+            r.status_code = 200
+            r.ok = True
+            if "/v1/users" in url:
+                r.json.return_value = {"results": [], "has_more": False}
+            elif "/v1/databases/" in url:
+                r.json.return_value = {
+                    "properties": {
+                        "名前": {"id": "title", "type": "title"},
+                        "選択": {"id": "|jHk", "type": "select"},
+                    }
+                }
+            elif "/v1/views?" in url:
+                r.json.return_value = {"results": [{"id": "v1"}]}
+            elif "/v1/views/v1" in url:
+                r.json.return_value = {
+                    "id": "v1",
+                    "name": "AAAビュー",
+                    "type": "table",
+                    "filter": None,
+                    "quick_filters": {"|jHk": {"select": {"equals": "AAA"}}},
+                    "sorts": None,
+                    "configuration": {
+                        "properties": [
+                            {"property_id": "|jHk", "property_name": "選択"},
+                            {"property_id": "title", "property_name": "名前"},
+                        ]
+                    },
+                }
+            return r
+
+        mock_req.get.side_effect = fake_get
+        mock_req.post.return_value = MagicMock(status_code=200, ok=True, json=lambda: {"results": [], "has_more": False})
+
+        enricher = NotionApiEnricher("secret_test")
+        db_node = PageNode(id="4157be77-284d-8021-b09e-f9e9a1a7475d", title="ダンプDB", node_type="database")
+        root = PageNode(id="root-dump", title="Root", node_type="page", children=[db_node])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dump_file = os.path.join(tmpdir, "sub", "dump.json")
+            enricher.enrich_tree(root, dump_path=dump_file)
+            self.assertTrue(os.path.exists(dump_file))
+            with open(dump_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(len(data["databases"]), 1)
+            db_entry = data["databases"][0]
+            self.assertEqual(db_entry["title"], "ダンプDB")
+            self.assertEqual(db_entry["column_order"], ["選択", "名前"])
+            self.assertIn("選択", db_entry["properties"])
+            self.assertEqual(db_entry["views"][0]["name"], "AAAビュー")
+            self.assertEqual(db_entry["views"][0]["quick_filters"], {"|jHk": {"select": {"equals": "AAA"}}})
+
 
 if __name__ == "__main__":
     unittest.main()

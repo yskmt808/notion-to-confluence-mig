@@ -6,7 +6,10 @@ HTML/CSVエクスポートから高速解析したPageNodeツリーに対し、N
 """
 
 import copy
+import datetime
+import json
 import logging
+import os
 import re
 import requests
 from typing import Dict, Any, List, Optional, Set, Tuple
@@ -183,7 +186,7 @@ class NotionApiEnricher:
         for u in UserMappingManager._iter_block_user_mentions(getattr(node, "blocks", []) or []):
             self._enrich_user_dict(u, summary)
 
-    def enrich_tree(self, root_node: PageNode) -> Dict[str, Any]:
+    def enrich_tree(self, root_node: PageNode, dump_path: Optional[str] = None) -> Dict[str, Any]:
         """ツリー内の全データベース・ユーザー情報をNotion APIから補完し、同姓同名警告を検知する。"""
         summary: Dict[str, Any] = {
             "databases_enriched": 0,
@@ -202,9 +205,22 @@ class NotionApiEnricher:
         self._fetch_workspace_users(summary)
 
         # 2. ツリー走査（DB補完＋未展開同期ブロックのピンポイント解決＋全ノードのユーザー補完）
+        dumped_databases: List[Dict[str, Any]] = []
+
         def traverse(node: PageNode):
             if node.node_type == "database":
                 self._enrich_database(node, summary)
+                if dump_path:
+                    schema = (node.properties or {}).get("schema") or {}
+                    views_cfg = (node.properties or {}).get("views_config") or []
+                    dumped_databases.append({
+                        "database_id": node.id,
+                        "title": node.title,
+                        "row_count": len(node.children or []),
+                        "column_order": list(schema.keys()),
+                        "properties": schema,
+                        "views": views_cfg,
+                    })
             self._enrich_node_external_synced_blocks(node, summary)
             self._enrich_node_users(node, summary)
             for child in node.children:
@@ -218,12 +234,34 @@ class NotionApiEnricher:
             workspace_users=self.workspace_users,
         )
 
+        if dump_path:
+            self._write_enrichment_dump(dump_path, summary, dumped_databases)
+
         logger.info(
             f"API Enrichment completed: {summary['databases_enriched']} databases enriched, "
             f"{summary['properties_mapped']} properties mapped, {summary['views_enriched']} views fetched, "
             f"{summary['users_fetched']} workspace users cached, {summary['users_enriched']} user refs enriched."
         )
         return summary
+
+    @staticmethod
+    def _write_enrichment_dump(
+        dump_path: str,
+        summary: Dict[str, Any],
+        databases: List[Dict[str, Any]],
+    ) -> None:
+        """取得したDBプロパティ・View定義の詳細をJSONファイルに出力する。"""
+        parent_dir = os.path.dirname(os.path.abspath(dump_path))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        payload = {
+            "dumped_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "summary": summary,
+            "databases": databases,
+        }
+        with open(dump_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.info(f"[API-ENRICH] Dumped API enrichment details ({len(databases)} DBs) to: {dump_path}")
 
     def _enrich_database(self, db_node: PageNode, summary: Dict[str, Any]):
         """単一データベースのスキーマ・ビュー定義・行ユーザー/監査情報をAPI取得してノードへ統合する。"""
