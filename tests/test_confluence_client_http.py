@@ -459,6 +459,21 @@ class TestDatabaseViews(ClientTestCase):
             csv_body,
         )
 
+    def test_create_view_includes_hidden_fields_when_specified(self):
+        self.req.get.return_value = R(200, {"version": {"number": 5}})
+        self.req.put.return_value = R(200)
+        new_view = {"id": "v5", "name": "非表示付き"}
+        with patch.object(self.client, "get_database_views", side_effect=[[], [new_view]]):
+            out = self.client.create_database_view(
+                "d1",
+                "非表示付き",
+                layout="table",
+                hidden_fields=["列A", "列B"],
+            )
+        self.assertEqual(out, new_view)
+        csv_body = self.req.put.call_args.kwargs["json"]["body"]["value"]
+        self.assertIn('add_view,非表示付き,table,,"列A,列B"', csv_body)
+
     def test_create_view_failure_paths(self):
         with patch.object(self.client, "get_database_views", return_value=[]):
             self.req.get.return_value = R(404)

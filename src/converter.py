@@ -2423,7 +2423,25 @@ class NotionToConfluenceConverter:
             field_lines.append(f"{self._escape_csv_cell(f_name)},{f_type},{f_cfg}")
         field_lines.append("</fields>")
 
-        hidden_fields_cell = f'"{hidden_link_col_name}"' if hidden_link_col_name else '""'
+        hidden_cols: List[str] = []
+        if hidden_link_col_name:
+            hidden_cols.append(hidden_link_col_name)
+        views_cfg = (db_node.properties or {}).get("views_config") or []
+        if isinstance(views_cfg, list) and views_cfg:
+            # デフォルトビュー（Untitled/Default view、または先頭ビュー）の visible=false 列を反映
+            default_vc = next(
+                (v for v in views_cfg if isinstance(v, dict) and (v.get("name") or "").strip() in ("", "Untitled", "Default view")),
+                views_cfg[0] if isinstance(views_cfg[0], dict) else None,
+            )
+            if isinstance(default_vc, dict):
+                field_name_set = {f[0] for f in fields}
+                for cp in (default_vc.get("configuration") or {}).get("properties") or []:
+                    if isinstance(cp, dict) and cp.get("visible") is False and cp.get("property_name"):
+                        h_name = self._sanitize_db_field_name(str(cp["property_name"]))
+                        if h_name and h_name in field_name_set and h_name != key_col_name and h_name not in hidden_cols:
+                            hidden_cols.append(h_name)
+
+        hidden_fields_cell = f'"{",".join(hidden_cols)}"' if hidden_cols else '""'
         view_lines = [
             "<views>",
             "view_name,layout,filters,sorts,hidden_fields",

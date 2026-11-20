@@ -372,6 +372,7 @@ class TestSmartDbViews(unittest.TestCase):
             layout="table",
             filters=None,
             sorts=None,
+            hidden_fields=None,
         )
         self.assertEqual(tel.total_warnings_count, 0)
 
@@ -590,6 +591,80 @@ class TestSmartDbViews(unittest.TestCase):
         }
         out_html = conv.generate_page_content(page_node)
         self.assertIn("savedViewId=vid-linked", out_html)
+
+    def test_visible_false_columns_are_applied_to_default_and_custom_views(self):
+        """views_config 内の visible=false カラムが generate_database_csv の hidden_fields および create_database_view に反映されること"""
+        db_node = PageNode(
+            id="db-vis",
+            title="表示制御DB",
+            node_type="database",
+            properties={
+                "schema": {
+                    "名前": {"id": "title", "type": "title"},
+                    "公開列": {"id": "p1", "type": "rich_text"},
+                    "非表示列": {"id": "p2", "type": "rich_text"},
+                },
+                "views_config": [
+                    {
+                        "id": "v-def",
+                        "name": "Untitled",
+                        "type": "table",
+                        "configuration": {
+                            "properties": [
+                                {"property_id": "title", "property_name": "名前", "visible": True},
+                                {"property_id": "p1", "property_name": "公開列", "visible": True},
+                                {"property_id": "p2", "property_name": "非表示列", "visible": False},
+                            ]
+                        },
+                    },
+                    {
+                        "id": "v-sub",
+                        "name": "サブビュー",
+                        "type": "table",
+                        "configuration": {
+                            "properties": [
+                                {"property_id": "title", "property_name": "名前", "visible": True},
+                                {"property_id": "p1", "property_name": "公開列", "visible": False},
+                                {"property_id": "p2", "property_name": "非表示列", "visible": False},
+                            ]
+                        },
+                    },
+                ],
+            },
+            children=[
+                PageNode(
+                    id="r1",
+                    title="Row1",
+                    node_type="database_row",
+                    properties={
+                        "名前": {"type": "title", "value": "Row1"},
+                        "公開列": {"type": "rich_text", "value": "a"},
+                        "非表示列": {"type": "rich_text", "value": "b"},
+                    },
+                )
+            ],
+        )
+        csv_body = NotionToConfluenceConverter().generate_database_csv(db_node, page_link_map={})
+        self.assertIn('すべてのデータ,table,"","","非表示列"', csv_body)
+
+        importer = self._create_importer()
+        importer.client.create_database_view.return_value = {"id": "v-sub-conf", "name": "サブビュー"}
+        importer._apply_api_views_config(
+            confluence_page_id="conf-db-vis",
+            node=db_node,
+            views_config=db_node.properties["views_config"],
+            existing_views=[],
+            single_props=[],
+            multi_props=[],
+        )
+        importer.client.create_database_view.assert_called_once_with(
+            "conf-db-vis",
+            view_name="サブビュー",
+            layout="table",
+            filters=None,
+            sorts=None,
+            hidden_fields=["公開列", "非表示列"],
+        )
 
 
 if __name__ == "__main__":

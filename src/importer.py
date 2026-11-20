@@ -835,12 +835,14 @@ class ConfluenceClient:
         layout: str = "table",
         filters: Optional[List[Dict[str, Any]]] = None,
         sorts: Optional[List[Dict[str, Any]]] = None,
+        hidden_fields: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Confluence Databases に新しいビュー（フィルタ・ソート付き）を自動作成する。
-        - layout: "table", "card", "board", "list"
+        Confluence Databases に新しいビュー（フィルタ・ソート・非表示列付き）を自動作成する。
+        - layout: "table", "card", "board"
         - filters: [{"field": "ステータス", "operator": "!=", "value": "完了"}]
         - sorts: [{"field": "期日", "direction": "asc"}]
+        - hidden_fields: ["メモ", "詳細リンク"]
         """
         norm_view_name = view_name.strip()
         existing_views = self.get_database_views(database_id)
@@ -854,9 +856,15 @@ class ConfluenceClient:
             return None
         cur_version = r_get.json().get("version", {}).get("number", 1)
 
+        add_view_line = f"add_view,{view_name},{layout}"
+        if hidden_fields:
+            clean_hidden = [str(hf).strip() for hf in hidden_fields if str(hf).strip()]
+            if clean_hidden:
+                add_view_line = f'add_view,{view_name},{layout},,"{",".join(clean_hidden)}"'
+
         metadata_lines = [
             "<metadata>",
-            f"add_view,{view_name},{layout}",
+            add_view_line,
         ]
         if filters:
             filter_exprs = []
@@ -1755,6 +1763,15 @@ class ConfluenceImporter:
                     direction = "desc" if s.get("direction") == "descending" else "asc"
                     sorts.append({"field": f_name, "direction": direction})
 
+            hidden_fields: List[str] = []
+            for cp in v_cfg.get("properties") or []:
+                if isinstance(cp, dict) and cp.get("visible") is False:
+                    raw_pname = cp.get("property_name") or prop_id_to_name.get(str(cp.get("property_id") or ""))
+                    if raw_pname:
+                        h_name = sanitize_fn(str(raw_pname)) if sanitize_fn else str(raw_pname)
+                        if h_name and h_name not in hidden_fields:
+                            hidden_fields.append(h_name)
+
             if v_name in ("Untitled", "Default view") and v_type == "table" and not filters and not sorts:
                 continue
             if v_name in existing_names:
@@ -1805,6 +1822,7 @@ class ConfluenceImporter:
                         layout="gallery",
                         filters=filters or None,
                         sorts=sorts or None,
+                        hidden_fields=hidden_fields or None,
                     )
                     if created_g:
                         existing_names.add(v_name)
@@ -1827,8 +1845,9 @@ class ConfluenceImporter:
                 layout=target_layout,
                 filters=filters or None,
                 sorts=sorts or None,
+                hidden_fields=hidden_fields or None,
             )
-            if not created and (filters or sorts):
+            if not created and (filters or sorts or hidden_fields):
                 # 非同期反映遅れで既に作成済みになっていないか再確認し、重複作成を防ぐ
                 refreshed = self.client.get_database_views(confluence_page_id)
                 if any((rv.get("name") or "").strip() == v_name for rv in refreshed):
