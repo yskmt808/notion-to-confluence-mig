@@ -436,6 +436,29 @@ class TestDatabaseViews(ClientTestCase):
         self.assertTrue(csv_body.startswith("<metadata>"))
         self.assertIn("<data>", csv_body)
 
+    def test_create_view_combines_multiple_filters_in_single_add_filter(self):
+        self.req.get.return_value = R(200, {"version": {"number": 5}})
+        self.req.put.return_value = R(200)
+        new_view = {"id": "v4", "name": "複合フィルタ"}
+        with patch.object(self.client, "get_database_views", side_effect=[[], [new_view]]):
+            out = self.client.create_database_view(
+                "d1",
+                "複合フィルタ",
+                layout="table",
+                filters=[
+                    {"field": "状態", "operator": "=", "value": "進行中"},
+                    {"field": "優先度", "operator": "!=", "value": "低"},
+                    {"field": "タグ", "operator": "contains", "value": "重要"},
+                    {"field": "数値", "operator": ">=", "value": "10"},
+                ],
+            )
+        self.assertEqual(out, new_view)
+        csv_body = self.req.put.call_args.kwargs["json"]["body"]["value"]
+        self.assertIn(
+            'add_filter,複合フィルタ,状態,"[\'状態\' = \'進行中\'],[\'優先度\' != \'低\'],[\'タグ\' contains \'重要\'],[\'数値\' >= \'10\']"',
+            csv_body,
+        )
+
     def test_create_view_failure_paths(self):
         with patch.object(self.client, "get_database_views", return_value=[]):
             self.req.get.return_value = R(404)

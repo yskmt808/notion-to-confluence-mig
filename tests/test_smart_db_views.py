@@ -389,6 +389,62 @@ class TestSmartDbViews(unittest.TestCase):
         self.assertEqual(tel.total_warnings_count, 1)
         self.assertIn("失敗ビュー", tel.warnings[0])
 
+    def test_api_views_does_not_duplicate_when_created_pending_and_extracts_all_4_filters(self):
+        """反映遅れでcreate_database_viewがNoneでも再確認で見つかれば重複作成せず、4条件フィルタをすべて抽出すること"""
+        importer = self._create_importer()
+        db_node = PageNode(
+            id="db-4f",
+            title="4フィルタDB",
+            node_type="database",
+            properties={
+                "schema": {
+                    "名前": {"id": "title", "type": "title"},
+                    "状態": {"id": "p_st", "type": "select"},
+                    "タグ": {"id": "p_tg", "type": "multi_select"},
+                    "期日": {"id": "p_dt", "type": "date"},
+                    "数値": {"id": "p_num", "type": "number"},
+                }
+            },
+        )
+        view_cfg = {
+            "id": "v-4f",
+            "name": "複合4条件",
+            "type": "table",
+            "filter": {
+                "and": [
+                    {"property": "p_st", "select": {"equals": "進行中"}},
+                    {"property": "p_tg", "multi_select": {"contains": "重要"}},
+                    {"property": "p_dt", "date": {"on_or_before": "2026-12-31"}},
+                ]
+            },
+            "quick_filters": {"p_num": {"number": {"greater_than": 5}}},
+            "configuration": {},
+        }
+        importer.client.create_database_view.return_value = None
+        importer.client.get_database_views.return_value = [{"id": "v-created", "name": "複合4条件", "type": "table"}]
+
+        importer._apply_api_views_config(
+            confluence_page_id="conf-db-4f",
+            node=db_node,
+            views_config=[view_cfg],
+            existing_views=[],
+            single_props=["状態"],
+            multi_props=["タグ"],
+        )
+
+        # 1回のみ呼ばれ、フォールバックの2回目は呼ばれないこと
+        self.assertEqual(importer.client.create_database_view.call_count, 1)
+        sent_filters = importer.client.create_database_view.call_args.kwargs["filters"]
+        self.assertEqual(
+            sent_filters,
+            [
+                {"field": "状態", "operator": "=", "value": "進行中"},
+                {"field": "タグ", "operator": "contains", "value": "重要"},
+                {"field": "期日", "operator": "<=", "value": "2026-12-31"},
+                {"field": "数値", "operator": ">", "value": "5"},
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

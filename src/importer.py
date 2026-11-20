@@ -842,9 +842,10 @@ class ConfluenceClient:
         - filters: [{"field": "ステータス", "operator": "!=", "value": "完了"}]
         - sorts: [{"field": "期日", "direction": "asc"}]
         """
+        norm_view_name = view_name.strip()
         existing_views = self.get_database_views(database_id)
         for v in existing_views:
-            if v.get("name") == view_name:
+            if (v.get("name") or "").strip() == norm_view_name:
                 return v
 
         url_get = f"{self.base_url}/api/v2/databases/{database_id}"
@@ -858,11 +859,15 @@ class ConfluenceClient:
             f"add_view,{view_name},{layout}",
         ]
         if filters:
+            filter_exprs = []
             for f in filters:
                 field = f["field"]
                 op = f.get("operator", "=")
                 val = f["value"]
-                metadata_lines.append(f'add_filter,{view_name},{field},"[\'{field}\' {op} \'{val}\']"')
+                filter_exprs.append(f"['{field}' {op} '{val}']")
+            primary_field = filters[0]["field"]
+            combined_expr = ",".join(filter_exprs)
+            metadata_lines.append(f'add_filter,{view_name},{primary_field},"{combined_expr}"')
 
         if sorts:
             for s in sorts:
@@ -887,9 +892,10 @@ class ConfluenceClient:
             logger.warning(f"Failed to create view [{view_name}] on database [{database_id}]: {r_put.status_code} - {r_put.text}")
             return None
 
+        time.sleep(0.5)
         new_views = self.get_database_views(database_id)
         for v in new_views:
-            if v.get("name") == view_name:
+            if (v.get("name") or "").strip() == norm_view_name:
                 logger.info(f"Successfully created view [{view_name}] (ID: {v.get('id')}) on database [{database_id}]")
                 return v
         return None
@@ -1633,10 +1639,15 @@ class ConfluenceImporter:
             "equals": "=",
             "does_not_equal": "!=",
             "contains": "contains",
+            "does_not_contain": "!=",
             "greater_than": ">",
             "less_than": "<",
             "greater_than_or_equal_to": ">=",
             "less_than_or_equal_to": "<=",
+            "before": "<",
+            "after": ">",
+            "on_or_before": "<=",
+            "on_or_after": ">=",
         }
         results: List[Dict[str, Any]] = []
 
@@ -1654,6 +1665,12 @@ class ConfluenceImporter:
                 if p_type in ("property", "timestamp") or not isinstance(spec, dict):
                     continue
                 for notion_op, val in spec.items():
+                    if notion_op == "is_empty" and val is True:
+                        results.append({"field": field_name, "operator": "=", "value": ""})
+                        continue
+                    if notion_op == "is_not_empty" and val is True:
+                        results.append({"field": field_name, "operator": "!=", "value": ""})
+                        continue
                     if notion_op not in op_map or val is None or isinstance(val, (dict, list)):
                         continue
                     conf_op = op_map[notion_op]
@@ -1674,7 +1691,7 @@ class ConfluenceImporter:
                 for item in node["or"]:
                     _walk_filter(item)
                 return
-            prop_key = node.get("property")
+            prop_key = node.get("property") or node.get("timestamp")
             if prop_key:
                 _parse_condition(str(prop_key), node)
 
@@ -1684,6 +1701,10 @@ class ConfluenceImporter:
             for q_key, q_cond in quick_filters.items():
                 if isinstance(q_cond, dict):
                     _parse_condition(str(q_key), q_cond)
+                elif isinstance(q_cond, list):
+                    for item in q_cond:
+                        if isinstance(item, dict):
+                            _parse_condition(str(q_key), item)
         return results
 
     def _apply_api_views_config(
@@ -1706,8 +1727,8 @@ class ConfluenceImporter:
                 if isinstance(cp, dict) and cp.get("property_id") and cp.get("property_name"):
                     prop_id_to_name[str(cp["property_id"])] = str(cp["property_name"])
 
-        existing_names = {v.get("name") for v in existing_views if v.get("name")}
-        existing_board_names = {v.get("name") for v in existing_views if v.get("type") == "board"}
+        existing_names = {(v.get("name") or "").strip() for v in existing_views if v.get("name")}
+        existing_board_names = {(v.get("name") or "").strip() for v in existing_views if v.get("type") == "board"}
         has_gallery_view = any(v.get("type") == "gallery" or "ギャラリー" in v.get("name", "") for v in existing_views)
         sanitize_fn = getattr(self.converter, "_sanitize_db_field_name", None)
 
@@ -1808,12 +1829,21 @@ class ConfluenceImporter:
                 sorts=sorts or None,
             )
             if not created and (filters or sorts):
-                # フィルタ/ソート演算子がConfluence側で未対応の場合でもビュー自体は作成する
-                created = self.client.create_database_view(
-                    confluence_page_id,
-                    view_name=v_name,
-                    layout=target_layout,
-                )
+                # 非同期反映遅れで既に作成済みになっていないか再確認し、重複作成を防ぐ
+                refreshed = self.client.get_database_views(confluence_page_id)
+                if any((rv.get("name") or "").strip() == v_name for rv in refreshed):
+                    created = {"name": v_name}
+                else:
+                    # フィルタ/ソート演算子がConfluence側で未対応の場合でもビュー自体は作成する
+                    created = self.client.create_database_view(
+                        confluence_page_id,
+                        view_name=v_name,
+                        layout=target_layout,
+                    )
+                    if not created:
+                        refreshed2 = self.client.get_database_views(confluence_page_id)
+                        if any((rv.get("name") or "").strip() == v_name for rv in refreshed2):
+                            created = {"name": v_name}
             if created:
                 existing_names.add(v_name)
             else:
