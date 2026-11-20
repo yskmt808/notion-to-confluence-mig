@@ -345,16 +345,15 @@ class NotionApiEnricher:
                         linked_views = fetched_block_cache[norm_bid]
                         if linked_views:
                             summary["views_enriched"] += len(linked_views)
-                            b["views"] = [
-                                {
-                                    "id": lv.get("id"),
-                                    "name": lv.get("name"),
-                                    "type": lv.get("type") or "table",
-                                    "configuration": lv.get("configuration") or {},
-                                }
-                                for lv in linked_views
-                            ]
+                            orig_views = b.get("views") or []
+                            orig_hint_name = (
+                                str(orig_views[0].get("name") or "").strip()
+                                if orig_views and isinstance(orig_views[0], dict)
+                                else ""
+                            )
                             target_db = db_nodes_by_norm_id.get(norm_tid)
+                            resolved_block_views: List[Dict[str, Any]] = []
+
                             if target_db is not None:
                                 existing_cfg = target_db.properties.setdefault("views_config", [])
                                 existing_names = {
@@ -367,26 +366,71 @@ class NotionApiEnricher:
                                     for ev in existing_cfg
                                     if isinstance(ev, dict) and ev.get("id")
                                 }
-                                for lv in linked_views:
-                                    lv_name = (lv.get("name") or "").strip()
-                                    if lv.get("id") in existing_ids or (lv_name and lv_name in existing_names):
-                                        continue
-                                    merged = dict(lv)
-                                    merged["source_block_id"] = block_id
-                                    existing_cfg.append(merged)
-                                    if lv_name:
-                                        existing_names.add(lv_name)
-                                    if lv.get("id"):
-                                        existing_ids.add(lv.get("id"))
+                                db_title = (target_db.title or "").strip()
+                                for lv_idx, lv in enumerate(linked_views):
+                                    raw_name = (lv.get("name") or "").strip()
+                                    if lv.get("id") and lv.get("id") in existing_ids:
+                                        existing_match = next(
+                                            (ev for ev in existing_cfg if isinstance(ev, dict) and ev.get("id") == lv.get("id")),
+                                            None,
+                                        )
+                                        assigned_name = (existing_match.get("name") if existing_match else raw_name) or raw_name
+                                    else:
+                                        if raw_name in ("", "Untitled", "Default view"):
+                                            if lv_idx == 0 and orig_hint_name and orig_hint_name not in ("Untitled", "Default view", db_title):
+                                                base_name = orig_hint_name
+                                            else:
+                                                base_name = page_title or "Embedded View"
+                                        elif raw_name not in existing_names:
+                                            base_name = raw_name
+                                        else:
+                                            base_name = f"{page_title} - {raw_name}" if page_title else raw_name
+
+                                        base_name = re.sub(r"[\r\n]+", " ", base_name).replace(",", "、").strip() or "Embedded View"
+                                        assigned_name = base_name
+                                        if assigned_name in existing_names:
+                                            suffix = 2
+                                            while f"{base_name} ({suffix})" in existing_names:
+                                                suffix += 1
+                                            assigned_name = f"{base_name} ({suffix})"
+
+                                        merged = dict(lv)
+                                        merged["name"] = assigned_name
+                                        merged["source_block_id"] = block_id
+                                        if page_title:
+                                            merged["source_page_title"] = page_title
+                                        existing_cfg.append(merged)
+                                        existing_names.add(assigned_name)
+                                        if lv.get("id"):
+                                            existing_ids.add(lv.get("id"))
+
+                                    resolved_block_views.append({
+                                        "id": lv.get("id"),
+                                        "name": assigned_name,
+                                        "type": lv.get("type") or "table",
+                                        "configuration": lv.get("configuration") or {},
+                                    })
+                            else:
+                                resolved_block_views = [
+                                    {
+                                        "id": lv.get("id"),
+                                        "name": lv.get("name"),
+                                        "type": lv.get("type") or "table",
+                                        "configuration": lv.get("configuration") or {},
+                                    }
+                                    for lv in linked_views
+                                ]
+
+                            b["views"] = resolved_block_views
                             linked_dumps.append({
                                 "page_title": page_title,
                                 "block_id": block_id,
                                 "target_database_id": target_id,
-                                "views": linked_views,
+                                "views": resolved_block_views,
                             })
                             logger.info(
                                 f"[API-ENRICH] Retrieved {len(linked_views)} linked view(s) on [{page_title}] "
-                                f"(block={block_id}): {[lv.get('name') for lv in linked_views]}"
+                                f"(block={block_id}): {[rv.get('name') for rv in resolved_block_views]}"
                             )
                 if b.get("children_blocks"):
                     _walk_blocks(b["children_blocks"], page_title)

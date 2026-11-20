@@ -666,6 +666,104 @@ class TestSmartDbViews(unittest.TestCase):
             hidden_fields=["公開列", "非表示列"],
         )
 
+    @patch("src.api_enricher.requests")
+    def test_same_named_linked_views_on_multiple_pages_get_unique_db_views_and_saved_view_ids(self, mock_req):
+        """複数ページのLinked Viewが同名('一覧'や'Untitled')でも、DB本体へ埋め込み先ごとの固有View名で定義され、各自のsavedViewIdへ紐付くこと"""
+        from src.api_enricher import NotionApiEnricher
+
+        db_id = "4157be77-284d-8021-b09e-f9e9a1a7475d"
+        blk_a = "41d7be77-284d-804c-bf7d-e626bec1d556"
+        blk_b = "41d7be77-284d-80ae-90bc-fb8f4096cc66"
+
+        def fake_get(url, headers=None, timeout=15):
+            r = MagicMock()
+            r.status_code = 200
+            r.ok = True
+            if "/v1/users" in url:
+                r.json.return_value = {"results": [], "has_more": False}
+            elif f"/v1/databases/{db_id}" in url:
+                r.json.return_value = {
+                    "properties": {
+                        "名前": {"id": "title", "type": "title"},
+                        "選択": {"id": "p_sel", "type": "select"},
+                    }
+                }
+            elif f"/v1/views?database_id={db_id}" in url:
+                r.json.return_value = {"results": [{"id": "v-base"}]}
+            elif "/v1/views/v-base" in url:
+                r.json.return_value = {"id": "v-base", "name": "一覧", "type": "table", "configuration": {}}
+            elif f"/v1/views?database_id={blk_a}" in url:
+                r.json.return_value = {"results": [{"id": "v-a"}]}
+            elif "/v1/views/v-a" in url:
+                r.json.return_value = {
+                    "id": "v-a",
+                    "name": "一覧",
+                    "type": "table",
+                    "quick_filters": {"p_sel": {"select": {"equals": "AAA"}}},
+                    "configuration": {},
+                }
+            elif f"/v1/views?database_id={blk_b}" in url:
+                r.json.return_value = {"results": [{"id": "v-b"}]}
+            elif "/v1/views/v-b" in url:
+                r.json.return_value = {
+                    "id": "v-b",
+                    "name": "一覧",
+                    "type": "table",
+                    "quick_filters": {"p_sel": {"select": {"equals": "BBB"}}},
+                    "configuration": {},
+                }
+            return r
+
+        mock_req.get.side_effect = fake_get
+        mock_req.post.return_value = MagicMock(status_code=200, ok=True, json=lambda: {"results": [], "has_more": False})
+
+        db_node = PageNode(id=db_id, title="共有DB", node_type="database")
+        page_a = PageNode(
+            id="page-a",
+            title="チームA",
+            node_type="page",
+            blocks=[{
+                "id": blk_a, "type": "child_database", "is_linked_database": True,
+                "database_id": db_id, "data_sources": [{"name": "共有DB", "id": db_id}],
+                "views": [{"name": "共有DB", "type": "table"}],
+            }],
+        )
+        page_b = PageNode(
+            id="page-b",
+            title="チームB",
+            node_type="page",
+            blocks=[{
+                "id": blk_b, "type": "child_database", "is_linked_database": True,
+                "database_id": db_id, "data_sources": [{"name": "共有DB", "id": db_id}],
+                "views": [{"name": "共有DB", "type": "table"}],
+            }],
+        )
+        root = PageNode(id="root-multi", title="Root", node_type="page", children=[db_node, page_a, page_b])
+
+        NotionApiEnricher("secret_test").enrich_tree(root)
+
+        vc_names = [v["name"] for v in db_node.properties["views_config"]]
+        self.assertEqual(vc_names, ["一覧", "チームA - 一覧", "チームB - 一覧"])
+        self.assertEqual(page_a.blocks[0]["views"][0]["name"], "チームA - 一覧")
+        self.assertEqual(page_b.blocks[0]["views"][0]["name"], "チームB - 一覧")
+
+        conv = NotionToConfluenceConverter()
+        conv.migration_map = {
+            db_id: {
+                "node_type": "database",
+                "url": "https://example.atlassian.net/wiki/spaces/TEST/database/777",
+                "views": {
+                    "すべてのデータ": "vid-all",
+                    "一覧": "vid-base",
+                    "チームA - 一覧": "vid-a",
+                    "チームB - 一覧": "vid-b",
+                },
+                "views_info": [],
+            }
+        }
+        self.assertIn("savedViewId=vid-a", conv.generate_page_content(page_a))
+        self.assertIn("savedViewId=vid-b", conv.generate_page_content(page_b))
+
 
 if __name__ == "__main__":
     unittest.main()
