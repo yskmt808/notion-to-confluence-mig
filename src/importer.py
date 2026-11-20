@@ -6,6 +6,7 @@ import html
 import io
 import json
 import logging
+import math
 import mimetypes
 import os
 import random
@@ -40,6 +41,29 @@ from src.checkpoint import CheckpointWriteError
 from src.db_triage import resolve_db_migration_mode
 
 logger = logging.getLogger(__name__)
+
+AGGREGATED_DETAIL_MAX_ROWS_PER_PAGE = 30
+
+
+def split_aggregated_rows_evenly(
+    rows: List[PageNode],
+    max_per_page: int = AGGREGATED_DETAIL_MAX_ROWS_PER_PAGE,
+) -> List[List[PageNode]]:
+    """本文ありDB行リストを、1ページあたり max_per_page 件以下で均等分割する。"""
+    total = len(rows)
+    if total == 0:
+        return []
+    if max_per_page <= 0 or total <= max_per_page:
+        return [list(rows)]
+    num_chunks = math.ceil(total / max_per_page)
+    base_size, remainder = divmod(total, num_chunks)
+    chunks: List[List[PageNode]] = []
+    idx = 0
+    for i in range(num_chunks):
+        size = base_size + (1 if i < remainder else 0)
+        chunks.append(list(rows[idx : idx + size]))
+        idx += size
+    return chunks
 
 ATTACHMENT_MIME_MAP = {
     ".pdf": "application/pdf",
@@ -344,13 +368,28 @@ class ConfluenceClient:
                 except Exception as ve:
                     logger.warning(f"Could not fetch latest page version for [{title}] ({page_id}): {ve}")
 
-            res = requests.put(url, json=payload, auth=self.auth, headers=self.headers, timeout=30)
+            try:
+                res = requests.put(url, json=payload, auth=self.auth, headers=self.headers, timeout=60)
+            except requests.exceptions.RequestException as req_err:
+                if attempt < max_retries - 1:
+                    backoff = (2 ** attempt) + random.uniform(0.5, 1.5)
+                    logger.warning(
+                        f"[Network/Timeout] Retrying update_page for [{title}] ({page_id}) "
+                        f"(attempt {attempt + 1}/{max_retries}) after {backoff:.2f}s: {req_err}"
+                    )
+                    time.sleep(backoff)
+                    continue
+                err_msg = f"Failed to update page [{title}] ({page_id}) due to request error: {req_err}"
+                logger.error(err_msg)
+                raise RuntimeError(err_msg) from req_err
+
             if res.status_code == 200:
                 return res.json()
-            elif res.status_code == 409 and attempt < max_retries - 1:
+            elif res.status_code in (409, 429, 500, 502, 503, 504) and attempt < max_retries - 1:
                 backoff = (2 ** attempt) + random.uniform(0.5, 1.5)
+                tag = "409 Conflict" if res.status_code == 409 else str(res.status_code)
                 logger.warning(
-                    f"[409 Conflict] Retrying update_page for [{title}] ({page_id}) "
+                    f"[{tag}] Retrying update_page for [{title}] ({page_id}) "
                     f"(attempt {attempt + 1}/{max_retries}) after {backoff:.2f}s..."
                 )
                 time.sleep(backoff)
@@ -1030,6 +1069,7 @@ class ConfluenceImporter:
         self._reserved_titles: Set[str] = set()
         self._node_to_title: Dict[str, str] = {}
         self._db_view_requirements: Dict[str, Dict[str, Any]] = {}
+        self.pass2_errors: List[Dict[str, str]] = []
         self.client = ConfluenceClient(url, username, token)
         if self.private_mode:
             current_user = self.client.get_current_user()
@@ -1760,6 +1800,7 @@ class ConfluenceImporter:
     ) -> Dict[str, Dict[str, str]]:
         """PageNodeのツリーをConfluenceへ階層構造を維持して再帰的にインポートする。"""
         root_node._is_root = True
+        self.pass2_errors = []
         # 全ノードのNotion ID -> Title マップを構築（リレーションのスマートリンク解決用）
         id_title_map = {}
         def collect_titles(n: PageNode):
@@ -2036,11 +2077,18 @@ class ConfluenceImporter:
                         self.cancel_manager.trigger_error_halt(f"Checkpoint write error during Pass 2 for [{node.title}]: {ce}")
                     raise
                 except Exception as e:
-                    logger.warning(f"Pass 2 update error for page {node.title} ({conf_id}): {e}")
+                    logger.error(f"Pass 2 update error for page {node.title} ({conf_id}): {e}")
+                    with self._lock:
+                        self.pass2_errors.append({
+                            "node_id": str(node.id),
+                            "title": str(node.title),
+                            "confluence_id": str(conf_id),
+                            "error": str(e),
+                        })
                     if self.telemetry:
-                        self.telemetry.record_warning(f"Pass 2 update error for page {node.title}: {e}")
+                        self.telemetry.record_error(e, context=f"Pass 2 update [{node.title}] ({conf_id})")
                     if self.dashboard:
-                        self.dashboard.record_warning(f"Pass 2 update error: {node.title}")
+                        self.dashboard.record_error(f"Pass 2 update error: {node.title}")
                 finally:
                     if self.dashboard:
                         self.dashboard.set_worker_idle()
@@ -2074,18 +2122,10 @@ class ConfluenceImporter:
         return self._get_db_migration_mode(db_node) in ("aggregated", "static_table")
 
     def _update_aggregated_detail_page_pass2(self, db_node: PageNode):
-        """Pass 2: 1ページ集約方式のDB詳細まとめページに解決済みリンクと?entryId=戻りリンクを反映する。"""
+        """Pass 2: 集約方式のDB詳細まとめページ（分割対応・並行実行）に解決済みリンクと?entryId=戻りリンクを反映する。"""
         with self._lock:
             db_info = self.migration_map.get(db_node.id)
         if not db_info:
-            return
-        agg_id = db_info.get("aggregated_detail_page_id") or getattr(db_node, "_aggregated_detail_page_id", None)
-        if not agg_id:
-            return
-        agg_node_id = f"{db_node.id}__details"
-        if self.checkpoint and self.checkpoint.is_pass2_done(agg_node_id):
-            if self.dashboard:
-                self.dashboard.record_pass2_skip(db_info.get("aggregated_detail_page_title") or db_node.title)
             return
 
         db_conf_id = str(db_info["confluence_id"])
@@ -2095,6 +2135,42 @@ class ConfluenceImporter:
             if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
         ]
         if not body_children:
+            return
+
+        pages_meta = (
+            getattr(db_node, "_aggregated_detail_pages", None)
+            or db_info.get("aggregated_detail_pages")
+        )
+        if not pages_meta:
+            agg_id = db_info.get("aggregated_detail_page_id") or getattr(db_node, "_aggregated_detail_page_id", None)
+            if not agg_id:
+                return
+            agg_title = db_info.get("aggregated_detail_page_title") or getattr(
+                db_node, "_aggregated_detail_page_title", f"{db_node.title} - 詳細ページ一覧"
+            )
+            pages_meta = [{
+                "node_id": f"{db_node.id}__details",
+                "confluence_id": str(agg_id),
+                "title": agg_title,
+                "row_ids": [c.id for c in body_children],
+            }]
+
+        row_by_id = {c.id: c for c in body_children}
+        pending_tasks: List[Tuple[str, str, str, List[PageNode]]] = []
+        for pm in pages_meta:
+            p_node_id = str(pm["node_id"])
+            p_conf_id = str(pm["confluence_id"])
+            p_title = str(pm.get("title") or f"{db_node.title} - 詳細ページ一覧")
+            if self.checkpoint and self.checkpoint.is_pass2_done(p_node_id):
+                if self.dashboard:
+                    self.dashboard.record_pass2_skip(p_title)
+                continue
+            r_ids = pm.get("row_ids") or []
+            chunk_rows = [row_by_id[rid] for rid in r_ids if rid in row_by_id] if r_ids else body_children
+            if chunk_rows:
+                pending_tasks.append((p_node_id, p_conf_id, p_title, chunk_rows))
+
+        if not pending_tasks:
             return
 
         # entry_id が未解決の行があれば Pass 2 時点で再取得を試みる
@@ -2110,38 +2186,66 @@ class ConfluenceImporter:
             except Exception as e:
                 logger.debug(f"Pass 2 entryId lookup skipped for aggregated DB [{db_node.title}]: {e}")
 
-        row_entries = [(c, getattr(c, "entry_id", None)) for c in body_children]
-        agg_title = db_info.get("aggregated_detail_page_title") or getattr(db_node, "_aggregated_detail_page_title", f"{db_node.title} - 詳細ページ一覧")
-        try:
-            if self.dashboard:
-                self.dashboard.set_worker_busy(agg_title, node_type="page")
+        # converter の共有状態をスレッド競合させないため、HTML生成は直列で事前構築する
+        rendered_tasks: List[Tuple[str, str, str, str]] = []
+        for p_node_id, p_conf_id, p_title, chunk_rows in pending_tasks:
+            row_entries = [(c, getattr(c, "entry_id", None)) for c in chunk_rows]
             agg_body = self.converter.generate_aggregated_database_details_html(db_node, db_web_url, row_entries)
-            latest = self.client.get_page_by_id(str(agg_id), expand="version")
-            if latest:
-                current_ver = latest.get("version", {}).get("number", 1)
-                self.client.update_page(
-                    page_id=str(agg_id),
-                    space_key=self.space_key,
-                    title=agg_title,
-                    body=agg_body,
-                    current_version=current_ver,
-                )
-                logger.info(f"Pass 2 updated aggregated detail page [{agg_title}] (ID: {agg_id}, v{current_ver + 1})")
-                if self.checkpoint:
-                    self.checkpoint.record_pass2(agg_node_id)
+            rendered_tasks.append((p_node_id, p_conf_id, p_title, agg_body))
+
+        def _update_one(task: Tuple[str, str, str, str]) -> None:
+            p_node_id, p_conf_id, p_title, agg_body = task
+            try:
                 if self.dashboard:
-                    self.dashboard.record_pass2_done(agg_title)
-        except CheckpointWriteError as ce:
-            if self.cancel_manager:
-                self.cancel_manager.trigger_error_halt(f"Checkpoint write error during Pass 2 for [{agg_title}]: {ce}")
-            raise
-        except Exception as e:
-            logger.warning(f"Pass 2 update error for aggregated detail page {agg_title} ({agg_id}): {e}")
-            if self.telemetry:
-                self.telemetry.record_warning(f"Pass 2 update error for aggregated detail page {agg_title}: {e}")
-        finally:
-            if self.dashboard:
-                self.dashboard.set_worker_idle()
+                    self.dashboard.set_worker_busy(p_title, node_type="page")
+                latest = self.client.get_page_by_id(p_conf_id, expand="version")
+                if latest:
+                    current_ver = latest.get("version", {}).get("number", 1)
+                    self.client.update_page(
+                        page_id=p_conf_id,
+                        space_key=self.space_key,
+                        title=p_title,
+                        body=agg_body,
+                        current_version=current_ver,
+                    )
+                    logger.info(f"Pass 2 updated aggregated detail page [{p_title}] (ID: {p_conf_id}, v{current_ver + 1})")
+                    if self.checkpoint:
+                        self.checkpoint.record_pass2(p_node_id)
+                    if self.dashboard:
+                        self.dashboard.record_pass2_done(p_title)
+                else:
+                    raise RuntimeError(f"Aggregated detail page [{p_title}] (ID: {p_conf_id}) not found for Pass 2 update")
+            except CheckpointWriteError as ce:
+                if self.cancel_manager:
+                    self.cancel_manager.trigger_error_halt(f"Checkpoint write error during Pass 2 for [{p_title}]: {ce}")
+                raise
+            except Exception as e:
+                logger.error(f"Pass 2 update error for aggregated detail page {p_title} ({p_conf_id}): {e}")
+                with self._lock:
+                    self.pass2_errors.append({
+                        "node_id": p_node_id,
+                        "title": p_title,
+                        "confluence_id": p_conf_id,
+                        "error": str(e),
+                    })
+                if self.telemetry:
+                    self.telemetry.record_error(e, context=f"Pass 2 aggregated detail [{p_title}] ({p_conf_id})")
+                if self.dashboard:
+                    self.dashboard.record_error(f"Pass 2 update error: {p_title}")
+            finally:
+                if self.dashboard:
+                    self.dashboard.set_worker_idle()
+
+        workers = min(self.page_workers, len(rendered_tasks))
+        if workers > 1:
+            logger.info(f"Pass 2: Concurrently updating {len(rendered_tasks)} aggregated detail page(s) for [{db_node.title}] with {workers} workers...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_update_one, t) for t in rendered_tasks]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+        else:
+            for t in rendered_tasks:
+                _update_one(t)
 
     def _resolve_and_update_page_links(self, root_node: PageNode):
         """パス2: 全データベースおよびページの作成完了後、相互リンクおよび埋め込みDBビューを完全に解決して更新する（並行実行）。"""
@@ -2558,6 +2662,144 @@ class ConfluenceImporter:
             if b.get("children_blocks"):
                 self._disambiguate_row_attachment_filenames(b["children_blocks"], row_idx, used_filenames)
 
+    def _provision_aggregated_detail_pages(
+        self,
+        db_node: PageNode,
+        body_children: List[PageNode],
+        parent_id: str,
+        overwrite: bool = True,
+        child_link_map: Optional[Dict[str, str]] = None,
+        is_resume: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """集約詳細ページを上限(20〜30件均等)で分割作成し、添付アップロードと行アンカー登録を並行実行する。"""
+        chunks = split_aggregated_rows_evenly(body_children)
+        num_chunks = len(chunks)
+        if num_chunks == 0:
+            return []
+
+        if num_chunks > 1:
+            logger.info(
+                f"Splitting aggregated detail pages for [{db_node.title}]: "
+                f"{len(body_children)} rows -> {num_chunks} pages ({[len(c) for c in chunks]})"
+            )
+
+        def _process_chunk(idx_1based: int, chunk: List[PageNode]) -> Optional[Dict[str, Any]]:
+            if num_chunks == 1:
+                agg_node_id = f"{db_node.id}__details"
+                base_title = f"{db_node.title} - 詳細ページ一覧"
+            else:
+                agg_node_id = f"{db_node.id}__details__{idx_1based}"
+                base_title = f"{db_node.title} - 詳細ページ一覧 ({idx_1based}/{num_chunks})"
+
+            cached_agg = self.checkpoint.get_node_info(agg_node_id) if self.checkpoint else None
+            if self.checkpoint and self.checkpoint.is_pass1_done(agg_node_id) and cached_agg and cached_agg.get("confluence_id"):
+                agg_page_id = str(cached_agg["confluence_id"])
+                agg_page_title = cached_agg.get("title") or base_title
+                agg_page_url = cached_agg.get("url") or f"{self.client.base_url}/spaces/{self.space_key}/pages/{agg_page_id}"
+            elif is_resume:
+                if not (cached_agg and cached_agg.get("confluence_id")):
+                    return None
+                agg_page_id = str(cached_agg["confluence_id"])
+                agg_page_title = cached_agg.get("title") or base_title
+                agg_page_url = cached_agg.get("url") or f"{self.client.base_url}/spaces/{self.space_key}/pages/{agg_page_id}"
+            else:
+                agg_page_title, existing_agg = self._resolve_unique_page_title(
+                    base_title=base_title,
+                    notion_node_id=agg_node_id,
+                    allow_existing_overwrite=overwrite,
+                )
+                if existing_agg and overwrite:
+                    agg_page_id = str(existing_agg["id"])
+                    agg_webui = existing_agg.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
+                else:
+                    with self._get_parent_lock(parent_id):
+                        agg_res = self.client.create_page(
+                            space_key=self.space_key,
+                            title=agg_page_title,
+                            body="<p>詳細ページを生成中...</p>",
+                            parent_id=parent_id,
+                        )
+                    agg_page_id = str(agg_res["id"])
+                    agg_webui = agg_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
+                agg_page_url = f"{self.client.base_url}{agg_webui}"
+                if self.checkpoint:
+                    self.checkpoint.record_pass1(
+                        node_id=agg_node_id,
+                        confluence_id=agg_page_id,
+                        title=agg_page_title,
+                        url=agg_page_url,
+                        node_type="page",
+                    )
+                if self.dashboard:
+                    self.dashboard.record_pass1_done(agg_page_title, node_type="page")
+
+            pass2_already_done = bool(self.checkpoint and self.checkpoint.is_pass2_done(agg_node_id))
+            if not pass2_already_done:
+                self._process_aggregated_attachments(chunk, agg_page_id)
+
+            return {
+                "node_id": agg_node_id,
+                "confluence_id": agg_page_id,
+                "title": agg_page_title,
+                "url": agg_page_url,
+                "row_ids": [c.id for c in chunk],
+                "_rows": chunk,
+            }
+
+        results_by_idx: Dict[int, Dict[str, Any]] = {}
+        workers = min(self.page_workers, num_chunks)
+        if workers > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                fut_map = {
+                    executor.submit(_process_chunk, idx, chunk): idx
+                    for idx, chunk in enumerate(chunks, start=1)
+                }
+                for future in concurrent.futures.as_completed(fut_map):
+                    idx = fut_map[future]
+                    res = future.result()
+                    if res is not None:
+                        results_by_idx[idx] = res
+        else:
+            for idx, chunk in enumerate(chunks, start=1):
+                res = _process_chunk(idx, chunk)
+                if res is not None:
+                    results_by_idx[idx] = res
+
+        ordered_pages = [results_by_idx[i] for i in sorted(results_by_idx.keys())]
+        if not ordered_pages:
+            return []
+
+        public_pages_meta: List[Dict[str, Any]] = []
+        first_page = ordered_pages[0]
+        db_node._aggregated_detail_page_id = first_page["confluence_id"]
+        db_node._aggregated_detail_page_title = first_page["title"]
+        db_node._aggregated_detail_page_url = first_page["url"]
+
+        with self._lock:
+            for pm in ordered_pages:
+                chunk_rows = pm.pop("_rows", [])
+                public_pages_meta.append(pm)
+                self.migration_map[pm["node_id"]] = {
+                    "confluence_id": pm["confluence_id"],
+                    "title": pm["title"],
+                    "url": pm["url"],
+                    "node_type": "page",
+                }
+                for child in chunk_rows:
+                    anchor = urllib.parse.quote((child.title or "").strip(), safe="")
+                    row_anchor_url = f"{pm['url']}#{anchor}" if anchor else pm["url"]
+                    if child_link_map is not None:
+                        child_link_map[child.id] = row_anchor_url
+                    self.migration_map[child.id] = {
+                        "confluence_id": pm["confluence_id"],
+                        "title": child.title,
+                        "url": row_anchor_url,
+                        "node_type": child.node_type,
+                    }
+
+        db_node._aggregated_detail_pages = public_pages_meta
+        return public_pages_meta
+
     def _process_aggregated_attachments(self, body_children: List[PageNode], agg_page_id: str):
         """1ページ集約詳細ページ配下の全レコード本文に含まれる画像・添付ファイルを一括アップロードする。"""
         agg_uploaded_filenames: Set[str] = set()
@@ -2967,34 +3209,23 @@ class ConfluenceImporter:
                 elif node.node_type == "database" and self._is_aggregated_db(node):
                     node._aggregated_mode = True
                     self._register_skipped_db_rows(node, confluence_url, skip_only_bodyless=True)
-                    agg_node_id = f"{node.id}__details"
-                    agg_info = self.checkpoint.get_node_info(agg_node_id) if self.checkpoint else None
-                    if agg_info and agg_info.get("confluence_id"):
-                        agg_id = str(agg_info["confluence_id"])
-                        agg_title = agg_info.get("title") or f"{node.title} - 詳細ページ一覧"
-                        agg_url = agg_info.get("url") or f"{self.client.base_url}/spaces/{self.space_key}/pages/{agg_id}"
-                        node._aggregated_detail_page_id = agg_id
-                        node._aggregated_detail_page_title = agg_title
-                        node._aggregated_detail_page_url = agg_url
-                        self.migration_map[node.id]["aggregated_detail_page_id"] = agg_id
-                        self.migration_map[node.id]["aggregated_detail_page_title"] = agg_title
-                        self.migration_map[node.id]["aggregated_detail_page_url"] = agg_url
-                        body_children = [
-                            c for c in (node.children or [])
-                            if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
-                        ]
-                        if body_children and not self.checkpoint.is_pass2_done(agg_node_id):
-                            self._process_aggregated_attachments(body_children, agg_id)
-                        with self._lock:
-                            for c in body_children:
-                                anchor = urllib.parse.quote((c.title or "").strip(), safe="")
-                                row_anchor_url = f"{agg_url}#{anchor}" if anchor else agg_url
-                                self.migration_map[c.id] = {
-                                    "confluence_id": agg_id,
-                                    "title": c.title,
-                                    "url": row_anchor_url,
-                                    "node_type": c.node_type,
-                                }
+                    body_children = [
+                        c for c in (node.children or [])
+                        if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
+                    ]
+                    agg_pages_meta = self._provision_aggregated_detail_pages(
+                        db_node=node,
+                        body_children=body_children,
+                        parent_id=confluence_page_id,
+                        overwrite=overwrite,
+                        is_resume=True,
+                    )
+                    if agg_pages_meta:
+                        first_agg = agg_pages_meta[0]
+                        self.migration_map[node.id]["aggregated_detail_page_id"] = first_agg["confluence_id"]
+                        self.migration_map[node.id]["aggregated_detail_page_title"] = first_agg["title"]
+                        self.migration_map[node.id]["aggregated_detail_page_url"] = first_agg["url"]
+                        self.migration_map[node.id]["aggregated_detail_pages"] = agg_pages_meta
                         nested_children = [
                             sub
                             for c in (node.children or [])
@@ -3004,7 +3235,7 @@ class ConfluenceImporter:
                             self._import_children_concurrently(
                                 parent_node=node,
                                 children=nested_children,
-                                parent_id=agg_id,
+                                parent_id=first_agg["confluence_id"],
                                 overwrite=overwrite,
                                 allow_sub_parallel=allow_sub_parallel,
                             )
@@ -3075,70 +3306,29 @@ class ConfluenceImporter:
                 ]
                 if body_children:
                     node._aggregated_mode = True
-                    agg_node_id = f"{node.id}__details"
-                    agg_title, existing_agg = self._resolve_unique_page_title(
-                        base_title=f"{node.title} - 詳細ページ一覧",
-                        notion_node_id=agg_node_id,
-                        allow_existing_overwrite=overwrite,
+                    agg_pages_meta = self._provision_aggregated_detail_pages(
+                        db_node=node,
+                        body_children=body_children,
+                        parent_id=confluence_page_id,
+                        overwrite=overwrite,
                     )
-                    if existing_agg and overwrite:
-                        agg_page_id = str(existing_agg["id"])
-                        agg_webui = existing_agg.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
-                    else:
-                        with self._get_parent_lock(confluence_page_id):
-                            agg_res = self.client.create_page(
-                                space_key=self.space_key,
-                                title=agg_title,
-                                body="<p>詳細ページを生成中...</p>",
-                                parent_id=confluence_page_id,
+                    if agg_pages_meta:
+                        first_agg = agg_pages_meta[0]
+                        db_map_entry["aggregated_detail_page_id"] = first_agg["confluence_id"]
+                        db_map_entry["aggregated_detail_page_title"] = first_agg["title"]
+                        db_map_entry["aggregated_detail_page_url"] = first_agg["url"]
+                        db_map_entry["aggregated_detail_pages"] = agg_pages_meta
+                        nested_children = [
+                            sub for c in (node.children or []) for sub in (getattr(c, "children", None) or [])
+                        ]
+                        if nested_children:
+                            self._import_children_concurrently(
+                                parent_node=node,
+                                children=nested_children,
+                                parent_id=first_agg["confluence_id"],
+                                overwrite=overwrite,
+                                allow_sub_parallel=allow_sub_parallel,
                             )
-                        agg_page_id = str(agg_res["id"])
-                        agg_webui = agg_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
-                    agg_page_url = f"{self.client.base_url}{agg_webui}"
-                    node._aggregated_detail_page_id = agg_page_id
-                    node._aggregated_detail_page_title = agg_title
-                    node._aggregated_detail_page_url = agg_page_url
-                    db_map_entry["aggregated_detail_page_id"] = agg_page_id
-                    db_map_entry["aggregated_detail_page_title"] = agg_title
-                    db_map_entry["aggregated_detail_page_url"] = agg_page_url
-                    with self._lock:
-                        self.migration_map[agg_node_id] = {
-                            "confluence_id": agg_page_id,
-                            "title": agg_title,
-                            "url": agg_page_url,
-                            "node_type": "page",
-                        }
-                        for c in body_children:
-                            anchor = urllib.parse.quote((c.title or "").strip(), safe="")
-                            row_anchor_url = f"{agg_page_url}#{anchor}" if anchor else agg_page_url
-                            self.migration_map[c.id] = {
-                                "confluence_id": agg_page_id,
-                                "title": c.title,
-                                "url": row_anchor_url,
-                                "node_type": c.node_type,
-                            }
-                    if self.checkpoint:
-                        self.checkpoint.record_pass1(
-                            node_id=agg_node_id,
-                            confluence_id=agg_page_id,
-                            title=agg_title,
-                            url=agg_page_url,
-                            node_type="page",
-                        )
-                    if self.dashboard:
-                        self.dashboard.record_pass1_done(agg_title, node_type="page")
-                    self._process_aggregated_attachments(body_children, agg_page_id)
-                    nested_children = [
-                        sub for c in (node.children or []) for sub in (getattr(c, "children", None) or [])
-                    ]
-                    if nested_children:
-                        self._import_children_concurrently(
-                            parent_node=node,
-                            children=nested_children,
-                            parent_id=agg_page_id,
-                            overwrite=overwrite,
-                            allow_sub_parallel=allow_sub_parallel,
-                        )
                 self._register_skipped_db_rows(node, confluence_url, skip_only_bodyless=True)
                 with self._lock:
                     self.migration_map[node.id] = db_map_entry
@@ -3215,68 +3405,21 @@ class ConfluenceImporter:
                     if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
                 ]
                 logger.info(
-                    f"Aggregated 1-page mode DB [{node.title}] ({len(body_children)}/{db_stats['total_rows']} rows with body): "
-                    f"creating 1 detail page with 'text' key column and hidden 'hyperlink' column."
+                    f"Aggregated mode DB [{node.title}] ({len(body_children)}/{db_stats['total_rows']} rows with body): "
+                    f"creating detail page(s) with 'text' key column and hidden 'hyperlink' column."
                 )
-                agg_node_id = f"{node.id}__details"
-                if self.checkpoint and self.checkpoint.is_pass1_done(agg_node_id):
-                    cached_agg = self.checkpoint.get_node_info(agg_node_id)
-                    agg_page_id = str(cached_agg["confluence_id"])
-                    agg_page_title = cached_agg.get("title") or f"{node.title} - 詳細ページ一覧"
-                    agg_page_url = cached_agg.get("url") or f"{self.client.base_url}/spaces/{self.space_key}/pages/{agg_page_id}"
-                else:
-                    agg_page_title, existing_agg = self._resolve_unique_page_title(
-                        base_title=f"{node.title} - 詳細ページ一覧",
-                        notion_node_id=agg_node_id,
-                        allow_existing_overwrite=overwrite,
-                    )
-                    if existing_agg and overwrite:
-                        agg_page_id = str(existing_agg["id"])
-                        agg_webui = existing_agg.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
-                        agg_page_url = f"{self.client.base_url}{agg_webui}"
-                    else:
-                        with self._get_parent_lock(parent_id):
-                            agg_res = self.client.create_page(
-                                space_key=self.space_key,
-                                title=agg_page_title,
-                                body="<p>詳細ページを生成中...</p>",
-                                parent_id=parent_id,
-                            )
-                        agg_page_id = str(agg_res["id"])
-                        agg_webui = agg_res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{agg_page_id}")
-                        agg_page_url = f"{self.client.base_url}{agg_webui}"
-                    if self.checkpoint:
-                        self.checkpoint.record_pass1(
-                            node_id=agg_node_id,
-                            confluence_id=agg_page_id,
-                            title=agg_page_title,
-                            url=agg_page_url,
-                            node_type="page",
-                        )
-                    if self.dashboard:
-                        self.dashboard.record_pass1_done(agg_page_title, node_type="page")
-
-                node._aggregated_detail_page_id = agg_page_id
-                node._aggregated_detail_page_title = agg_page_title
-                node._aggregated_detail_page_url = agg_page_url
-                self._process_aggregated_attachments(body_children, agg_page_id)
-                with self._lock:
-                    self.migration_map[agg_node_id] = {
-                        "confluence_id": agg_page_id,
-                        "title": agg_page_title,
-                        "url": agg_page_url,
-                        "node_type": "page",
-                    }
-                    for child in body_children:
-                        anchor = urllib.parse.quote((child.title or "").strip(), safe="")
-                        row_anchor_url = f"{agg_page_url}#{anchor}" if anchor else agg_page_url
-                        child_link_map[child.id] = row_anchor_url
-                        self.migration_map[child.id] = {
-                            "confluence_id": agg_page_id,
-                            "title": child.title,
-                            "url": row_anchor_url,
-                            "node_type": child.node_type,
-                        }
+                agg_pages_meta = self._provision_aggregated_detail_pages(
+                    db_node=node,
+                    body_children=body_children,
+                    parent_id=parent_id,
+                    overwrite=overwrite,
+                    child_link_map=child_link_map,
+                )
+                if agg_pages_meta:
+                    first_agg = agg_pages_meta[0]
+                    agg_page_id = first_agg["confluence_id"]
+                    agg_page_title = first_agg["title"]
+                    agg_page_url = first_agg["url"]
                 nested_children = [
                     sub
                     for c in (node.children or [])
@@ -3286,7 +3429,7 @@ class ConfluenceImporter:
                     self._import_children_concurrently(
                         parent_node=node,
                         children=nested_children,
-                        parent_id=agg_page_id,
+                        parent_id=agg_page_id or parent_id,
                         overwrite=overwrite,
                         allow_sub_parallel=allow_sub_parallel,
                     )
@@ -3619,6 +3762,8 @@ class ConfluenceImporter:
                     db_map_entry["aggregated_detail_page_id"] = agg_page_id
                     db_map_entry["aggregated_detail_page_title"] = agg_page_title
                     db_map_entry["aggregated_detail_page_url"] = agg_page_url
+                    if getattr(node, "_aggregated_detail_pages", None):
+                        db_map_entry["aggregated_detail_pages"] = node._aggregated_detail_pages
                 self.migration_map[node.id] = db_map_entry
                 if self.checkpoint:
                     self.checkpoint.record_pass1(

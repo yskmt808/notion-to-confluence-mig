@@ -585,6 +585,162 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         self.assertIn("連絡先,hyperlink,", fields_section)
         self.assertIn(r"\\fileserver\share\project", csv_body)
 
+    def test_split_aggregated_rows_evenly_sizes(self):
+        """split_aggregated_rows_evenly が上限30件以下で20〜30件目安に均等分割すること。"""
+        from src.importer import split_aggregated_rows_evenly
+
+        def make_rows(n):
+            return [PageNode(id=f"r-{i}", title=f"Row {i}", node_type="database_row") for i in range(n)]
+
+        self.assertEqual([len(c) for c in split_aggregated_rows_evenly(make_rows(30))], [30])
+        self.assertEqual([len(c) for c in split_aggregated_rows_evenly(make_rows(45))], [23, 22])
+        self.assertEqual([len(c) for c in split_aggregated_rows_evenly(make_rows(65))], [22, 22, 21])
+        self.assertEqual([len(c) for c in split_aggregated_rows_evenly(make_rows(90))], [30, 30, 30])
+
+    def test_aggregated_detail_pages_split_and_update_concurrently(self):
+        """65件の本文ありDB行が3分割(22/22/21)されて並行作成・Pass 2更新され、各行が正しい分割ページを指すこと。"""
+        rows = [
+            PageNode(
+                id=f"r-sp-{i}",
+                title=f"Row{i}",
+                node_type="database_row",
+                properties={"名前": {"type": "title", "value": f"Row{i}"}},
+                blocks=[{"id": f"b-{i}", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "plain_text": f"body {i}"}]}}],
+            )
+            for i in range(65)
+        ]
+        db = PageNode(
+            id="db-split",
+            title="分割DB",
+            node_type="database",
+            properties={"schema": {"名前": {"type": "title"}}},
+            children=rows,
+        )
+        root = PageNode(id="root-split", title="Root", node_type="page", children=[db])
+
+        import threading
+        lock = threading.Lock()
+        created_pages = []
+        updated_pages = []
+        next_id = [100]
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_space_id.return_value = "space-1"
+        mock_client.get_page_by_title.return_value = None
+        mock_client.get_database_by_title.return_value = None
+        mock_client.get_database_views.return_value = [{"id": "v-1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = []
+
+        def fake_create_page(space_key, title, body, parent_id=None):
+            with lock:
+                next_id[0] += 1
+                pid = str(next_id[0])
+                created_pages.append((pid, title))
+            return {"id": pid, "_links": {"webui": f"/spaces/TEST/pages/{pid}"}}
+
+        def fake_create_database(**kwargs):
+            return {"id": "db-conf-1", "_links": {"webui": "/spaces/TEST/database/db-conf-1"}}
+
+        def fake_get_page_by_id(pid, expand=None):
+            return {"id": pid, "version": {"number": 1}}
+
+        def fake_update_page(page_id, space_key, title, body, current_version, parent_id=None):
+            with lock:
+                updated_pages.append((page_id, title, body))
+            return {"id": page_id}
+
+        mock_client.create_page.side_effect = fake_create_page
+        mock_client.create_database.side_effect = fake_create_database
+        mock_client.get_page_by_id.side_effect = fake_get_page_by_id
+        mock_client.update_page.side_effect = fake_update_page
+
+        importer = ConfluenceImporter("https://example.atlassian.net", "u", "t", "TEST", page_workers=4)
+        importer.client = mock_client
+        mapping = importer.import_tree(root, parent_id="parent-0", overwrite=False)
+
+        detail_pages = [t for _, t in created_pages if "詳細ページ一覧" in t]
+        self.assertEqual(
+            sorted(detail_pages),
+            ["分割DB - 詳細ページ一覧 (1/3)", "分割DB - 詳細ページ一覧 (2/3)", "分割DB - 詳細ページ一覧 (3/3)"],
+        )
+        detail_updates = [(pid, title, body) for pid, title, body in updated_pages if "詳細ページ一覧" in title]
+        self.assertEqual(len(detail_updates), 3)
+        # 1件目(Row0)は(1/3)、23件目(Row22)は(2/3)、45件目(Row44)は(3/3)へ紐付くこと
+        self.assertNotEqual(mapping["r-sp-0"]["confluence_id"], mapping["r-sp-22"]["confluence_id"])
+        self.assertNotEqual(mapping["r-sp-22"]["confluence_id"], mapping["r-sp-44"]["confluence_id"])
+        self.assertIn("#Row0", mapping["r-sp-0"]["url"])
+        self.assertIn("#Row44", mapping["r-sp-44"]["url"])
+
+    def test_pass2_timeout_records_error_and_leaves_checkpoint_resumable(self):
+        """Pass 2 の集約子ページ更新でタイムアウト等が起きた場合、エラー記録されチェックポイントが完了にならず再開可能であること。"""
+        import tempfile
+        from src.checkpoint import MigrationCheckpoint
+        from src.telemetry import SanitizedTelemetry
+
+        row = PageNode(
+            id="r-err-1",
+            title="RowErr",
+            node_type="database_row",
+            properties={"名前": {"type": "title", "value": "RowErr"}},
+            blocks=[{"id": "b-err-1", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "plain_text": "body"}]}}],
+        )
+        db = PageNode(
+            id="db-err",
+            title="エラーDB",
+            node_type="database",
+            properties={"schema": {"名前": {"type": "title"}}},
+            children=[row],
+        )
+        root = PageNode(id="root-err", title="Root", node_type="page", children=[db])
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_space_id.return_value = "space-1"
+        mock_client.get_page_by_title.return_value = None
+        mock_client.get_database_by_title.return_value = None
+        mock_client.get_database_views.return_value = [{"id": "v-1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = []
+        pid_counter = [200]
+
+        def fake_create_page(space_key, title, body, parent_id=None):
+            pid_counter[0] += 1
+            pid = str(pid_counter[0])
+            return {"id": pid, "_links": {"webui": f"/spaces/TEST/pages/{pid}"}}
+
+        mock_client.create_page.side_effect = fake_create_page
+        mock_client.create_database.return_value = {"id": "db-conf-err", "_links": {"webui": "/spaces/TEST/database/db-conf-err"}}
+        mock_client.get_page_by_id.return_value = {"id": "202", "version": {"number": 1}}
+
+        def fake_update(page_id, space_key, title, body, current_version, parent_id=None):
+            if "詳細ページ一覧" in title:
+                raise RuntimeError("Failed to update page due to request error: Read timed out")
+            return {"id": page_id}
+
+        mock_client.update_page.side_effect = fake_update
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cp_path = os.path.join(tmpdir, "cp.json")
+            cp = MigrationCheckpoint(cp_path)
+            tel = SanitizedTelemetry()
+
+            importer = ConfluenceImporter(
+                "https://example.atlassian.net",
+                "u",
+                "t",
+                "TEST",
+                checkpoint=cp,
+                telemetry=tel,
+                page_workers=1,
+            )
+            importer.client = mock_client
+            importer.import_tree(root, parent_id="parent-0", overwrite=False)
+
+            self.assertEqual(len(importer.pass2_errors), 1)
+            self.assertIn("詳細ページ一覧", importer.pass2_errors[0]["title"])
+            self.assertEqual(len(tel.errors), 1)
+            self.assertFalse(cp.is_pass2_done("db-err__details"))
+
 
 if __name__ == "__main__":
     unittest.main()

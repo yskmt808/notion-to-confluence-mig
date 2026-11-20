@@ -1384,7 +1384,28 @@ def main():
     except Exception:
         pass
 
+    raw_p2_errors = getattr(importer, "pass2_errors", None)
+    pass2_errors = raw_p2_errors if isinstance(raw_p2_errors, list) else []
+    raw_tel_errors = getattr(telemetry, "errors", None)
+    telemetry_errors = raw_tel_errors if isinstance(raw_tel_errors, list) else []
+    has_import_errors = bool(pass2_errors or telemetry_errors)
+
     print("\n==================================================")
+    if has_import_errors:
+        _safe_mark_interrupted()
+        total_err_count = max(len(pass2_errors), len(telemetry_errors))
+        print(f"⚠️ 移行処理中にエラーが発生しました（失敗: {total_err_count} 件）。")
+        for pe in pass2_errors[:5]:
+            print(f"  - [{pe.get('title')}] (ID: {pe.get('confluence_id')}): {pe.get('error')}")
+        if len(pass2_errors) > 5:
+            print(f"  ... 他 {len(pass2_errors) - 5} 件")
+        if not getattr(checkpoint, "write_failed", False):
+            print(f"現在の進捗状況はチェックポイント '{args.checkpoint}' に保存されています。")
+            print("未完了ページの更新を再開するには、以下のコマンドを実行してください:")
+            print(f"  python migrate.py --resume" + (f" --checkpoint {args.checkpoint}" if args.checkpoint != "migration_checkpoint.json" else ""))
+        print("==================================================")
+        sys.exit(1)
+
     print("🎉 移行が正常に完了しました！")
     print(f"開始時刻: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     print(f"終了時刻: {end_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
