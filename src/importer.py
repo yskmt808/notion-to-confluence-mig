@@ -853,6 +853,10 @@ class ConfluenceClient:
         url_get = f"{self.base_url}/api/v2/databases/{database_id}"
         r_get = requests.get(url_get, auth=self.auth, timeout=15)
         if not r_get.ok:
+            logger.warning(
+                f"Failed to fetch database [{database_id}] before creating view [{view_name}]: "
+                f"HTTP {r_get.status_code} - {r_get.text}"
+            )
             return None
         cur_version = r_get.json().get("version", {}).get("number", 1)
 
@@ -897,7 +901,10 @@ class ConfluenceClient:
         }
         r_put = requests.put(url_get, json=payload, auth=self.auth, timeout=30)
         if not r_put.ok:
-            logger.warning(f"Failed to create view [{view_name}] on database [{database_id}]: {r_put.status_code} - {r_put.text}")
+            logger.warning(
+                f"Failed to create view [{view_name}] on database [{database_id}]: "
+                f"HTTP {r_put.status_code} - {r_put.text} | metadata={metadata_lines}"
+            )
             return None
 
         time.sleep(0.5)
@@ -906,6 +913,10 @@ class ConfluenceClient:
             if (v.get("name") or "").strip() == norm_view_name:
                 logger.info(f"Successfully created view [{view_name}] (ID: {v.get('id')}) on database [{database_id}]")
                 return v
+        logger.warning(
+            f"View [{view_name}] PUT succeeded (HTTP {r_put.status_code}) on database [{database_id}], "
+            f"but not found in /views response yet. Returned view names={[v.get('name') for v in new_views]} | metadata={metadata_lines}"
+        )
         return None
 
     def setup_grouped_database_views(
@@ -1839,6 +1850,10 @@ class ConfluenceImporter:
                 logger.info(
                     f"View [{v_name}] on [{node.title}] has Notion type '{v_type}'; falling back to Confluence 'table' layout."
                 )
+            logger.info(
+                f"Creating Confluence view [{v_name}] on DB [{node.title}] ({confluence_page_id}): "
+                f"layout={target_layout}, filters={filters}, sorts={sorts}, hidden_fields={hidden_fields}"
+            )
             created = self.client.create_database_view(
                 confluence_page_id,
                 view_name=v_name,
@@ -1851,8 +1866,15 @@ class ConfluenceImporter:
                 # 非同期反映遅れで既に作成済みになっていないか再確認し、重複作成を防ぐ
                 refreshed = self.client.get_database_views(confluence_page_id)
                 if any((rv.get("name") or "").strip() == v_name for rv in refreshed):
+                    logger.info(
+                        f"View [{v_name}] on DB [{node.title}] ({confluence_page_id}) confirmed in refreshed /views."
+                    )
                     created = {"name": v_name}
                 else:
+                    logger.warning(
+                        f"Retrying view [{v_name}] on DB [{node.title}] ({confluence_page_id}) without filters/sorts/hidden_fields "
+                        f"(existing views={[rv.get('name') for rv in refreshed]})."
+                    )
                     # フィルタ/ソート演算子がConfluence側で未対応の場合でもビュー自体は作成する
                     created = self.client.create_database_view(
                         confluence_page_id,
@@ -1862,12 +1884,16 @@ class ConfluenceImporter:
                     if not created:
                         refreshed2 = self.client.get_database_views(confluence_page_id)
                         if any((rv.get("name") or "").strip() == v_name for rv in refreshed2):
+                            logger.info(
+                                f"View [{v_name}] on DB [{node.title}] ({confluence_page_id}) confirmed in second /views refresh."
+                            )
                             created = {"name": v_name}
             if created:
                 existing_names.add(v_name)
             else:
                 _record_view_warning(
-                    f"DB [{node.title}] のビュー [{v_name}] (Notion type: {v_type} -> {target_layout}) の作成に失敗しました。"
+                    f"DB [{node.title}] ({confluence_page_id}) のビュー [{v_name}] "
+                    f"(Notion type: {v_type} -> {target_layout}, filters={filters}, sorts={sorts}, hidden_fields={hidden_fields}) の作成に失敗しました。"
                 )
 
     def import_tree(
