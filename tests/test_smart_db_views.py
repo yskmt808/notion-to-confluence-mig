@@ -814,6 +814,94 @@ class TestSmartDbViews(unittest.TestCase):
         self.assertTrue(any("Board view layout" in w for w in res2["warnings"]))
         self.assertFalse(any("Group by filtered views" in w for w in res2["warnings"]))
 
+    def test_identical_linked_views_across_pages_are_consolidated_into_single_db_view(self):
+        from src.api_enricher import NotionApiEnricher
+
+        db_id = "db-orig-dedup"
+        db_node = PageNode(
+            id=db_id,
+            title="タスクDB",
+            node_type="database",
+            properties={
+                "schema": {
+                    "名前": {"type": "title", "id": "title"},
+                    "ステータス": {"type": "select", "id": "p_sel", "options": ["AAA", "BBB"]},
+                },
+                "views_config": [
+                    {
+                        "id": "v-orig",
+                        "name": "Untitled",
+                        "type": "table",
+                        "filter": None,
+                        "quick_filters": None,
+                        "sorts": None,
+                        "configuration": {"properties": [{"property": "title", "visible": True}, {"property": "p_sel", "visible": True}]},
+                    }
+                ],
+            },
+        )
+        p1 = PageNode(
+            id="p1", title="ページ1", node_type="page",
+            blocks=[{"id": "blk1", "type": "child_database", "is_linked_database": True, "database_id": db_id, "data_sources": [{"name": "タスクDB", "id": db_id}], "views": [{"name": "タスクDB", "type": "table"}]}],
+        )
+        p2 = PageNode(
+            id="p2", title="ページ2", node_type="page",
+            blocks=[{"id": "blk2", "type": "child_database", "is_linked_database": True, "database_id": db_id, "data_sources": [{"name": "タスクDB", "id": db_id}], "views": [{"name": "タスクDB", "type": "table"}]}],
+        )
+        p3 = PageNode(
+            id="p3", title="ページ3", node_type="page",
+            blocks=[{"id": "blk3", "type": "child_database", "is_linked_database": True, "database_id": db_id, "data_sources": [{"name": "タスクDB", "id": db_id}], "views": [{"name": "タスクDB", "type": "table"}]}],
+        )
+        p4 = PageNode(
+            id="p4", title="ページ4", node_type="page",
+            blocks=[{"id": "blk4", "type": "child_database", "is_linked_database": True, "database_id": db_id, "data_sources": [{"name": "タスクDB", "id": db_id}], "views": [{"name": "タスクDB", "type": "table"}]}],
+        )
+        root = PageNode(id="root", title="Root", node_type="page", children=[db_node, p1, p2, p3, p4])
+
+        enricher = NotionApiEnricher(token="dummy")
+
+        def fake_fetch_views(target_id, label=""):
+            if target_id == "blk1":
+                return [{"id": "lv1", "name": "Untitled", "type": "table", "filter": None, "quick_filters": None, "sorts": None, "configuration": {"properties": [{"property": "title", "visible": True}, {"property": "p_sel", "visible": True}]}}]
+            if target_id == "blk2":
+                return [{"id": "lv2", "name": "Default view", "type": "table", "filter": None, "quick_filters": None, "sorts": None, "configuration": {"properties": [{"property": "title", "visible": True}, {"property": "p_sel", "visible": True}]}}]
+            if target_id == "blk3":
+                return [{"id": "lv3", "name": "一覧", "type": "table", "filter": None, "quick_filters": {"p_sel": {"select": {"equals": "AAA"}}}, "sorts": None, "configuration": {"properties": [{"property": "title", "visible": True}, {"property": "p_sel", "visible": False}]}}]
+            if target_id == "blk4":
+                return [{"id": "lv4", "name": "一覧", "type": "table", "filter": None, "quick_filters": {"p_sel": {"select": {"equals": "AAA"}}}, "sorts": None, "configuration": {"properties": [{"property": "title", "visible": True}, {"property": "p_sel", "visible": False}]}}]
+            return []
+
+        enricher._fetch_views_for_database_id = fake_fetch_views
+        summary = {"views_enriched": 0}
+        enricher._enrich_linked_database_views(root, {db_id.replace("-", "").lower(): db_node}, summary)
+
+        # Default views on p1 & p2 consolidate to "すべてのデータ" (no new view added to views_config)
+        self.assertEqual(p1.blocks[0]["views"][0]["name"], "すべてのデータ")
+        self.assertEqual(p2.blocks[0]["views"][0]["name"], "すべてのデータ")
+        # Identical custom views on p3 & p4 consolidate into a single view
+        self.assertEqual(len(db_node.properties["views_config"]), 2)
+        shared_view_name = db_node.properties["views_config"][1]["name"]
+        self.assertEqual(p3.blocks[0]["views"][0]["name"], shared_view_name)
+        self.assertEqual(p4.blocks[0]["views"][0]["name"], shared_view_name)
+
+        # Both p3 & p4 resolve to the same savedViewId in converter
+        conv = NotionToConfluenceConverter()
+        conv.migration_map = {
+            db_id: {
+                "node_type": "database",
+                "url": "https://example.atlassian.net/wiki/spaces/TEST/database/777",
+                "views": {
+                    "すべてのデータ": "view-default-id",
+                    shared_view_name: "view-shared-id",
+                },
+                "views_info": [],
+            }
+        }
+        self.assertIn("savedViewId=view-default-id", conv.generate_page_content(p1))
+        self.assertIn("savedViewId=view-default-id", conv.generate_page_content(p2))
+        self.assertIn("savedViewId=view-shared-id", conv.generate_page_content(p3))
+        self.assertIn("savedViewId=view-shared-id", conv.generate_page_content(p4))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -314,6 +314,27 @@ class NotionApiEnricher:
             logger.debug(f"[API-ENRICH] Views API skipped or not available for {label or formatted_id}: {ve}")
         return views_info
 
+    @staticmethod
+    def _build_view_config_signature(vc: Dict[str, Any]) -> str:
+        """ビューの実質的設定（レイアウト・フィルタ・ソート・非表示列・group_by）から集約用の比較キーを生成する。"""
+        v_type = (vc.get("type") or "table").strip().lower()
+        effective_layout = v_type if v_type in ("board", "gallery") else "table"
+        cfg = vc.get("configuration") or {}
+        hidden_cols = sorted(
+            str(cp.get("property_name") or cp.get("property_id") or "").strip()
+            for cp in (cfg.get("properties") or [])
+            if isinstance(cp, dict) and cp.get("visible") is False
+        )
+        sig_obj = {
+            "layout": effective_layout,
+            "filter": vc.get("filter") or None,
+            "quick_filters": vc.get("quick_filters") or None,
+            "sorts": vc.get("sorts") or None,
+            "hidden": hidden_cols,
+            "group_by": (cfg.get("group_by") or None) if effective_layout == "board" else None,
+        }
+        return json.dumps(sig_obj, sort_keys=True, ensure_ascii=False)
+
     def _enrich_linked_database_views(
         self,
         root_node: PageNode,
@@ -366,15 +387,42 @@ class NotionApiEnricher:
                                     for ev in existing_cfg
                                     if isinstance(ev, dict) and ev.get("id")
                                 }
+                                sig_to_name: Dict[str, str] = {}
+                                for ev in existing_cfg:
+                                    if isinstance(ev, dict) and ev.get("name"):
+                                        ev_sig = self._build_view_config_signature(ev)
+                                        if ev_sig not in sig_to_name:
+                                            ev_n = (ev.get("name") or "").strip()
+                                            # Confluence のデフォルトビューと完全一致する場合は「すべてのデータ」へ集約
+                                            if (
+                                                ev_n in ("Untitled", "Default view")
+                                                and not ev.get("filter")
+                                                and not ev.get("quick_filters")
+                                                and not ev.get("sorts")
+                                                and (ev.get("type") or "table").strip().lower() not in ("board", "gallery")
+                                                and not any(
+                                                    isinstance(cp, dict) and cp.get("visible") is False
+                                                    for cp in ((ev.get("configuration") or {}).get("properties") or [])
+                                                )
+                                            ):
+                                                sig_to_name[ev_sig] = "すべてのデータ"
+                                            else:
+                                                sig_to_name[ev_sig] = ev_n
                                 db_title = (target_db.title or "").strip()
                                 for lv_idx, lv in enumerate(linked_views):
                                     raw_name = (lv.get("name") or "").strip()
+                                    lv_sig = self._build_view_config_signature(lv)
                                     if lv.get("id") and lv.get("id") in existing_ids:
                                         existing_match = next(
                                             (ev for ev in existing_cfg if isinstance(ev, dict) and ev.get("id") == lv.get("id")),
                                             None,
                                         )
                                         assigned_name = (existing_match.get("name") if existing_match else raw_name) or raw_name
+                                    elif lv_sig in sig_to_name:
+                                        assigned_name = sig_to_name[lv_sig]
+                                        logger.debug(
+                                            f"[API-ENRICH] Deduplicated linked view on [{page_title}] (raw={raw_name!r}) -> reusing [{assigned_name}]"
+                                        )
                                     else:
                                         if raw_name in ("", "Untitled", "Default view"):
                                             if lv_idx == 0 and orig_hint_name and orig_hint_name not in ("Untitled", "Default view", db_title):
@@ -401,6 +449,7 @@ class NotionApiEnricher:
                                             merged["source_page_title"] = page_title
                                         existing_cfg.append(merged)
                                         existing_names.add(assigned_name)
+                                        sig_to_name[lv_sig] = assigned_name
                                         if lv.get("id"):
                                             existing_ids.add(lv.get("id"))
 
