@@ -195,6 +195,38 @@ class NotionToConfluenceConverter:
             return f'<a href="{html.escape(db_url)}">{escaped_disp}</a>'
         return f'<span>{escaped_disp}</span>'
 
+    @staticmethod
+    def _is_aggregated_row_entry(target_info: Optional[Dict[str, Any]]) -> bool:
+        """migration_map エントリが集約詳細ページ内のDB行アンカー参照かどうかを判定する。"""
+        if not isinstance(target_info, dict):
+            return False
+        if target_info.get("aggregated_page_title"):
+            return True
+        return (
+            target_info.get("node_type") == "database_row"
+            and "#" in str(target_info.get("url") or "")
+        )
+
+    @staticmethod
+    def _render_aggregated_row_link(target_info: Dict[str, Any], label: Optional[str] = None) -> str:
+        """集約詳細ページ内のDB行への参照を、詳細ページ＋見出しアンカーへのリンクへ変換する。"""
+        disp = label or target_info.get("title") or "Page"
+        escaped_disp = html.escape(disp)
+        agg_page_title = target_info.get("aggregated_page_title")
+        agg_anchor = target_info.get("aggregated_anchor") or target_info.get("title") or ""
+        if agg_page_title:
+            anchor_attr = f' ac:anchor="{html.escape(agg_anchor)}"' if agg_anchor else ""
+            return (
+                f'<ac:link{anchor_attr}>'
+                f'<ri:page ri:content-title="{html.escape(agg_page_title)}" />'
+                f'<ac:link-body>{escaped_disp}</ac:link-body>'
+                f'</ac:link>'
+            )
+        row_url = target_info.get("url")
+        if row_url:
+            return f'<a href="{html.escape(row_url)}">{escaped_disp}</a>'
+        return f'<span>{escaped_disp}</span>'
+
     def _get_attachment_filename(self, block: Dict[str, Any]) -> str:
         """ブロック情報からConfluence用の一意で分かりやすい添付ファイル名を導出する。"""
         att_ref_re = re.compile(
@@ -433,6 +465,8 @@ class NotionToConfluenceConverter:
                 if target_info and target_info.get("node_type") == "database":
                     db_url = target_info.get("url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
                     links.append(f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(db_url)}</a>')
+                elif self._is_aggregated_row_entry(target_info):
+                    links.append(self._render_aggregated_row_link(target_info, label=disp_title))
                 elif (skipped_info := self._lookup_skipped_db_row(target_id)):
                     links.append(self._render_skipped_db_row_link(skipped_info, label=disp_title or skipped_info.get("title")))
                 elif disp_title:
@@ -541,6 +575,10 @@ class NotionToConfluenceConverter:
                     skipped_info = self._lookup_skipped_db_row(target_page_id) if not target_info else None
                     if skipped_info:
                         result.append(self._render_skipped_db_row_link(skipped_info, label=target_title))
+                        continue
+
+                    if self._is_aggregated_row_entry(target_info):
+                        result.append(self._render_aggregated_row_link(target_info, label=target_title))
                         continue
 
                     escaped_title = html.escape(target_title)
@@ -732,6 +770,9 @@ class NotionToConfluenceConverter:
                 elif not target_info and (skipped_info := self._lookup_skipped_db_row(target_uuid)):
                     raw_label = re.sub(r"<[^>]+>", "", (item.get("plain_text") or (item.get("text") or {}).get("content", ""))).strip()
                     escaped = self._render_skipped_db_row_link(skipped_info, label=raw_label or target_title)
+                elif self._is_aggregated_row_entry(target_info) and not item.get("_is_unresolved_external_page"):
+                    raw_label = re.sub(r"<[^>]+>", "", (item.get("plain_text") or (item.get("text") or {}).get("content", ""))).strip()
+                    escaped = self._render_aggregated_row_link(target_info, label=raw_label or target_info.get("title") or target_title)
                 elif not item.get("_is_unresolved_external_page") and (target_info or target_title or (href and href.startswith("#"))):
                     disp_title = (target_info.get("title") if target_info else None) or target_title or getattr(self, "current_page_title", "") or escaped
                     escaped_title = html.escape(disp_title)
@@ -1283,6 +1324,9 @@ class NotionToConfluenceConverter:
                             "<p>参照先ページがエクスポートZIPに含まれていないためリンクを解決できませんでした。</p>",
                         )
                     )
+                elif self._is_aggregated_row_entry(target_info):
+                    disp_title = (target_info.get("title") if target_info else None) or child_title
+                    output.append(f"<p>{self._render_aggregated_row_link(target_info, label=disp_title)}</p>")
                 else:
                     disp_title = (target_info.get("title") if target_info else None) or child_title
                     escaped_title = html.escape(disp_title)
@@ -1540,6 +1584,8 @@ class NotionToConfluenceConverter:
                             target_title = m_entry.get("title")
                     if target_page_id and not db_info and (skipped_info := self._lookup_skipped_db_row(target_page_id)):
                         output.append(f"<p>{self._render_skipped_db_row_link(skipped_info, label=target_title)}</p>")
+                    elif self._is_aggregated_row_entry(db_info):
+                        output.append(f"<p>{self._render_aggregated_row_link(db_info, label=target_title or db_info.get('title'))}</p>")
                     elif target_title:
                         escaped_title = html.escape(target_title)
                         output.append(

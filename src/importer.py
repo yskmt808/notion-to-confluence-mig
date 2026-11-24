@@ -2911,6 +2911,8 @@ class ConfluenceImporter:
                         "title": child.title,
                         "url": row_anchor_url,
                         "node_type": child.node_type,
+                        "aggregated_page_title": pm["title"],
+                        "aggregated_anchor": (child.title or "").strip(),
                     }
 
         db_node._aggregated_detail_pages = public_pages_meta

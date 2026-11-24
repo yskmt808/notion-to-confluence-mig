@@ -1047,6 +1047,43 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         self.assertIn('<ac:link><ri:attachment ri:filename="spec.docx" />', storage_xml)
         self.assertIn('<![CDATA[📎 spec.docx (添付ファイルをダウンロード)]]>', storage_xml)
 
+    def test_empty_collection_content_wrapper_inside_div_or_callout_is_extracted(self):
+        """table無しの0件View(collection-content-wrapper)がdivラッパーやコールアウト内にあってもスキップされず抽出されること"""
+        root_id = "aaaa1111111111111111111111111111"
+        db_id = "bbbb2222222222222222222222222222"
+        view_block_id = "cccc3333-3333-3333-3333-333333333333"
+
+        html_doc = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Root</title></head>
+<body><article id="{root_id}" class="page sans"><header><h1 class="page-title">Root</h1></header>
+<div class="page-body">
+  <div dir="auto" id="{view_block_id}">
+    <div class="collection-content-wrapper"><h4 class="collection-title">空DB</h4></div>
+  </div>
+  <aside class="callout">
+    <div class="collection-content-wrapper" id="callout-view-1"><h4 class="collection-title">空DB</h4></div>
+  </aside>
+</div>
+</article></body></html>"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zpath = os.path.join(tmpdir, "empty_wrapper.zip")
+            with zipfile.ZipFile(zpath, "w") as zf:
+                zf.writestr(f"Root {root_id}.html", html_doc)
+                zf.writestr(f"Root/空DB {db_id}.csv", "名前,メモ\n")
+            tree = HtmlZipExtractor(zpath).extract_tree()
+
+        db_blocks = [b for b in tree.blocks if b.get("type") == "child_database"]
+        self.assertEqual(len(db_blocks), 1)
+        self.assertEqual(db_blocks[0]["id"], view_block_id)
+        self.assertEqual(db_blocks[0]["database_id"].replace("-", ""), db_id)
+
+        callouts = [b for b in tree.blocks if b.get("type") == "callout"]
+        self.assertEqual(len(callouts), 1)
+        callout_dbs = [b for b in callouts[0].get("children_blocks", []) if b.get("type") == "child_database"]
+        self.assertEqual(len(callout_dbs), 1)
+        self.assertEqual(callout_dbs[0]["database_id"].replace("-", ""), db_id)
+
 
 if __name__ == "__main__":
     unittest.main()

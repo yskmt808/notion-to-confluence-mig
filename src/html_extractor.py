@@ -2532,6 +2532,20 @@ class HtmlZipExtractor:
                     db_csv_map=db_csv_map,
                     in_synced_wrapper=(in_synced_wrapper or is_synced_wrapper_el),
                 )
+                parent_el_id = el.get("id")
+                if parent_el_id:
+                    for sb in sub_blocks:
+                        if (
+                            isinstance(sb, dict)
+                            and sb.get("type") == "child_database"
+                            and str(sb.get("id") or "").startswith("b_")
+                        ):
+                            sb["id"] = parent_el_id
+                            if str(sb.get("database_id") or "").startswith("b_"):
+                                sb["database_id"] = parent_el_id
+                            for ds in sb.get("data_sources") or []:
+                                if isinstance(ds, dict) and str(ds.get("id") or "").startswith("b_"):
+                                    ds["id"] = parent_el_id
                 blocks.extend(sub_blocks)
 
             # 17. その他・未知のNotion固有要素 (例: breadcrumb 等)
@@ -2678,6 +2692,7 @@ class HtmlZipExtractor:
                 "column-list",
                 "column_list",
                 "collection-content",
+                "collection-content-wrapper",
                 "link-to-page",
                 "image",
                 "table-of-contents",

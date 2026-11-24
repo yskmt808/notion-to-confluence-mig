@@ -756,6 +756,87 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
             self.assertEqual(len(tel.errors), 1)
             self.assertFalse(cp.is_pass2_done("db-err__details"))
 
+    def test_aggregated_row_direct_links_resolve_to_detail_page_anchor(self):
+        """集約子ページになっているDB行への単独ページリンク(link_to_page/mention/inline/relation)が集約詳細ページ+アンカーに接続されること"""
+        conv = NotionToConfluenceConverter()
+        row_id = "41d7be77-284d-8079-a310-e1733e48a15a"
+        row_id_fallback = "51d7be77-284d-8079-a310-e1733e48a15b"
+        conv.id_to_title_map = {
+            row_id: "raw6",
+            row_id_fallback: "raw7",
+        }
+        conv.migration_map = {
+            row_id: {
+                "confluence_id": "7143589",
+                "title": "同じ名前 - 詳細ページ一覧",
+                "url": "https://example.atlassian.net/wiki/spaces/TEST/pages/7143589#%5B20261119%5Draw6",
+                "node_type": "database_row",
+                "aggregated_page_title": "同じ名前 - 詳細ページ一覧",
+                "aggregated_anchor": "raw6",
+            },
+            row_id_fallback: {
+                "confluence_id": "7143589",
+                "title": "raw7",
+                "url": "https://example.atlassian.net/wiki/spaces/TEST/pages/7143589#raw7",
+                "node_type": "database_row",
+            },
+        }
+        conv.migration_map[row_id]["title"] = "raw6"
+
+        page = PageNode(
+            id="p-caller",
+            title="参照元ページ",
+            node_type="page",
+            blocks=[
+                {"type": "link_to_page", "link_to_page": {"type": "page_id", "page_id": row_id}},
+                {"type": "link_to_page", "link_to_page": {"type": "page_id", "page_id": row_id_fallback}},
+                {
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [
+                            {
+                                "type": "mention",
+                                "plain_text": "@raw6",
+                                "mention": {"type": "page", "page": {"id": row_id}},
+                            },
+                            {"type": "text", "text": {"content": " / "}, "plain_text": " / "},
+                            {
+                                "type": "text",
+                                "text": {"content": "raw6へのリンク", "link": {"url": f"/{row_id.replace('-', '')}"}},
+                                "plain_text": "raw6へのリンク",
+                                "href": f"/{row_id.replace('-', '')}",
+                            },
+                        ]
+                    },
+                },
+            ],
+        )
+
+        storage_xml = conv.generate_page_content(page)
+        expected_anchor_link = (
+            '<ac:link ac:anchor="raw6">'
+            '<ri:page ri:content-title="同じ名前 - 詳細ページ一覧" />'
+            '<ac:link-body>raw6</ac:link-body>'
+            '</ac:link>'
+        )
+        self.assertIn(f"<p>{expected_anchor_link}</p>", storage_xml)
+        self.assertIn(expected_anchor_link, storage_xml)
+        self.assertIn(
+            '<ac:link ac:anchor="raw6"><ri:page ri:content-title="同じ名前 - 詳細ページ一覧" /><ac:link-body>raw6へのリンク</ac:link-body></ac:link>',
+            storage_xml,
+        )
+        self.assertIn(
+            '<p><a href="https://example.atlassian.net/wiki/spaces/TEST/pages/7143589#raw7">raw7</a></p>',
+            storage_xml,
+        )
+        self.assertNotIn('<ri:page ri:content-title="raw6" />', storage_xml)
+
+        rel_html = conv.format_property_for_confluence({
+            "type": "relation",
+            "relations": [{"id": row_id, "text": "raw6"}],
+        })
+        self.assertEqual(rel_html, expected_anchor_link)
+
 
 if __name__ == "__main__":
     unittest.main()
