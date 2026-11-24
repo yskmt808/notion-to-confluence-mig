@@ -314,6 +314,45 @@ class TestDbTriage(unittest.TestCase):
             self.assertEqual(len(db2.children[0].blocks), 1)
             self.assertTrue(database_row_has_substantive_body(db2.children[0]))
 
+    def test_column_referenced_db_recommends_individual_mode(self):
+        """レコード子ページが他DBのカラム値として参照されている場合、DBトリアージの推奨がindividualになること"""
+        ref_row_id = "11111111-1111-1111-1111-111111111111"
+        db_target_rows = [_row(ref_row_id, "参照される行", has_body=True)] + [
+            _row(f"11111111-1111-1111-1111-11111111{i:04x}", f"Row-{i}", has_body=True)
+            for i in range(2, 36)
+        ]
+        db_target = PageNode(
+            id="aaaa0000-0000-0000-0000-000000000010",
+            title="参照先DB",
+            node_type="database",
+            children=db_target_rows,
+        )
+        db_caller_row = _row("22222222-2222-2222-2222-222222222222", "呼出元行", has_body=False)
+        db_caller_row.properties["関連"] = {
+            "type": "relation",
+            "relations": [{"id": ref_row_id, "text": "参照される行"}],
+        }
+        db_caller = PageNode(
+            id="aaaa0000-0000-0000-0000-000000000020",
+            title="呼出元DB",
+            node_type="database",
+            children=[db_caller_row],
+        )
+        db_unreferenced = PageNode(
+            id="aaaa0000-0000-0000-0000-000000000030",
+            title="独立標準DB",
+            node_type="database",
+            children=[
+                _row(f"33333333-3333-3333-3333-33333333{i:04x}", f"Plain-{i}", has_body=True)
+                for i in range(1, 36)
+            ],
+        )
+        root = PageNode(id="root-ref-triage", title="Root", node_type="page", children=[db_target, db_caller, db_unreferenced])
+
+        triage_rows = {r["db_title"]: r for r in collect_db_triage_rows(root)}
+        self.assertIn("individual推奨", triage_rows["参照先DB"]["recommendation"])
+        self.assertEqual(triage_rows["独立標準DB"]["recommendation"], "✅ 標準 (aggregated推奨)")
+
 
 if __name__ == "__main__":
     unittest.main()

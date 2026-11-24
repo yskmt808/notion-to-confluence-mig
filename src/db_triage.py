@@ -2,7 +2,8 @@
 
 import csv
 import os
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Set
 
 from src.extractor import (
     analyze_database_child_page_stats,
@@ -41,10 +42,71 @@ def resolve_db_migration_mode(
     return "aggregated"
 
 
-def _recommend_db_triage(total_rows: int, body_rows: int, total_body_blocks: int) -> str:
+_UUID_CANDIDATE_RE = re.compile(
+    r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
+)
+
+
+def _collect_column_referenced_db_ids(root_node: Any) -> Set[str]:
+    """いずれかのDBの行カラム値(relation/mention/リンク等)から参照されているレコード子ページが属するDBの正規化ID集合を返す。"""
+    row_to_db: Dict[str, str] = {}
+
+    def _index_rows(node: Any, current_db_nid: Optional[str] = None) -> None:
+        ntype = getattr(node, "node_type", "")
+        nid = normalize_notion_id(getattr(node, "id", "") or "")
+        next_db_nid = nid if ntype == "database" and nid else current_db_nid
+        if ntype == "database_row" and nid and current_db_nid and not is_empty_database_row(node):
+            row_to_db[nid] = current_db_nid
+        for c in (getattr(node, "children", None) or []):
+            _index_rows(c, next_db_nid if ntype == "database" else current_db_nid)
+
+    _index_rows(root_node)
+    if not row_to_db:
+        return set()
+
+    referenced_db_ids: Set[str] = set()
+
+    def _scan_value(val: Any) -> None:
+        if val is None:
+            return
+        if isinstance(val, str):
+            for m in _UUID_CANDIDATE_RE.findall(val):
+                norm_u = normalize_notion_id(m)
+                if norm_u in row_to_db:
+                    referenced_db_ids.add(row_to_db[norm_u])
+        elif isinstance(val, dict):
+            for v in val.values():
+                _scan_value(v)
+        elif isinstance(val, (list, tuple, set)):
+            for item in val:
+                _scan_value(item)
+
+    def _walk_props(node: Any) -> None:
+        if getattr(node, "node_type", "") == "database_row":
+            props = getattr(node, "properties", None) or {}
+            if isinstance(props, dict):
+                _scan_value(props)
+        for c in (getattr(node, "children", None) or []):
+            _walk_props(c)
+
+    _walk_props(root_node)
+    return referenced_db_ids
+
+
+def _recommend_db_triage(
+    total_rows: int,
+    body_rows: int,
+    total_body_blocks: int,
+    has_column_ref: bool = False,
+) -> str:
     if body_rows == 0:
         return "詳細なし (textキーのみ)"
-    if total_rows >= LARGE_DB_ROW_THRESHOLD or total_body_blocks >= LARGE_DB_BODY_BLOCKS_THRESHOLD:
+    is_large = total_rows >= LARGE_DB_ROW_THRESHOLD or total_body_blocks >= LARGE_DB_BODY_BLOCKS_THRESHOLD
+    if has_column_ref:
+        if is_large:
+            return "⚠️ 大規模DB・カラム値参照あり (individual推奨)"
+        return "💡 カラム値参照あり (individual推奨)"
+    if is_large:
         return "⚠️ 大規模DB注意 (static_table / skip検討)"
     if 1 <= body_rows <= SMALL_DB_BODY_ROW_THRESHOLD:
         return "💡 小規模DB (individual候補)"
@@ -137,6 +199,7 @@ def collect_db_triage_rows(
         return rows
 
     embedded_counts = _count_embedded_db_views(root_node)
+    referenced_db_ids = _collect_column_referenced_db_ids(root_node)
 
     def _walk(node: Any):
         ntype = getattr(node, "node_type", "")
@@ -168,6 +231,7 @@ def collect_db_triage_rows(
                     stats["total_rows"],
                     stats["body_rows"],
                     total_body_blocks,
+                    has_column_ref=(norm_id in referenced_db_ids),
                 ),
             })
         for child in (getattr(node, "children", None) or []):

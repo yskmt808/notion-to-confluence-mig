@@ -902,6 +902,32 @@ class TestSmartDbViews(unittest.TestCase):
         self.assertIn("savedViewId=view-shared-id", conv.generate_page_content(p3))
         self.assertIn("savedViewId=view-shared-id", conv.generate_page_content(p4))
 
+    def test_extract_notion_view_filters_resolves_relation_uuids_to_titles(self):
+        """DB Viewのリレーション(ページリンク)フィルタ条件のNotion UUIDが対象ページのタイトルへ解決されること"""
+        uid_a = "41d7be77-284d-8079-a310-e1733e48a15a"
+        uid_b = "51d7be77-284d-8079-a310-e1733e48a15b"
+        vc = {
+            "name": "関連フィルタビュー",
+            "type": "table",
+            "filter": {"property": "prop_rel", "relation": {"contains": uid_a}},
+            "quick_filters": {"prop_rel": {"relation": {"does_not_contain": [uid_b.replace("-", "")]}}},
+        }
+        filters = ConfluenceImporter._extract_notion_view_filters(
+            vc,
+            prop_id_to_name={"prop_rel": "関連タスク"},
+            multi_props=[],
+            id_to_title_map={uid_a: "タスクAlpha"},
+            migration_map={uid_b: {"title": "タスクBeta"}},
+            relation_props={"関連タスク"},
+        )
+        self.assertEqual(
+            filters,
+            [
+                {"field": "関連タスク", "operator": "contains", "value": "タスクAlpha"},
+                {"field": "関連タスク", "operator": "!=", "value": "タスクBeta"},
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

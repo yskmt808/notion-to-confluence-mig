@@ -1659,6 +1659,9 @@ class ConfluenceImporter:
         prop_id_to_name: Dict[str, str],
         multi_props: List[str],
         sanitize_fn: Optional[Any] = None,
+        id_to_title_map: Optional[Dict[str, str]] = None,
+        migration_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        relation_props: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Notion Views API の filter / quick_filters を Confluence add_filter 形式へ変換する。"""
         op_map = {
@@ -1676,6 +1679,7 @@ class ConfluenceImporter:
             "on_or_after": ">=",
         }
         results: List[Dict[str, Any]] = []
+        rel_props = relation_props or set()
 
         def _resolve_field_name(raw_key: str) -> str:
             name = prop_id_to_name.get(raw_key, raw_key)
@@ -1683,13 +1687,44 @@ class ConfluenceImporter:
                 name = sanitize_fn(name) or name
             return name
 
+        def _resolve_relation_value(raw_val: Any) -> Optional[str]:
+            if isinstance(raw_val, dict):
+                raw_val = raw_val.get("id") or raw_val.get("value") or raw_val.get("name")
+            if raw_val is None:
+                return None
+            s_val = str(raw_val).strip()
+            if not s_val:
+                return None
+            norm_val = s_val.replace("-", "").lower()
+            if id_to_title_map:
+                t = id_to_title_map.get(s_val) or id_to_title_map.get(norm_val)
+                if not t:
+                    for k, v in id_to_title_map.items():
+                        if str(k).replace("-", "").lower() == norm_val:
+                            t = v
+                            break
+                if t:
+                    return str(t)
+            if migration_map:
+                m = migration_map.get(s_val) or migration_map.get(norm_val)
+                if not m:
+                    for k, v in migration_map.items():
+                        if str(k).replace("-", "").lower() == norm_val:
+                            m = v
+                            break
+                if isinstance(m, dict) and m.get("title"):
+                    return str(m["title"])
+            return s_val
+
         def _parse_condition(field_key: str, cond_body: Dict[str, Any]) -> None:
             if not isinstance(cond_body, dict) or not field_key:
                 return
             field_name = _resolve_field_name(field_key)
+            is_rel_field = field_name in rel_props or field_key in rel_props
             for p_type, spec in cond_body.items():
                 if p_type in ("property", "timestamp") or not isinstance(spec, dict):
                     continue
+                is_relation = (p_type == "relation") or is_rel_field
                 for notion_op, val in spec.items():
                     if notion_op == "is_empty" and val is True:
                         results.append({"field": field_name, "operator": "=", "value": ""})
@@ -1697,12 +1732,21 @@ class ConfluenceImporter:
                     if notion_op == "is_not_empty" and val is True:
                         results.append({"field": field_name, "operator": "!=", "value": ""})
                         continue
-                    if notion_op not in op_map or val is None or isinstance(val, (dict, list)):
+                    if notion_op not in op_map or val is None:
                         continue
                     conf_op = op_map[notion_op]
                     if p_type == "multi_select" or field_name in multi_props:
                         if notion_op in ("equals", "contains"):
                             conf_op = "contains"
+                    if is_relation:
+                        items = val if isinstance(val, list) else [val]
+                        for item_val in items:
+                            resolved_title = _resolve_relation_value(item_val)
+                            if resolved_title is not None:
+                                results.append({"field": field_name, "operator": conf_op, "value": resolved_title})
+                        continue
+                    if isinstance(val, (dict, list)):
+                        continue
                     val_str = str(val).lower() if isinstance(val, bool) else str(val)
                     results.append({"field": field_name, "operator": conf_op, "value": val_str})
 
@@ -1745,9 +1789,19 @@ class ConfluenceImporter:
         """--enrich-via-api で取得した Notion Views API 定義を Confluence データベースへ反映する。"""
         schema = node.properties.get("schema") or {}
         prop_id_to_name: Dict[str, str] = {}
+        relation_props: Set[str] = set()
         for pname, pinfo in schema.items():
-            if isinstance(pinfo, dict) and pinfo.get("id"):
-                prop_id_to_name[str(pinfo["id"])] = pname
+            if isinstance(pinfo, dict):
+                if pinfo.get("id"):
+                    prop_id_to_name[str(pinfo["id"])] = pname
+                if pinfo.get("type") == "relation":
+                    relation_props.add(pname)
+                    if sanitize_fn := getattr(self.converter, "_sanitize_db_field_name", None):
+                        s_name = sanitize_fn(pname)
+                        if s_name:
+                            relation_props.add(s_name)
+                    if pinfo.get("id"):
+                        relation_props.add(str(pinfo["id"]))
         for vc in views_config:
             for cp in (vc.get("configuration") or {}).get("properties") or []:
                 if isinstance(cp, dict) and cp.get("property_id") and cp.get("property_name"):
@@ -1770,7 +1824,15 @@ class ConfluenceImporter:
             v_name = (vc.get("name") or "").strip() or "Untitled"
             v_type = (vc.get("type") or "table").strip().lower()
             v_cfg = vc.get("configuration") or {}
-            filters = self._extract_notion_view_filters(vc, prop_id_to_name, multi_props, sanitize_fn=sanitize_fn)
+            filters = self._extract_notion_view_filters(
+                vc,
+                prop_id_to_name,
+                multi_props,
+                sanitize_fn=sanitize_fn,
+                id_to_title_map=getattr(self.converter, "id_to_title_map", None),
+                migration_map=self.migration_map,
+                relation_props=relation_props,
+            )
 
             sorts: List[Dict[str, Any]] = []
             for s in vc.get("sorts") or []:
