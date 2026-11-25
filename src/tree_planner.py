@@ -904,3 +904,212 @@ def export_summary_markdown(summary_md: str, output_path: str) -> str:
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(summary_md)
     return output_path
+
+
+_ZIP_UUID_SUFFIX_RE = re.compile(r"\s+([0-9a-fA-F]{32})$")
+
+
+def _count_csv_data_rows_fast(raw_bytes: bytes) -> int:
+    """BeautifulSoup等を使わずにCSVバイト列のデータ行数（ヘッダ除く）を高速カウントする。"""
+    text = HtmlZipExtractor._decode_csv_bytes(raw_bytes)
+    if not text.strip():
+        return 0
+    import io as _io
+    reader = csv.reader(_io.StringIO(text))
+    header = next(reader, None)
+    if header is None:
+        return 0
+    return sum(1 for row in reader if any(cell.strip() for cell in row))
+
+
+def analyze_zips_lightweight(
+    zip_paths: List[str],
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, Any]:
+    """HTMLパースを行わず、ZIPメタデータとCSV行数カウントのみでエクスポート規模を高速算出する。"""
+    total_html = 0
+    total_csv = 0
+    total_other = 0
+    total_compressed_bytes = 0
+    total_uncompressed_bytes = 0
+    total_csv_rows = 0
+    ext_counts: Dict[str, int] = {}
+    ext_bytes: Dict[str, int] = {}
+    folder_stats: Dict[str, Dict[str, Any]] = {}
+    db_entries: List[Dict[str, Any]] = []
+    largest_files: List[Dict[str, Any]] = []
+
+    for z_idx, zp in enumerate(zip_paths, start=1):
+        z_name = os.path.basename(zp)
+        if progress_cb:
+            progress_cb(z_idx, len(zip_paths), z_name)
+        with zipfile.ZipFile(zp, "r") as zf:
+            infos = [info for info in zf.infolist() if not info.is_dir()]
+            html_paths: List[str] = []
+
+            for info in infos:
+                fname = info.filename
+                lower = fname.lower()
+                ext = os.path.splitext(lower)[1] or "(no_ext)"
+                ext_counts[ext] = ext_counts.get(ext, 0) + 1
+                ext_bytes[ext] = ext_bytes.get(ext, 0) + info.file_size
+                total_compressed_bytes += info.compress_size
+                total_uncompressed_bytes += info.file_size
+
+                parts = [p for p in fname.split("/") if p]
+                top_folder = parts[0] if len(parts) > 1 else "(root)"
+                fst = folder_stats.setdefault(
+                    top_folder,
+                    {"folder": top_folder, "html_count": 0, "csv_count": 0, "csv_rows": 0, "other_count": 0, "total_bytes": 0},
+                )
+                fst["total_bytes"] += info.file_size
+
+                largest_files.append({"zip_name": z_name, "path": fname, "bytes": info.file_size})
+
+                if lower.endswith(".html"):
+                    total_html += 1
+                    fst["html_count"] += 1
+                    html_paths.append(fname)
+                elif lower.endswith(".csv"):
+                    total_csv += 1
+                    fst["csv_count"] += 1
+                    raw_csv = zf.read(fname)
+                    row_cnt = _count_csv_data_rows_fast(raw_csv)
+                    total_csv_rows += row_cnt
+                    fst["csv_rows"] += row_cnt
+
+                    base_no_ext = os.path.splitext(fname)[0]
+                    base_name = os.path.basename(base_no_ext)
+                    m_uid = _ZIP_UUID_SUFFIX_RE.search(base_name)
+                    db_id = _format_uuid(m_uid.group(1)) if m_uid else ""
+                    db_title = _ZIP_UUID_SUFFIX_RE.sub("", base_name).strip() or base_name
+                    db_entries.append({
+                        "zip_name": z_name,
+                        "csv_path": fname,
+                        "db_title": db_title,
+                        "db_id": db_id,
+                        "row_count": row_cnt,
+                        "csv_bytes": info.file_size,
+                        "_dir_prefix": _ZIP_UUID_SUFFIX_RE.sub("", base_no_ext).rstrip("/") + "/",
+                        "_short_uid_prefix": (
+                            f"{_ZIP_UUID_SUFFIX_RE.sub('', base_no_ext).rstrip('/')} {m_uid.group(1).lower()[:4]}-{m_uid.group(1).lower()[-4:]}/"
+                            if m_uid
+                            else ""
+                        ),
+                    })
+                else:
+                    total_other += 1
+                    fst["other_count"] += 1
+
+            # 同じZIP内の各DBに対応する行HTMLディレクトリ配下のHTML件数を高速集計
+            for db_e in db_entries:
+                if db_e["zip_name"] != z_name:
+                    continue
+                p1 = db_e.pop("_dir_prefix")
+                p2 = db_e.pop("_short_uid_prefix")
+                row_html_cnt = sum(
+                    1 for hp in html_paths
+                    if hp.startswith(p1) or (p2 and hp.startswith(p2))
+                )
+                db_e["row_html_count"] = row_html_cnt
+
+    largest_files.sort(key=lambda x: -x["bytes"])
+    db_entries.sort(key=lambda x: (-x["row_count"], -x["csv_bytes"], x["db_title"]))
+    folders_sorted = sorted(folder_stats.values(), key=lambda x: (-x["total_bytes"], -x["html_count"], x["folder"]))
+
+    return {
+        "zip_count": len(zip_paths),
+        "total_files": total_html + total_csv + total_other,
+        "total_html": total_html,
+        "total_csv": total_csv,
+        "total_other": total_other,
+        "total_csv_rows": total_csv_rows,
+        "total_compressed_bytes": total_compressed_bytes,
+        "total_uncompressed_bytes": total_uncompressed_bytes,
+        "ext_counts": ext_counts,
+        "ext_bytes": ext_bytes,
+        "folders": folders_sorted,
+        "databases": db_entries,
+        "largest_files": largest_files[:20],
+    }
+
+
+def build_zip_stats_markdown(stats: Dict[str, Any], elapsed_seconds: float = 0.0) -> str:
+    """analyze_zips_lightweight の結果を Markdown レポートとして整形する。"""
+    def _fmt_mb(b: int) -> str:
+        return f"{b / (1024 * 1024):.2f} MB"
+
+    now_str = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    lines = [
+        "# Notion エクスポートZIP 軽量規模サマリー (`--stats-only`)",
+        "",
+        f"- **生成日時**: {now_str}",
+        f"- **対象ZIP数**: {stats['zip_count']} 件",
+        f"- **解析時間**: {elapsed_seconds:.2f} 秒 (HTMLフルパースなし)",
+        "",
+        "## 1. 全体規模",
+        "",
+        "| 項目 | 値 |",
+        "| :--- | ---: |",
+        f"| 総ファイル数 | {stats['total_files']} |",
+        f"| HTMLファイル数 (ページ＋DB行HTML) | {stats['total_html']} |",
+        f"| DB CSVファイル数 | {stats['total_csv']} |",
+        f"| DB CSV総レコード行数 | {stats['total_csv_rows']} |",
+        f"| 添付・その他ファイル数 | {stats['total_other']} |",
+        f"| 非圧縮合計サイズ | {_fmt_mb(stats['total_uncompressed_bytes'])} |",
+        f"| ZIP圧縮合計サイズ | {_fmt_mb(stats['total_compressed_bytes'])} |",
+        "",
+        "## 2. トップレベルフォルダ別規模",
+        "",
+        "| フォルダ | HTML | DB CSV | CSV行数 | 添付/他 | 合計サイズ |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for fst in stats["folders"][:30]:
+        lines.append(
+            f"| {fst['folder']} | {fst['html_count']} | {fst['csv_count']} | {fst['csv_rows']} | {fst['other_count']} | {_fmt_mb(fst['total_bytes'])} |"
+        )
+    if len(stats["folders"]) > 30:
+        lines.append(f"| ... (他 {len(stats['folders']) - 30} フォルダ) | | | | | |")
+
+    if stats["databases"]:
+        lines.extend([
+            "",
+            "## 3. データベース一覧（CSV行数降順 Top 30）",
+            "",
+            "| データベース名 | CSV行数 | 行HTML数 | CSVサイズ | ID |",
+            "| :--- | ---: | ---: | ---: | :--- |",
+        ])
+        for db in stats["databases"][:30]:
+            lines.append(
+                f"| {db['db_title']} | {db['row_count']} | {db.get('row_html_count', 0)} | {db['csv_bytes']:,} B | `{db['db_id']}` |"
+            )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def export_zip_stats_csvs(stats: Dict[str, Any], output_dir: str) -> Tuple[str, str]:
+    """軽量規模分析のDB一覧CSV・フォルダ一覧CSVを書き出す。"""
+    os.makedirs(output_dir, exist_ok=True)
+    db_csv_path = os.path.join(output_dir, "zip_databases.csv")
+    folder_csv_path = os.path.join(output_dir, "zip_folders.csv")
+
+    with open(db_csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["zip_name", "db_title", "db_id", "row_count", "row_html_count", "csv_bytes", "csv_path"],
+        )
+        writer.writeheader()
+        for db in stats["databases"]:
+            writer.writerow(db)
+
+    with open(folder_csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["folder", "html_count", "csv_count", "csv_rows", "other_count", "total_bytes"],
+        )
+        writer.writeheader()
+        for fst in stats["folders"]:
+            writer.writerow(fst)
+
+    return db_csv_path, folder_csv_path

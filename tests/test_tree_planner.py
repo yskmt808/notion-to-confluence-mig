@@ -363,6 +363,40 @@ class TestTreePlanner(unittest.TestCase):
                 csv_rows = list(csv.DictReader(f))
             self.assertEqual([r["title"] for r in csv_rows], ["部署A", "手順書"])
 
+    def test_zip_stats_only_calculates_scale_without_html_parsing(self):
+        """--stats-only 指定時はHTMLフルパースを行わず、ZIP規模サマリー・DB一覧CSV・フォルダ一覧CSVを高速出力すること"""
+        root_id = "aaaa1111111111111111111111111111"
+        db_id = "bbbb2222222222222222222222222222"
+        row_id = "cccc3333333333333333333333333333"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "scale.zip")
+            out_dir = os.path.join(tmpdir, "stats_out")
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr(f"DeptA/Top {root_id}.html", "<html><body>top</body></html>")
+                zf.writestr(f"DeptA/Tasks {db_id}.csv", "名前,メモ\nT1,a\nT2,b\nT3,c\n".encode("utf-16"))
+                zf.writestr(f"DeptA/Tasks/T1 {row_id}.html", "<html><body>detail</body></html>")
+                zf.writestr("DeptA/image.png", b"\x89PNG\r\n\x1a\n")
+
+            with patch("src.tree_planner.HtmlZipExtractor.extract_tree", side_effect=AssertionError("should not full-parse")):
+                exit_code = plan_tree.main(["--zip", zip_path, "--stats-only", "--output-dir", out_dir])
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(os.path.exists(os.path.join(out_dir, "zip_stats.md")))
+            with open(os.path.join(out_dir, "zip_databases.csv"), "r", encoding="utf-8-sig") as f:
+                db_rows = list(csv.DictReader(f))
+            self.assertEqual(len(db_rows), 1)
+            self.assertEqual(db_rows[0]["db_title"], "Tasks")
+            self.assertEqual(db_rows[0]["row_count"], "3")
+            self.assertEqual(db_rows[0]["row_html_count"], "1")
+
+            with open(os.path.join(out_dir, "zip_folders.csv"), "r", encoding="utf-8-sig") as f:
+                folder_rows = list(csv.DictReader(f))
+            self.assertEqual(folder_rows[0]["folder"], "DeptA")
+            self.assertEqual(folder_rows[0]["html_count"], "2")
+            self.assertEqual(folder_rows[0]["csv_count"], "1")
+            self.assertEqual(folder_rows[0]["csv_rows"], "3")
+
 
 if __name__ == "__main__":
     unittest.main()

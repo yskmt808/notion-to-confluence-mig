@@ -19,10 +19,13 @@ from dotenv import load_dotenv
 
 from src.tree_planner import (
     ApiTreeScanner,
+    analyze_zips_lightweight,
     build_summary_markdown,
+    build_zip_stats_markdown,
     count_zip_source_files,
     export_pages_csv,
     export_summary_markdown,
+    export_zip_stats_csvs,
     flatten_plan_trees,
     scan_zips_to_plan_trees,
 )
@@ -94,6 +97,11 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
         "--exclude-db-rows",
         action="store_true",
         help="pages.csv の明細行から DB行レコード (database_row) を除外する（サマリーとdb_row_countは維持）",
+    )
+    parser.add_argument(
+        "--stats-only",
+        action="store_true",
+        help="(--zip / --zip-dir 時) HTMLフルパースを行わず、ZIPメタデータとCSV行数カウントのみで規模感(zip_stats.md / zip_databases.csv / zip_folders.csv)を高速算出する",
     )
     parser.add_argument(
         "-v",
@@ -194,6 +202,25 @@ def main(argv: List[str] = None) -> int:
                 print(f"エラー: ディレクトリ '{args.zip_dir}' にZIPファイルが見つかりません。", file=sys.stderr)
                 return 1
         html_cnt, csv_cnt = count_zip_source_files(zip_files)
+        if args.stats_only:
+            print(f"⚡ エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) の軽量規模算出を実行中...")
+            stats = analyze_zips_lightweight(
+                zip_files,
+                progress_cb=lambda idx, tot, name: print(f"  ... [{idx}/{tot}] {name}", flush=True),
+            )
+            elapsed = time.monotonic() - t0
+            os.makedirs(args.output_dir, exist_ok=True)
+            stats_md = build_zip_stats_markdown(stats, elapsed_seconds=elapsed)
+            md_path = os.path.join(args.output_dir, "zip_stats.md")
+            export_summary_markdown(stats_md, md_path)
+            db_csv_path, folder_csv_path = export_zip_stats_csvs(stats, args.output_dir)
+            print("")
+            print(stats_md)
+            print("✅ 軽量規模算出完了:")
+            print(f"   - サマリー (Markdown): {md_path}")
+            print(f"   - DB一覧CSV          : {db_csv_path}")
+            print(f"   - フォルダ一覧CSV    : {folder_csv_path}")
+            return 0
         print(f"📦 エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) からページツリーを解析中...")
         roots = scan_zips_to_plan_trees(zip_files, root_page_id=args.root_page_id or None)
         source_label = f"Export ZIP x {len(zip_files)} ({os.path.basename(zip_files[0])})"
