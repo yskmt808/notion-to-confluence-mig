@@ -436,6 +436,39 @@ class TestTreePlanner(unittest.TestCase):
             self.assertEqual([r["title"] for r in csv_rows], ["全体ルート", "部署A", "課題DB"])
             self.assertEqual(csv_rows[2]["db_row_count"], "2")
 
+    def test_fast_tree_multizip_excludes_db_rows_across_zips_from_level1(self):
+        """複数ZIP分割でDB CSVと行HTMLが別ZIPに分かれていても、--exclude-db-rows時にDBレコードがlevel_1に漏れないこと"""
+        root_id = "11111111111111111111111111111111"
+        db_id = "22222222222222222222222222222222"
+        row1_id = "33333333333333333333333333333333"
+        nested_id = "44444444444444444444444444444444"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip1 = os.path.join(tmpdir, "part1.zip")
+            zip2 = os.path.join(tmpdir, "part2.zip")
+            out_dir = os.path.join(tmpdir, "out")
+            with zipfile.ZipFile(zip1, "w") as zf:
+                zf.writestr(f"Root {root_id}.html", "<html><head><title>Root</title></head></html>")
+                zf.writestr(f"Root/案件DB {db_id}.csv", "名前,メモ\nRow1,a\n")
+            with zipfile.ZipFile(zip2, "w") as zf:
+                zf.writestr(f"Root/案件DB/Row1 {row1_id}.html", "<html><head><title>Row1</title></head></html>")
+                zf.writestr(f"Root/案件DB/Row1/孫メモ {nested_id}.html", "<html><head><title>孫メモ</title></head></html>")
+
+            exit_code = plan_tree.main([
+                "--zip", zip1, zip2,
+                "--fast-tree",
+                "--exclude-db-rows",
+                "--output-dir", out_dir,
+            ])
+            self.assertEqual(exit_code, 0)
+            with open(os.path.join(out_dir, "pages.csv"), "r", encoding="utf-8-sig") as f:
+                csv_rows = list(csv.DictReader(f))
+            self.assertEqual([r["title"] for r in csv_rows], ["Root", "案件DB"])
+            with open(os.path.join(out_dir, "summary.md"), "r", encoding="utf-8") as f:
+                md = f.read()
+            self.assertNotIn("Row1", md)
+            self.assertNotIn("孫メモ", md)
+
 
 if __name__ == "__main__":
     unittest.main()
