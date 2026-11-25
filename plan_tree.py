@@ -62,7 +62,7 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
     parser.add_argument(
         "--root-page-id",
         default="",
-        help="(--api時) 調査対象とするルートページ/DBのUUID（未指定時はアクセス可能な全体）",
+        help="(--api / --from-cache / --zip / --zip-dir 時) 調査対象とするルートページ/DBのUUID（未指定時は全体）",
     )
     parser.add_argument(
         "--subtree-only",
@@ -195,8 +195,10 @@ def main(argv: List[str] = None) -> int:
                 return 1
         html_cnt, csv_cnt = count_zip_source_files(zip_files)
         print(f"📦 エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) からページツリーを解析中...")
-        roots = scan_zips_to_plan_trees(zip_files)
+        roots = scan_zips_to_plan_trees(zip_files, root_page_id=args.root_page_id or None)
         source_label = f"Export ZIP x {len(zip_files)} ({os.path.basename(zip_files[0])})"
+        if args.root_page_id:
+            source_label += f" [root={args.root_page_id}]"
 
     include_db_rows = not args.exclude_db_rows
     rows = flatten_plan_trees(roots, include_db_rows=include_db_rows)

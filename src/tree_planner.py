@@ -634,7 +634,23 @@ def count_zip_source_files(zip_paths: List[str]) -> Tuple[int, int]:
     return html_cnt, csv_cnt
 
 
-def scan_zips_to_plan_trees(zip_paths: List[str]) -> List[PlanTreeNode]:
+def _find_plan_node_by_id(roots: List[PlanTreeNode], target_id: str) -> Optional[PlanTreeNode]:
+    target_norm = normalize_notion_id(target_id)
+    if not target_norm:
+        return None
+    stack = list(roots)
+    while stack:
+        curr = stack.pop(0)
+        if normalize_notion_id(curr.node_id) == target_norm:
+            return curr
+        stack.extend(curr.children)
+    return None
+
+
+def scan_zips_to_plan_trees(
+    zip_paths: List[str],
+    root_page_id: Optional[str] = None,
+) -> List[PlanTreeNode]:
     """エクスポートZIP（単一または複数）からAPIコールなしでPlanTreeNodeのルートリストを構築する。"""
     if not zip_paths:
         raise ValueError("No ZIP files provided.")
@@ -642,7 +658,14 @@ def scan_zips_to_plan_trees(zip_paths: List[str]) -> List[PlanTreeNode]:
         root_pnode = HtmlZipExtractor(zip_paths[0]).extract_tree()
     else:
         root_pnode = MultiZipExtractor(zip_paths=zip_paths).extract_tree()
-    return [_page_node_to_plan_node(root_pnode)]
+    roots = [_page_node_to_plan_node(root_pnode)]
+    if root_page_id:
+        target = _find_plan_node_by_id(roots, root_page_id)
+        if not target:
+            raise ValueError(f"Root page/database ID '{root_page_id}' not found in ZIP export.")
+        target.parent_id = ""
+        return [target]
+    return roots
 
 
 def _compute_subtree_counts(node: PlanTreeNode, include_db_rows: bool) -> int:

@@ -159,6 +159,16 @@ class TestTreePlanner(unittest.TestCase):
             self.assertEqual([r["title"] for r in csv_rows], ["Top", "Child", "Items"])
             self.assertEqual(csv_rows[2]["db_row_count"], "2")
 
+            sub_dir = os.path.join(tmpdir, "plan_sub")
+            exit_code_sub = plan_tree.main([
+                "--zip", zip_path, "--root-page-id", sub_id, "--output-dir", sub_dir,
+            ])
+            self.assertEqual(exit_code_sub, 0)
+            with open(os.path.join(sub_dir, "pages.csv"), "r", encoding="utf-8-sig") as f:
+                sub_rows = list(csv.DictReader(f))
+            self.assertEqual([r["title"] for r in sub_rows], ["Child"])
+            self.assertEqual(sub_rows[0]["parent_id"], "")
+
     @patch("src.tree_planner.time.sleep")
     @patch("src.tree_planner.requests.request")
     def test_subtree_only_mode_traverses_blocks_and_skips_db_rows(self, mock_req, mock_sleep):
