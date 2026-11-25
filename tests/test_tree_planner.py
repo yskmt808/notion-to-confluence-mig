@@ -122,13 +122,13 @@ class TestTreePlanner(unittest.TestCase):
             self.assertIn("| DB行レコード (`database_row` 実数) | 1 |", md)
             self.assertIn("| タスクDB | 1 |", md)
 
-            # キャッシュからの再開時は /v1/search を呼ばないこと
+            # キャッシュからの再開時は /v1/search も block_id親解決 も呼ばないこと (block_parentsもキャッシュ済み)
             mock_req.reset_mock()
-            mock_req.side_effect = [r_block_parent]
+            mock_req.side_effect = []
             scanner_resumed = ApiTreeScanner(token="ntn_test", rate_limit=100.0, cache_file=cache_path, resume=True)
             roots_resumed = scanner_resumed.scan(root_page_id=root_id)
             self.assertEqual(len(roots_resumed), 1)
-            self.assertEqual(scanner_resumed.api_calls, 1)  # block_id親解決のみ
+            self.assertEqual(scanner_resumed.api_calls, 0)
 
     def test_zip_mode_cli_outputs_pages_csv_and_summary_md(self):
         root_id = "aaaa1111111111111111111111111111"
@@ -284,6 +284,72 @@ class TestTreePlanner(unittest.TestCase):
 
             self.assertEqual(attempts[0], 3)
             self.assertTrue(os.path.exists(target))
+
+    @patch("src.tree_planner.time.sleep")
+    @patch("src.tree_planner.requests.request")
+    def test_from_cache_cli_extracts_subtree_offline_with_block_parents(self, mock_req, mock_sleep):
+        root_id = "11111111-1111-1111-1111-111111111111"
+        sub_root_id = "22222222-2222-2222-2222-222222222222"
+        leaf_id = "33333333-3333-3333-3333-333333333333"
+        blk_id = "44444444-4444-4444-4444-444444444444"
+
+        r_search = MagicMock(
+            status_code=200,
+            ok=True,
+            json=lambda: {
+                "results": [
+                    {
+                        "object": "page",
+                        "id": root_id,
+                        "parent": {"type": "workspace", "workspace": True},
+                        "properties": {"title": {"type": "title", "title": [{"plain_text": "全体ルート"}]}},
+                    },
+                    {
+                        "object": "page",
+                        "id": sub_root_id,
+                        "parent": {"type": "page_id", "page_id": root_id},
+                        "properties": {"title": {"type": "title", "title": [{"plain_text": "部署A"}]}},
+                    },
+                    {
+                        "object": "page",
+                        "id": leaf_id,
+                        "parent": {"type": "block_id", "block_id": blk_id},
+                        "properties": {"title": {"type": "title", "title": [{"plain_text": "手順書"}]}},
+                    },
+                ],
+                "has_more": False,
+                "next_cursor": None,
+            },
+        )
+        r_blk = MagicMock(
+            status_code=200,
+            ok=True,
+            json=lambda: {"id": blk_id, "parent": {"type": "page_id", "page_id": sub_root_id}},
+        )
+        mock_req.side_effect = [r_search, r_blk]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "api_search_cache.json")
+            out_sub = os.path.join(tmpdir, "sub_out")
+            scanner = ApiTreeScanner(token="ntn_test", rate_limit=100.0, cache_file=cache_path)
+            scanner.scan()
+
+            # --from-cache は requests.request を一切呼ばずにサブツリーを抽出できること
+            mock_req.reset_mock()
+            exit_code = plan_tree.main([
+                "--from-cache",
+                cache_path,
+                "--root-page-id",
+                sub_root_id,
+                "--output-dir",
+                out_sub,
+            ])
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(mock_req.call_count, 0)
+
+            with open(os.path.join(out_sub, "pages.csv"), "r", encoding="utf-8-sig") as f:
+                csv_rows = list(csv.DictReader(f))
+            self.assertEqual([r["title"] for r in csv_rows], ["部署A", "手順書"])
 
 
 if __name__ == "__main__":

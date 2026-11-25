@@ -147,6 +147,9 @@ class ApiTreeScanner:
         try:
             with open(self.cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            bp = data.get("block_parents")
+            if isinstance(bp, dict):
+                self._block_parent_cache.update(bp)
             return data.get("results", []), data.get("next_cursor"), bool(data.get("search_completed", False))
         except Exception as e:
             logger.warning(f"Failed to load search cache {self.cache_file}: {e}")
@@ -189,10 +192,16 @@ class ApiTreeScanner:
                 "results": results,
                 "next_cursor": next_cursor,
                 "search_completed": completed,
+                "block_parents": self._block_parent_cache,
             },
         )
 
-    def _resolve_block_parent_page(self, block_id: str, known_ids: Set[str]) -> Optional[str]:
+    def _resolve_block_parent_page(
+        self,
+        block_id: str,
+        known_ids: Set[str],
+        offline_only: bool = False,
+    ) -> Optional[str]:
         """親が block_id（トグル・カラム等）の場合のみ GET /v1/blocks/{id} を辿って親ページ/DBを解決する。"""
         visited: Set[str] = set()
         curr_id = _format_uuid(block_id)
@@ -205,6 +214,8 @@ class ApiTreeScanner:
                 return norm
             if norm in self._block_parent_cache:
                 parent_obj = self._block_parent_cache[norm]
+            elif offline_only:
+                return None
             else:
                 res = self._request_with_retry("GET", f"https://api.notion.com/v1/blocks/{curr_id}")
                 if not res.ok:
@@ -280,6 +291,22 @@ class ApiTreeScanner:
                 if not has_more or not next_cursor:
                     break
 
+        return self._build_trees_from_items(
+            all_items=all_items,
+            root_page_id=root_page_id,
+            offline_only=False,
+            parent_progress_cb=parent_progress_cb,
+            save_after_parent_resolve=(all_items, next_cursor),
+        )
+
+    def _build_trees_from_items(
+        self,
+        all_items: List[Dict[str, Any]],
+        root_page_id: Optional[str] = None,
+        offline_only: bool = False,
+        parent_progress_cb: Optional[Callable[[int, int], None]] = None,
+        save_after_parent_resolve: Optional[Tuple[List[Dict[str, Any]], Optional[str]]] = None,
+    ) -> List[PlanTreeNode]:
         nodes_by_norm: Dict[str, PlanTreeNode] = {}
         raw_parent_by_norm: Dict[str, Dict[str, Any]] = {}
         for item in all_items:
@@ -315,6 +342,7 @@ class ApiTreeScanner:
         ]
         block_parent_total = len(block_parent_targets)
         block_parent_done = 0
+        before_bp_cnt = len(self._block_parent_cache)
 
         roots: List[PlanTreeNode] = []
         for norm, node in nodes_by_norm.items():
@@ -328,7 +356,7 @@ class ApiTreeScanner:
             elif p_type == "block_id":
                 blk_id = str(parent_obj.get("block_id") or "")
                 if blk_id:
-                    parent_norm = self._resolve_block_parent_page(blk_id, known_ids)
+                    parent_norm = self._resolve_block_parent_page(blk_id, known_ids, offline_only=offline_only)
                 block_parent_done += 1
                 if parent_progress_cb and block_parent_total:
                     parent_progress_cb(block_parent_done, block_parent_total)
@@ -339,6 +367,10 @@ class ApiTreeScanner:
                 parent_node.children.append(node)
             else:
                 roots.append(node)
+
+        if save_after_parent_resolve and len(self._block_parent_cache) > before_bp_cnt:
+            items_ref, cursor_ref = save_after_parent_resolve
+            self._save_cache(items_ref, cursor_ref, True)
 
         for node in nodes_by_norm.values():
             if node.node_type == "database":
@@ -353,6 +385,25 @@ class ApiTreeScanner:
             return [target_node]
 
         return roots
+
+    @classmethod
+    def build_trees_from_cache(
+        cls,
+        cache_file: str,
+        root_page_id: Optional[str] = None,
+    ) -> List[PlanTreeNode]:
+        """保存済みの api_search_cache.json から API 呼び出し 0 回でツリー（または特定サブツリー）を再構築する。"""
+        if not os.path.exists(cache_file):
+            raise FileNotFoundError(f"Cache file not found: {cache_file}")
+        scanner = cls(token="", cache_file=cache_file, resume=True)
+        all_items, _, _ = scanner._load_cache()
+        if not all_items:
+            raise ValueError(f"No search results found in cache file: {cache_file}")
+        return scanner._build_trees_from_items(
+            all_items=all_items,
+            root_page_id=root_page_id,
+            offline_only=True,
+        )
 
     def _load_subtree_cache(self) -> Dict[str, List[Dict[str, Any]]]:
         if not self.cache_file or not self.resume or not os.path.exists(self.cache_file):

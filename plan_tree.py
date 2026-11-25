@@ -48,6 +48,11 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
         "--zip-dir",
         help="複数のNotion HTMLエクスポートZIPが格納されたディレクトリ",
     )
+    mode_group.add_argument(
+        "--from-cache",
+        dest="from_cache",
+        help="保存済みのAPI検索キャッシュJSON (api_search_cache.json) からAPI呼び出し0回でツリー/サブツリーを抽出するモード",
+    )
 
     parser.add_argument(
         "--notion-token",
@@ -170,6 +175,15 @@ def main(argv: List[str] = None) -> int:
             if args.root_page_id:
                 source_label += f" [root={args.root_page_id}]"
         api_calls = scanner.api_calls
+    elif args.from_cache:
+        print(f"💾 キャッシュ [{args.from_cache}] からAPI呼び出しなしでページツリーを再構築中...")
+        roots = ApiTreeScanner.build_trees_from_cache(
+            cache_file=args.from_cache,
+            root_page_id=args.root_page_id or None,
+        )
+        source_label = f"API Cache ({os.path.basename(args.from_cache)})"
+        if args.root_page_id:
+            source_label += f" [root={args.root_page_id}]"
     else:
         zip_files: List[str] = []
         if args.zip_paths:

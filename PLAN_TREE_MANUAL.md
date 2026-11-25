@@ -55,19 +55,33 @@ Notion ワークスペース（または特定のルートページ配下）の�
 .venv/bin/python plan_tree.py --zip-dir ./notion_zips --output-dir reports/tree_plan
 ```
 
+### 3.3 保存済み API キャッシュから事後抽出 (`--from-cache`)
+
+`--api` モード（`--subtree-only` なし）で一度全件取得すると、`<output-dir>/api_search_cache.json` に全ページ・DB の検索結果と親ブロック情報が保存されます。
+このキャッシュを使えば、後から**API 呼び出し 0 回・トークン不要**で任意のサブツリーや別条件の CSV を即座に切り出せます。
+
+```bash
+# 保存済みキャッシュから特定サブツリーだけを切り出す
+.venv/bin/python plan_tree.py --from-cache reports/tree_plan/api_search_cache.json --root-page-id 11111111-1111-1111-1111-111111111111 --exclude-db-rows --output-dir reports/subtree_a
+
+# 同じキャッシュから全体（DB行あり）を再出力する
+.venv/bin/python plan_tree.py --from-cache reports/tree_plan/api_search_cache.json --output-dir reports/tree_plan_full
+```
+
 ---
 
 ## 4. コマンドラインオプション一覧
 
-※ `--api`、`--zip`、`--zip-dir` のいずれか 1 つを必ず指定してください（排他指定）。
+※ `--api`、`--zip`、`--zip-dir`、`--from-cache` のいずれか 1 つを必ず指定してください（排他指定）。
 
 | オプション | デフォルト値 | 説明 |
 | :--- | :--- | :--- |
 | `--api` | - | Notion API (`POST /v1/search`) でツリーを調査するモード |
 | `--zip <PATH ...>` | - | Notion HTML エクスポート ZIP ファイルのパス（複数指定可） |
 | `--zip-dir <DIR>` | - | 複数の Notion HTML エクスポート ZIP が格納されたディレクトリ |
+| `--from-cache <PATH>` | - | 保存済みの `api_search_cache.json` から API 呼び出し 0 回でツリー／サブツリーを抽出するモード |
 | `--notion-token <TOKEN>` | 環境変数 `NOTION_TOKEN` / `NOTION_API_KEY` | (`--api` 時) Notion Integration Token |
-| `--root-page-id <UUID>` | なし（全体） | (`--api` 時) 調査対象とするルートページ/DB の UUID |
+| `--root-page-id <UUID>` | なし（全体） | (`--api` / `--from-cache` 時) 調査対象とするルートページ/DB の UUID |
 | `--subtree-only` | `False` | (`--api` + `--root-page-id` 時) `POST /v1/search` を使わず `blocks/{id}/children` でサブツリー内のみを直接探索（DB行には入らない高速モード） |
 | `--rate-limit <FLOAT>` | `2.8` | (`--api` 時) 1秒あたりの最大 API リクエスト数 |
 | `--cache-file <PATH>` | `<output-dir>/api_search_cache.json` | (`--api` 時) API 検索結果の中間キャッシュ JSON パス |
