@@ -520,6 +520,39 @@ class TestTreePlanner(unittest.TestCase):
             db_count = sum(1 for r in rows if r["node_type"] == "database")
             self.assertEqual(db_count, unique_cnt)
 
+    def test_global_root_db_rows_do_not_leak_into_level1_summary(self):
+        """ZIPグローバル側(ルート直下/別階層)のDBレコードがsummary.mdのlevel_1リストに混入しないこと"""
+        db_id = "11111111111111111111111111111111"
+        row1_id = "22222222222222222222222222222222"
+        row2_id = "33333333333333333333333333333333"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip1 = os.path.join(tmpdir, "global_db.zip")
+            zip2 = os.path.join(tmpdir, "rows.zip")
+            out_with_rows = os.path.join(tmpdir, "out_with_rows")
+            out_no_rows = os.path.join(tmpdir, "out_no_rows")
+
+            with zipfile.ZipFile(zip1, "w") as zf:
+                zf.writestr(f"グローバルDB {db_id}.csv", "名前\nRec1\nRec2\n")
+            with zipfile.ZipFile(zip2, "w") as zf:
+                zf.writestr(f"グローバルDB/Rec1 {row1_id}.html", "<html><head><title>Rec1</title></head></html>")
+                zf.writestr(f"別階層/グローバルDB/Rec2 {row2_id}.html", "<html><head><title>Rec2</title></head></html>")
+
+            # 1. --exclude-db-rows 無しでも level_1 は親DB名になり、Rec1/Rec2 は level_1 に出ないこと
+            self.assertEqual(plan_tree.main(["--zip", zip1, zip2, "--fast-tree", "--output-dir", out_with_rows]), 0)
+            with open(os.path.join(out_with_rows, "summary.md"), "r", encoding="utf-8") as f:
+                md_with = f.read()
+            level1_section_with = md_with.split("## 3. 移行単位候補")[1].split("## 4.")[0]
+            self.assertIn("| グローバルDB | 3 |", level1_section_with)
+            self.assertNotIn("Rec1", level1_section_with)
+            self.assertNotIn("Rec2", level1_section_with)
+
+            # 2. --exclude-db-rows ありなら CSV/summary ともにグローバルDBのみ
+            self.assertEqual(plan_tree.main(["--zip", zip1, zip2, "--fast-tree", "--exclude-db-rows", "--output-dir", out_no_rows]), 0)
+            with open(os.path.join(out_no_rows, "pages.csv"), "r", encoding="utf-8-sig") as f:
+                csv_rows = list(csv.DictReader(f))
+            self.assertEqual([r["title"] for r in csv_rows], ["グローバルDB"])
+
 
 if __name__ == "__main__":
     unittest.main()

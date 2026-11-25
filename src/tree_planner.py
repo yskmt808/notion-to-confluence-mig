@@ -724,6 +724,10 @@ def flatten_plan_trees(
             c for c in node.children if include_db_rows or c.node_type != "database_row"
         ]
         subtree_count = _compute_subtree_counts(node, include_db_rows=include_db_rows)
+        if node.node_type == "database_row" and depth == 1:
+            level_1_val = curr_path[0]
+        else:
+            level_1_val = curr_path[1] if len(curr_path) > 1 else curr_path[0]
         rows.append({
             "tree_order": order_counter,
             "node_id": node.node_id,
@@ -732,7 +736,7 @@ def flatten_plan_trees(
             "node_type": node.node_type,
             "title": node.title,
             "path": " > ".join(curr_path),
-            "level_1": curr_path[1] if len(curr_path) > 1 else curr_path[0],
+            "level_1": level_1_val,
             "level_2": curr_path[2] if len(curr_path) > 2 else "",
             "level_3": curr_path[3] if len(curr_path) > 3 else "",
             "direct_children_count": len(visible_children),
@@ -1281,6 +1285,7 @@ def scan_zips_fast_tree(
     dir_to_parent: Dict[str, PlanTreeNode] = {}
     roots: List[PlanTreeNode] = []
     db_dir_prefixes: Dict[str, PlanTreeNode] = {}
+    db_folder_name_map: Dict[str, List[PlanTreeNode]] = {}
     excluded_dir_prefixes: List[str] = []
 
     with ExitStack() as stack:
@@ -1349,6 +1354,16 @@ def scan_zips_fast_tree(
                 if (cur + "/") in db_dir_prefixes:
                     return None, True
                 cur = os.path.dirname(cur).rstrip("/")
+            # フルパス一致しない場合（グローバル側DBと別階層に行HTMLがある場合等）はフォルダ名一致でフォールバック
+            direct_folder = os.path.basename(direct_dir)
+            if direct_folder in db_folder_name_map and len(db_folder_name_map[direct_folder]) == 1:
+                return db_folder_name_map[direct_folder][0], True
+            cur = os.path.dirname(direct_dir).rstrip("/")
+            while cur:
+                seg = os.path.basename(cur)
+                if seg in db_folder_name_map and len(db_folder_name_map[seg]) == 1:
+                    return None, True
+                cur = os.path.dirname(cur).rstrip("/")
             return None, False
 
         def _register_dir_aliases(base_no_ext: str, norm_uid: str, node: PlanTreeNode) -> None:
@@ -1399,6 +1414,15 @@ def scan_zips_fast_tree(
             ):
                 if d_pref:
                     db_dir_prefixes[d_pref] = db_node
+
+            clean_folder = os.path.basename(clean_base)
+            for f_name in (
+                clean_folder,
+                f"{clean_folder} {norm_uid[:4]}-{norm_uid[-4:]}" if len(norm_uid) == 32 else "",
+                f"{clean_folder} {norm_uid}" if len(norm_uid) == 32 else "",
+            ):
+                if f_name:
+                    db_folder_name_map.setdefault(f_name, []).append(db_node)
 
         # Pass 2: 通常ページHTML（DBディレクトリ外）を浅い階層順に処理
         pending_row_htmls: List[Tuple[str, str, str, str, str, int, Optional[PlanTreeNode]]] = []
