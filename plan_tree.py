@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from src.tree_planner import (
     ApiTreeScanner,
     build_summary_markdown,
+    count_zip_source_files,
     export_pages_csv,
     export_summary_markdown,
     flatten_plan_trees,
@@ -57,6 +58,11 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
         "--root-page-id",
         default="",
         help="(--api時) 調査対象とするルートページ/DBのUUID（未指定時はアクセス可能な全体）",
+    )
+    parser.add_argument(
+        "--subtree-only",
+        action="store_true",
+        help="(--api + --root-page-id時) POST /v1/search を使わず blocks/{id}/children でサブツリー内のみを直接探索する（DB行は辿らない高速モード）",
     )
     parser.add_argument(
         "--rate-limit",
@@ -111,6 +117,9 @@ def main(argv: List[str] = None) -> int:
         if not token:
             print("エラー: --api モードには --notion-token または環境変数 NOTION_TOKEN が必要です。", file=sys.stderr)
             return 1
+        if args.subtree_only and not args.root_page_id:
+            print("エラー: --subtree-only を使用する場合は --root-page-id を指定してください。", file=sys.stderr)
+            return 1
         cache_path = args.cache_file or os.path.join(args.output_dir, "api_search_cache.json")
         scanner = ApiTreeScanner(
             token=token,
@@ -118,15 +127,49 @@ def main(argv: List[str] = None) -> int:
             cache_file=cache_path,
             resume=args.resume,
         )
-        print("🔍 Notion API (POST /v1/search) でページツリーを探索中...")
-        roots = scanner.scan(
-            root_page_id=args.root_page_id or None,
-            progress_cb=lambda cnt: print(f"  ... {cnt} 件取得済み (API呼出: {scanner.api_calls}回)", flush=True),
-        )
+        if args.subtree_only:
+            print(f"🔍 Notion API (blocks/children) でサブツリー [{args.root_page_id}] 配下を直接探索中...")
+
+            def _on_subtree_progress(page_cnt: int, db_cnt: int, q_len: int) -> None:
+                elapsed_s = time.monotonic() - t0
+                print(
+                    f"  ... ページ {page_cnt}件 / DB {db_cnt}件 (残りキュー: {q_len}件, API呼出: {scanner.api_calls}回, {elapsed_s:.1f}s)",
+                    flush=True,
+                )
+
+            roots = scanner.scan_subtree(
+                root_page_id=args.root_page_id,
+                progress_cb=_on_subtree_progress,
+            )
+            source_label = f"Notion API (blocks/children subtree) [root={args.root_page_id}]"
+        else:
+            print("🔍 Notion API (POST /v1/search) でページツリーを探索中...")
+
+            def _on_search_progress(cnt: int) -> None:
+                elapsed_s = max(0.01, time.monotonic() - t0)
+                st = scanner.last_search_stats
+                rate = cnt / elapsed_s
+                latest = (st.get("latest_title") or "")[:30]
+                print(
+                    f"  ... {cnt}件取得 (page:{st.get('page', 0)} / db:{st.get('database', 0)} / row:{st.get('database_row', 0)}) "
+                    f"| API:{scanner.api_calls}回 | {elapsed_s:.1f}s ({rate:.1f}件/s) | 最新: {latest}",
+                    flush=True,
+                )
+
+            def _on_parent_progress(done: int, total: int) -> None:
+                if done == total or done % 10 == 0:
+                    pct = (done / total * 100.0) if total else 100.0
+                    print(f"  ... 親ブロック解決中: {done}/{total} ({pct:.0f}%)", flush=True)
+
+            roots = scanner.scan(
+                root_page_id=args.root_page_id or None,
+                progress_cb=_on_search_progress,
+                parent_progress_cb=_on_parent_progress,
+            )
+            source_label = "Notion API (POST /v1/search)"
+            if args.root_page_id:
+                source_label += f" [root={args.root_page_id}]"
         api_calls = scanner.api_calls
-        source_label = "Notion API (POST /v1/search)"
-        if args.root_page_id:
-            source_label += f" [root={args.root_page_id}]"
     else:
         zip_files: List[str] = []
         if args.zip_paths:
@@ -136,7 +179,8 @@ def main(argv: List[str] = None) -> int:
             if not zip_files:
                 print(f"エラー: ディレクトリ '{args.zip_dir}' にZIPファイルが見つかりません。", file=sys.stderr)
                 return 1
-        print(f"📦 エクスポートZIP ({len(zip_files)}件) からページツリーを解析中...")
+        html_cnt, csv_cnt = count_zip_source_files(zip_files)
+        print(f"📦 エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) からページツリーを解析中...")
         roots = scan_zips_to_plan_trees(zip_files)
         source_label = f"Export ZIP x {len(zip_files)} ({os.path.basename(zip_files[0])})"
 

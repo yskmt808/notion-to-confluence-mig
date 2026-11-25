@@ -31,7 +31,10 @@ Notion ワークスペース（または特定のルートページ配下）の�
 # アクセス可能なワークスペース全体を調査（DB行は明細CSVから除外して軽量化）
 .venv/bin/python plan_tree.py --api --exclude-db-rows --output-dir reports/tree_plan
 
-# 特定のルートページ配下のみを調査
+# 特定のルートページ配下のみを調査（サブツリー外やDB行には入らない高速モード）
+.venv/bin/python plan_tree.py --api --root-page-id 11111111-1111-1111-1111-111111111111 --subtree-only
+
+# 特定のルートページ配下を調査（search API でDB行数も含めて集計する場合）
 .venv/bin/python plan_tree.py --api --root-page-id 11111111-1111-1111-1111-111111111111
 
 # レート制限を下げて実行し、中断した場合はキャッシュから再開
@@ -65,6 +68,7 @@ Notion ワークスペース（または特定のルートページ配下）の�
 | `--zip-dir <DIR>` | - | 複数の Notion HTML エクスポート ZIP が格納されたディレクトリ |
 | `--notion-token <TOKEN>` | 環境変数 `NOTION_TOKEN` / `NOTION_API_KEY` | (`--api` 時) Notion Integration Token |
 | `--root-page-id <UUID>` | なし（全体） | (`--api` 時) 調査対象とするルートページ/DB の UUID |
+| `--subtree-only` | `False` | (`--api` + `--root-page-id` 時) `POST /v1/search` を使わず `blocks/{id}/children` でサブツリー内のみを直接探索（DB行には入らない高速モード） |
 | `--rate-limit <FLOAT>` | `2.8` | (`--api` 時) 1秒あたりの最大 API リクエスト数 |
 | `--cache-file <PATH>` | `<output-dir>/api_search_cache.json` | (`--api` 時) API 検索結果の中間キャッシュ JSON パス |
 | `--resume` | `False` | (`--api` 時) キャッシュファイルから中断箇所を再開する |

@@ -8,6 +8,8 @@ import random
 import re
 import time
 import urllib.parse
+import zipfile
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -80,6 +82,13 @@ class ApiTreeScanner:
         self.resume = resume
         self.api_calls = 0
         self._block_parent_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        self.last_search_stats: Dict[str, Any] = {
+            "page": 0,
+            "database": 0,
+            "database_row": 0,
+            "latest_title": "",
+            "has_more": False,
+        }
 
     def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
         for attempt in range(self.max_retries):
@@ -197,10 +206,35 @@ class ApiTreeScanner:
         self,
         root_page_id: Optional[str] = None,
         progress_cb: Optional[Callable[[int], None]] = None,
+        parent_progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> List[PlanTreeNode]:
         """POST /v1/search で全ページ/DBを一括取得し、ツリー構造を構築してルートリストを返す。"""
         all_items, next_cursor, search_completed = self._load_cache()
         seen_ids = {normalize_notion_id(str(it.get("id") or "")) for it in all_items if it.get("id")}
+
+        def _update_search_stats(items: List[Dict[str, Any]], has_more_flag: bool) -> None:
+            p_cnt = 0
+            d_cnt = 0
+            r_cnt = 0
+            for it in items:
+                okind = it.get("object", "page")
+                pt = (it.get("parent") or {}).get("type", "")
+                if okind == "database":
+                    d_cnt += 1
+                elif pt in ("database_id", "data_source_id"):
+                    r_cnt += 1
+                else:
+                    p_cnt += 1
+            self.last_search_stats = {
+                "page": p_cnt,
+                "database": d_cnt,
+                "database_row": r_cnt,
+                "latest_title": self._extract_title(items[-1]) if items else "",
+                "has_more": has_more_flag,
+            }
+
+        if all_items:
+            _update_search_stats(all_items, not search_completed)
 
         if not search_completed:
             while True:
@@ -216,10 +250,11 @@ class ApiTreeScanner:
                     if nid and nid not in seen_ids:
                         seen_ids.add(nid)
                         all_items.append(item)
-                if progress_cb:
-                    progress_cb(len(all_items))
                 has_more = bool(data.get("has_more"))
                 next_cursor = data.get("next_cursor")
+                _update_search_stats(all_items, has_more)
+                if progress_cb:
+                    progress_cb(len(all_items))
                 self._save_cache(all_items, next_cursor, not has_more)
                 if not has_more or not next_cursor:
                     break
@@ -253,6 +288,13 @@ class ApiTreeScanner:
             raw_parent_by_norm[norm] = parent_obj
 
         known_ids = set(nodes_by_norm.keys())
+        block_parent_targets = [
+            norm for norm, po in raw_parent_by_norm.items()
+            if po.get("type") == "block_id" and po.get("block_id")
+        ]
+        block_parent_total = len(block_parent_targets)
+        block_parent_done = 0
+
         roots: List[PlanTreeNode] = []
         for norm, node in nodes_by_norm.items():
             parent_obj = raw_parent_by_norm.get(norm) or {}
@@ -266,6 +308,9 @@ class ApiTreeScanner:
                 blk_id = str(parent_obj.get("block_id") or "")
                 if blk_id:
                     parent_norm = self._resolve_block_parent_page(blk_id, known_ids)
+                block_parent_done += 1
+                if parent_progress_cb and block_parent_total:
+                    parent_progress_cb(block_parent_done, block_parent_total)
 
             if parent_norm and parent_norm in nodes_by_norm and parent_norm != norm:
                 parent_node = nodes_by_norm[parent_norm]
@@ -288,6 +333,161 @@ class ApiTreeScanner:
 
         return roots
 
+    def _load_subtree_cache(self) -> Dict[str, List[Dict[str, Any]]]:
+        if not self.cache_file or not self.resume or not os.path.exists(self.cache_file):
+            return {}
+        try:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("subtree_blocks") or {}
+        except Exception as e:
+            logger.warning(f"Failed to load subtree cache {self.cache_file}: {e}")
+            return {}
+
+    def _save_subtree_cache(self, subtree_blocks: Dict[str, List[Dict[str, Any]]]) -> None:
+        if not self.cache_file:
+            return
+        parent = os.path.dirname(os.path.abspath(self.cache_file))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{self.cache_file}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({"subtree_blocks": subtree_blocks}, f, ensure_ascii=False)
+        os.replace(tmp_path, self.cache_file)
+
+    def _fetch_block_children_all(
+        self,
+        block_id: str,
+        subtree_cache: Dict[str, List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        norm_id = normalize_notion_id(block_id)
+        if norm_id in subtree_cache:
+            return subtree_cache[norm_id]
+        formatted = _format_uuid(block_id)
+        results: List[Dict[str, Any]] = []
+        next_cursor: Optional[str] = None
+        while True:
+            params: Dict[str, Any] = {"page_size": 100}
+            if next_cursor:
+                params["start_cursor"] = next_cursor
+            res = self._request_with_retry(
+                "GET",
+                f"https://api.notion.com/v1/blocks/{formatted}/children",
+                params=params,
+            )
+            if not res.ok:
+                logger.warning(f"Failed to fetch block children for {formatted}: HTTP {res.status_code}")
+                break
+            data = res.json()
+            results.extend(data.get("results") or [])
+            if not data.get("has_more") or not data.get("next_cursor"):
+                break
+            next_cursor = data.get("next_cursor")
+        subtree_cache[norm_id] = results
+        self._save_subtree_cache(subtree_cache)
+        return results
+
+    def scan_subtree(
+        self,
+        root_page_id: str,
+        progress_cb: Optional[Callable[[int, int, int], None]] = None,
+    ) -> List[PlanTreeNode]:
+        """--root-page-id を起点に blocks/{id}/children のみでサブツリーを直接探索する（DB行には入らない高速モード）。"""
+        if not root_page_id:
+            raise ValueError("scan_subtree requires root_page_id.")
+        formatted_root = _format_uuid(root_page_id)
+        root_norm = normalize_notion_id(root_page_id)
+
+        res = self._request_with_retry("GET", f"https://api.notion.com/v1/pages/{formatted_root}")
+        if res.ok:
+            root_obj = res.json()
+            root_node = PlanTreeNode(
+                node_id=_format_uuid(str(root_obj.get("id") or formatted_root)),
+                parent_id="",
+                node_type="page",
+                title=self._extract_title(root_obj),
+                notion_url=str(root_obj.get("url") or f"https://www.notion.so/{root_norm}"),
+                last_edited_time=str(root_obj.get("last_edited_time") or ""),
+                archived=bool(root_obj.get("archived") or root_obj.get("in_trash")),
+            )
+        else:
+            res_db = self._request_with_retry("GET", f"https://api.notion.com/v1/databases/{formatted_root}")
+            if not res_db.ok:
+                raise RuntimeError(
+                    f"Root page/database '{root_page_id}' could not be retrieved: HTTP {res.status_code} / {res_db.status_code}"
+                )
+            db_obj = res_db.json()
+            return [
+                PlanTreeNode(
+                    node_id=_format_uuid(str(db_obj.get("id") or formatted_root)),
+                    parent_id="",
+                    node_type="database",
+                    title=self._extract_title(db_obj),
+                    notion_url=str(db_obj.get("url") or f"https://www.notion.so/{root_norm}"),
+                    last_edited_time=str(db_obj.get("last_edited_time") or ""),
+                    archived=bool(db_obj.get("archived") or db_obj.get("in_trash")),
+                    db_row_count=None,
+                )
+            ]
+
+        subtree_cache = self._load_subtree_cache()
+        visited_containers: Set[str] = set()
+        queue: deque = deque([(root_node, root_norm)])
+        page_count = 1
+        db_count = 0
+
+        while queue:
+            parent_page_node, container_norm = queue.popleft()
+            if container_norm in visited_containers:
+                continue
+            visited_containers.add(container_norm)
+
+            children_blocks = self._fetch_block_children_all(container_norm, subtree_cache)
+            for blk in children_blocks:
+                if not isinstance(blk, dict):
+                    continue
+                b_type = blk.get("type", "")
+                b_id = str(blk.get("id") or "")
+                b_norm = normalize_notion_id(b_id)
+                if not b_norm:
+                    continue
+
+                if b_type == "child_page":
+                    title = str((blk.get("child_page") or {}).get("title") or "").strip() or "Untitled"
+                    child_node = PlanTreeNode(
+                        node_id=_format_uuid(b_id),
+                        parent_id=parent_page_node.node_id,
+                        node_type="page",
+                        title=title,
+                        notion_url=f"https://www.notion.so/{b_norm}",
+                        last_edited_time=str(blk.get("last_edited_time") or ""),
+                        archived=bool(blk.get("archived") or blk.get("in_trash")),
+                    )
+                    parent_page_node.children.append(child_node)
+                    page_count += 1
+                    queue.append((child_node, b_norm))
+                elif b_type == "child_database":
+                    title = str((blk.get("child_database") or {}).get("title") or "").strip() or "Untitled Database"
+                    db_node = PlanTreeNode(
+                        node_id=_format_uuid(b_id),
+                        parent_id=parent_page_node.node_id,
+                        node_type="database",
+                        title=title,
+                        notion_url=f"https://www.notion.so/{b_norm}",
+                        last_edited_time=str(blk.get("last_edited_time") or ""),
+                        archived=bool(blk.get("archived") or blk.get("in_trash")),
+                        db_row_count=None,
+                    )
+                    parent_page_node.children.append(db_node)
+                    db_count += 1
+                elif blk.get("has_children"):
+                    queue.append((parent_page_node, b_norm))
+
+            if progress_cb:
+                progress_cb(page_count, db_count, len(queue))
+
+        return [root_node]
+
 
 def _page_node_to_plan_node(pnode: PageNode, parent_id: str = "") -> PlanTreeNode:
     norm = normalize_notion_id(getattr(pnode, "id", "") or "")
@@ -308,6 +508,21 @@ def _page_node_to_plan_node(pnode: PageNode, parent_id: str = "") -> PlanTreeNod
         db_row_count=db_row_count,
         children=children,
     )
+
+
+def count_zip_source_files(zip_paths: List[str]) -> Tuple[int, int]:
+    """ZIP内の .html および .csv ファイル総数を事前にカウントして返す。"""
+    html_cnt = 0
+    csv_cnt = 0
+    for zp in zip_paths:
+        with zipfile.ZipFile(zp, "r") as zf:
+            for name in zf.namelist():
+                lower = name.lower()
+                if lower.endswith(".html"):
+                    html_cnt += 1
+                elif lower.endswith(".csv"):
+                    csv_cnt += 1
+    return html_cnt, csv_cnt
 
 
 def scan_zips_to_plan_trees(zip_paths: List[str]) -> List[PlanTreeNode]:

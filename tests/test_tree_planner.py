@@ -159,6 +159,106 @@ class TestTreePlanner(unittest.TestCase):
             self.assertEqual([r["title"] for r in csv_rows], ["Top", "Child", "Items"])
             self.assertEqual(csv_rows[2]["db_row_count"], "2")
 
+    @patch("src.tree_planner.time.sleep")
+    @patch("src.tree_planner.requests.request")
+    def test_subtree_only_mode_traverses_blocks_and_skips_db_rows(self, mock_req, mock_sleep):
+        root_id = "aaaa0000-0000-0000-0000-000000000001"
+        child_page_id = "bbbb0000-0000-0000-0000-000000000002"
+        toggle_id = "cccc0000-0000-0000-0000-000000000003"
+        nested_db_id = "dddd0000-0000-0000-0000-000000000004"
+
+        r_root = MagicMock(
+            status_code=200,
+            ok=True,
+            json=lambda: {
+                "object": "page",
+                "id": root_id,
+                "url": "https://www.notion.so/root",
+                "last_edited_time": "2026-11-24T00:00:00.000Z",
+                "archived": False,
+                "properties": {"title": {"type": "title", "title": [{"plain_text": "対象ルート"}]}},
+            },
+        )
+        r_root_children = MagicMock(
+            status_code=200,
+            ok=True,
+            json=lambda: {
+                "results": [
+                    {
+                        "id": child_page_id,
+                        "type": "child_page",
+                        "child_page": {"title": "配下ページ"},
+                        "has_children": True,
+                        "last_edited_time": "2026-11-24T01:00:00.000Z",
+                        "archived": False,
+                    },
+                    {
+                        "id": toggle_id,
+                        "type": "toggle",
+                        "toggle": {"rich_text": []},
+                        "has_children": True,
+                    },
+                ],
+                "has_more": False,
+            },
+        )
+        r_child_children = MagicMock(
+            status_code=200,
+            ok=True,
+            json=lambda: {"results": [], "has_more": False},
+        )
+        r_toggle_children = MagicMock(
+            status_code=200,
+            ok=True,
+            json=lambda: {
+                "results": [
+                    {
+                        "id": nested_db_id,
+                        "type": "child_database",
+                        "child_database": {"title": "配下DB"},
+                        "has_children": False,
+                        "last_edited_time": "2026-11-24T02:00:00.000Z",
+                        "archived": False,
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+        mock_req.side_effect = [r_root, r_root_children, r_child_children, r_toggle_children]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "subtree_cache.json")
+            out_dir = os.path.join(tmpdir, "out")
+            exit_code = plan_tree.main([
+                "--api",
+                "--notion-token",
+                "ntn_test",
+                "--root-page-id",
+                root_id,
+                "--subtree-only",
+                "--rate-limit",
+                "100",
+                "--cache-file",
+                cache_path,
+                "--output-dir",
+                out_dir,
+            ])
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(mock_req.call_count, 4)
+
+            with open(os.path.join(out_dir, "pages.csv"), "r", encoding="utf-8-sig") as f:
+                csv_rows = list(csv.DictReader(f))
+            self.assertEqual([r["title"] for r in csv_rows], ["対象ルート", "配下ページ", "配下DB"])
+            self.assertEqual([r["node_type"] for r in csv_rows], ["page", "page", "database"])
+
+            # --resume 時はキャッシュからブロックを読み込み、ルート確認の1回のみで済むこと
+            mock_req.reset_mock()
+            mock_req.side_effect = [r_root]
+            scanner_resume = ApiTreeScanner(token="ntn_test", rate_limit=100.0, cache_file=cache_path, resume=True)
+            roots_resumed = scanner_resume.scan_subtree(root_id)
+            self.assertEqual(len(roots_resumed), 1)
+            self.assertEqual(scanner_resume.api_calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
