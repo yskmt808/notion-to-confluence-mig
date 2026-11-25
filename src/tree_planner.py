@@ -152,24 +152,45 @@ class ApiTreeScanner:
             logger.warning(f"Failed to load search cache {self.cache_file}: {e}")
             return [], None, False
 
+    def _atomic_write_json(self, path: str, payload: Dict[str, Any]) -> None:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        for attempt in range(6):
+            try:
+                os.replace(tmp_path, path)
+                return
+            except PermissionError as e:
+                if attempt < 5:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                logger.warning(f"Failed to replace cache file {path} ({e}); falling back to direct write.")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to write cache file {path}: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
     def _save_cache(self, results: List[Dict[str, Any]], next_cursor: Optional[str], completed: bool) -> None:
         if not self.cache_file:
             return
-        parent = os.path.dirname(os.path.abspath(self.cache_file))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        tmp_path = f"{self.cache_file}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "results": results,
-                    "next_cursor": next_cursor,
-                    "search_completed": completed,
-                },
-                f,
-                ensure_ascii=False,
-            )
-        os.replace(tmp_path, self.cache_file)
+        self._atomic_write_json(
+            self.cache_file,
+            {
+                "results": results,
+                "next_cursor": next_cursor,
+                "search_completed": completed,
+            },
+        )
 
     def _resolve_block_parent_page(self, block_id: str, known_ids: Set[str]) -> Optional[str]:
         """親が block_id（トグル・カラム等）の場合のみ GET /v1/blocks/{id} を辿って親ページ/DBを解決する。"""
@@ -347,22 +368,31 @@ class ApiTreeScanner:
     def _save_subtree_cache(self, subtree_blocks: Dict[str, List[Dict[str, Any]]]) -> None:
         if not self.cache_file:
             return
-        parent = os.path.dirname(os.path.abspath(self.cache_file))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        tmp_path = f"{self.cache_file}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump({"subtree_blocks": subtree_blocks}, f, ensure_ascii=False)
-        os.replace(tmp_path, self.cache_file)
+        self._atomic_write_json(self.cache_file, {"subtree_blocks": subtree_blocks})
+
+    @staticmethod
+    def _compact_block_for_cache(blk: Dict[str, Any]) -> Dict[str, Any]:
+        b_type = blk.get("type", "")
+        compact: Dict[str, Any] = {
+            "id": blk.get("id"),
+            "type": b_type,
+            "has_children": bool(blk.get("has_children")),
+            "last_edited_time": blk.get("last_edited_time") or "",
+            "archived": bool(blk.get("archived")),
+            "in_trash": bool(blk.get("in_trash")),
+        }
+        if b_type in ("child_page", "child_database") and isinstance(blk.get(b_type), dict):
+            compact[b_type] = {"title": blk[b_type].get("title", "")}
+        return compact
 
     def _fetch_block_children_all(
         self,
         block_id: str,
         subtree_cache: Dict[str, List[Dict[str, Any]]],
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], bool]:
         norm_id = normalize_notion_id(block_id)
         if norm_id in subtree_cache:
-            return subtree_cache[norm_id]
+            return subtree_cache[norm_id], False
         formatted = _format_uuid(block_id)
         results: List[Dict[str, Any]] = []
         next_cursor: Optional[str] = None
@@ -379,13 +409,27 @@ class ApiTreeScanner:
                 logger.warning(f"Failed to fetch block children for {formatted}: HTTP {res.status_code}")
                 break
             data = res.json()
-            results.extend(data.get("results") or [])
+            for item in data.get("results") or []:
+                if isinstance(item, dict):
+                    results.append(self._compact_block_for_cache(item))
             if not data.get("has_more") or not data.get("next_cursor"):
                 break
             next_cursor = data.get("next_cursor")
         subtree_cache[norm_id] = results
-        self._save_subtree_cache(subtree_cache)
-        return results
+        return results, True
+
+    _SUBTREE_CONTAINER_BLOCK_TYPES = frozenset({
+        "column_list",
+        "column",
+        "toggle",
+        "callout",
+        "synced_block",
+        "template",
+        "bulleted_list_item",
+        "numbered_list_item",
+        "to_do",
+        "quote",
+    })
 
     def scan_subtree(
         self,
@@ -435,56 +479,70 @@ class ApiTreeScanner:
         queue: deque = deque([(root_node, root_norm)])
         page_count = 1
         db_count = 0
+        dirty_count = 0
+        last_save_ts = time.monotonic()
 
-        while queue:
-            parent_page_node, container_norm = queue.popleft()
-            if container_norm in visited_containers:
-                continue
-            visited_containers.add(container_norm)
-
-            children_blocks = self._fetch_block_children_all(container_norm, subtree_cache)
-            for blk in children_blocks:
-                if not isinstance(blk, dict):
+        try:
+            while queue:
+                parent_page_node, container_norm = queue.popleft()
+                if container_norm in visited_containers:
                     continue
-                b_type = blk.get("type", "")
-                b_id = str(blk.get("id") or "")
-                b_norm = normalize_notion_id(b_id)
-                if not b_norm:
-                    continue
+                visited_containers.add(container_norm)
 
-                if b_type == "child_page":
-                    title = str((blk.get("child_page") or {}).get("title") or "").strip() or "Untitled"
-                    child_node = PlanTreeNode(
-                        node_id=_format_uuid(b_id),
-                        parent_id=parent_page_node.node_id,
-                        node_type="page",
-                        title=title,
-                        notion_url=f"https://www.notion.so/{b_norm}",
-                        last_edited_time=str(blk.get("last_edited_time") or ""),
-                        archived=bool(blk.get("archived") or blk.get("in_trash")),
-                    )
-                    parent_page_node.children.append(child_node)
-                    page_count += 1
-                    queue.append((child_node, b_norm))
-                elif b_type == "child_database":
-                    title = str((blk.get("child_database") or {}).get("title") or "").strip() or "Untitled Database"
-                    db_node = PlanTreeNode(
-                        node_id=_format_uuid(b_id),
-                        parent_id=parent_page_node.node_id,
-                        node_type="database",
-                        title=title,
-                        notion_url=f"https://www.notion.so/{b_norm}",
-                        last_edited_time=str(blk.get("last_edited_time") or ""),
-                        archived=bool(blk.get("archived") or blk.get("in_trash")),
-                        db_row_count=None,
-                    )
-                    parent_page_node.children.append(db_node)
-                    db_count += 1
-                elif blk.get("has_children"):
-                    queue.append((parent_page_node, b_norm))
+                children_blocks, fetched_new = self._fetch_block_children_all(container_norm, subtree_cache)
+                if fetched_new:
+                    dirty_count += 1
+                    now_ts = time.monotonic()
+                    if dirty_count >= 25 or (now_ts - last_save_ts) >= 5.0:
+                        self._save_subtree_cache(subtree_cache)
+                        dirty_count = 0
+                        last_save_ts = now_ts
 
-            if progress_cb:
-                progress_cb(page_count, db_count, len(queue))
+                for blk in children_blocks:
+                    if not isinstance(blk, dict):
+                        continue
+                    b_type = blk.get("type", "")
+                    b_id = str(blk.get("id") or "")
+                    b_norm = normalize_notion_id(b_id)
+                    if not b_norm:
+                        continue
+
+                    if b_type == "child_page":
+                        title = str((blk.get("child_page") or {}).get("title") or "").strip() or "Untitled"
+                        child_node = PlanTreeNode(
+                            node_id=_format_uuid(b_id),
+                            parent_id=parent_page_node.node_id,
+                            node_type="page",
+                            title=title,
+                            notion_url=f"https://www.notion.so/{b_norm}",
+                            last_edited_time=str(blk.get("last_edited_time") or ""),
+                            archived=bool(blk.get("archived") or blk.get("in_trash")),
+                        )
+                        parent_page_node.children.append(child_node)
+                        page_count += 1
+                        queue.append((child_node, b_norm))
+                    elif b_type == "child_database":
+                        title = str((blk.get("child_database") or {}).get("title") or "").strip() or "Untitled Database"
+                        db_node = PlanTreeNode(
+                            node_id=_format_uuid(b_id),
+                            parent_id=parent_page_node.node_id,
+                            node_type="database",
+                            title=title,
+                            notion_url=f"https://www.notion.so/{b_norm}",
+                            last_edited_time=str(blk.get("last_edited_time") or ""),
+                            archived=bool(blk.get("archived") or blk.get("in_trash")),
+                            db_row_count=None,
+                        )
+                        parent_page_node.children.append(db_node)
+                        db_count += 1
+                    elif blk.get("has_children") and b_type in self._SUBTREE_CONTAINER_BLOCK_TYPES:
+                        queue.append((parent_page_node, b_norm))
+
+                if progress_cb:
+                    progress_cb(page_count, db_count, len(queue))
+        finally:
+            if dirty_count > 0:
+                self._save_subtree_cache(subtree_cache)
 
         return [root_node]
 

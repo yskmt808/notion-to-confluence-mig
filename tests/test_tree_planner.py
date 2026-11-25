@@ -198,6 +198,12 @@ class TestTreePlanner(unittest.TestCase):
                         "toggle": {"rich_text": []},
                         "has_children": True,
                     },
+                    {
+                        "id": "eeee0000-0000-0000-0000-000000000005",
+                        "type": "table",
+                        "table": {},
+                        "has_children": True,
+                    },
                 ],
                 "has_more": False,
             },
@@ -258,6 +264,26 @@ class TestTreePlanner(unittest.TestCase):
             roots_resumed = scanner_resume.scan_subtree(root_id)
             self.assertEqual(len(roots_resumed), 1)
             self.assertEqual(scanner_resume.api_calls, 1)
+
+    @patch("src.tree_planner.time.sleep")
+    def test_atomic_write_json_retries_on_winerror5_permission_error(self, mock_sleep):
+        scanner = ApiTreeScanner(token="ntn_test")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "cache.json")
+            orig_replace = os.replace
+            attempts = [0]
+
+            def flaky_replace(src, dst):
+                attempts[0] += 1
+                if attempts[0] <= 2:
+                    raise PermissionError(13, "WinError 5 access denied")
+                return orig_replace(src, dst)
+
+            with patch("src.tree_planner.os.replace", side_effect=flaky_replace):
+                scanner._atomic_write_json(target, {"ok": True})
+
+            self.assertEqual(attempts[0], 3)
+            self.assertTrue(os.path.exists(target))
 
 
 if __name__ == "__main__":
