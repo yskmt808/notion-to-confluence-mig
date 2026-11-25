@@ -469,6 +469,33 @@ class TestTreePlanner(unittest.TestCase):
             self.assertNotIn("Row1", md)
             self.assertNotIn("孫メモ", md)
 
+    def test_attached_csv_without_notion_uuid_is_not_treated_as_database(self):
+        """添付ファイルとして配置されたUUID無しCSVがDBとして誤認されないこと"""
+        root_id = "11111111111111111111111111111111"
+        sub_id = "22222222222222222222222222222222"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "attached_csv.zip")
+            out_fast = os.path.join(tmpdir, "out_fast")
+            out_stats = os.path.join(tmpdir, "out_stats")
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr(f"Root {root_id}.html", "<html><head><title>Root</title></head></html>")
+                zf.writestr("Root/添付データ.csv", "col1,col2\n1,2\n3,4\n")
+                zf.writestr(f"Root/子ページ {sub_id}.html", "<html><head><title>子ページ</title></head></html>")
+
+            exit_fast = plan_tree.main(["--zip", zip_path, "--fast-tree", "--exclude-db-rows", "--output-dir", out_fast])
+            self.assertEqual(exit_fast, 0)
+            with open(os.path.join(out_fast, "pages.csv"), "r", encoding="utf-8-sig") as f:
+                fast_rows = list(csv.DictReader(f))
+            self.assertEqual([r["title"] for r in fast_rows], ["Root", "子ページ"])
+            self.assertEqual([r["node_type"] for r in fast_rows], ["page", "page"])
+
+            exit_stats = plan_tree.main(["--zip", zip_path, "--stats-only", "--output-dir", out_stats])
+            self.assertEqual(exit_stats, 0)
+            with open(os.path.join(out_stats, "zip_databases.csv"), "r", encoding="utf-8-sig") as f:
+                db_rows = list(csv.DictReader(f))
+            self.assertEqual(db_rows, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -918,6 +918,15 @@ def export_summary_markdown(summary_md: str, output_path: str) -> str:
 
 
 _ZIP_UUID_SUFFIX_RE = re.compile(r"\s+([0-9a-fA-F]{32})$")
+_NOTION_DB_CSV_SUFFIX_RE = re.compile(r"(?:^|\s)([0-9a-fA-F]{32})(?:_all)?$", re.IGNORECASE)
+
+
+def _is_notion_db_csv_filename(path: str) -> bool:
+    """Notion DBのエクスポートCSV（末尾32桁UUID付き .csv / _all.csv）か判定し、添付CSVと区別する。"""
+    if not path.lower().endswith(".csv"):
+        return False
+    stem = os.path.basename(os.path.splitext(path)[0])
+    return bool(_NOTION_DB_CSV_SUFFIX_RE.search(stem))
 
 
 def _count_csv_data_rows_fast(raw_bytes: bytes) -> int:
@@ -1004,7 +1013,7 @@ def analyze_zips_lightweight(
                     total_html += 1
                     fst["html_count"] += 1
                     html_paths.append(fname)
-                elif lower.endswith(".csv"):
+                elif _is_notion_db_csv_filename(fname):
                     total_csv += 1
                     fst["csv_count"] += 1
                     raw_csv = zf.read(fname)
@@ -1339,7 +1348,7 @@ def scan_zips_fast_tree(
         # Pass 1: 全ZIPの DB CSV を解析し、統合 db_dir_prefixes と pending_dbs を構築
         pending_dbs: List[Tuple[str, str, str, PlanTreeNode]] = []
         for norm_fn, raw_fn, zf_idx in all_entries:
-            if not norm_fn.lower().endswith(".csv") or _is_excluded(norm_fn):
+            if not _is_notion_db_csv_filename(norm_fn) or _is_excluded(norm_fn):
                 continue
             if norm_fn.lower().endswith("_all.csv") and (norm_fn[:-8] + ".csv") in all_norm_set:
                 continue
