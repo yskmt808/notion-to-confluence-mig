@@ -825,6 +825,30 @@ def build_summary_markdown(
         f"- **調査ソース**: {source_label}",
         f"- **生成日時**: {now_str}",
         f"- **所要時間**: {elapsed_seconds:.2f} 秒 (APIリクエスト数: {api_calls})",
+    ]
+    if len(roots) == 1:
+        r0 = roots[0]
+        lines.append(f"- **ルートページ**: {r0.title} (`{r0.node_type}` / ID: `{r0.node_id}`)")
+        if r0.notion_url:
+            lines.append(f"- **ルートURL**: {r0.notion_url}")
+    elif roots:
+        lines.append(f"- **ルートページ数**: {len(roots)} 件")
+
+    if roots:
+        lines.extend([
+            "",
+            "## 0. ルートページ情報",
+            "",
+            "| タイトル | 種別 | ID | 直下子数 | URL |",
+            "| :--- | :--- | :--- | ---: | :--- |",
+        ])
+        for rn in roots[:20]:
+            url_str = rn.notion_url or "-"
+            lines.append(f"| {rn.title} | `{rn.node_type}` | `{rn.node_id}` | {len(rn.children)} | {url_str} |")
+        if len(roots) > 20:
+            lines.append(f"| ... (他 {len(roots) - 20} 件) | | | | |")
+
+    lines.extend([
         "",
         "## 1. 全体統計",
         "",
@@ -841,7 +865,7 @@ def build_summary_markdown(
         "",
         "| depth | ノード数 |",
         "| ---: | ---: |",
-    ]
+    ])
     for d in sorted(by_depth.keys()):
         lines.append(f"| {d} | {by_depth[d]} |")
 

@@ -118,6 +118,8 @@ class TestTreePlanner(unittest.TestCase):
             self.assertEqual(csv_rows[2]["db_row_count"], "1")
 
             md = build_summary_markdown(roots, rows_no_db, source_label="Notion API", api_calls=scanner.api_calls)
+            self.assertIn("**ルートページ**: 全社ポータル (`page` / ID: `11111111-1111-1111-1111-111111111111`)", md)
+            self.assertIn("## 0. ルートページ情報", md)
             self.assertIn("| 出力ノード総数 (CSV行数) | 3 |", md)
             self.assertIn("| DB行レコード (`database_row` 実数) | 1 |", md)
             self.assertIn("| タスクDB | 1 |", md)
