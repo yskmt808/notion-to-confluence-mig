@@ -56,6 +56,9 @@ Notion ワークスペース（または特定のルートページ配下）の�
 
 # 巨大 ZIP でフルパースが重い場合: HTMLパースをスキップして軽量に規模感だけ算出
 .venv/bin/python plan_tree.py --zip-dir ./notion_zips --stats-only --output-dir reports/zip_stats
+
+# 巨大 ZIP から HTML本文をパースせず高速にページツリー (pages.csv / summary.md) を生成
+.venv/bin/python plan_tree.py --zip-dir ./notion_zips --fast-tree --exclude-db-rows --exclude-file exclude_ids.txt --output-dir reports/tree_fast
 ```
 
 ### 3.3 保存済み API キャッシュから事後抽出 (`--from-cache`)
@@ -92,6 +95,9 @@ Notion ワークスペース（または特定のルートページ配下）の�
 | `--output-dir <DIR>` | `reports/tree_plan` | `pages.csv` と `summary.md` の出力先ディレクトリ |
 | `--exclude-db-rows` | `False` | `pages.csv` の明細行から DB 行レコード (`database_row`) を除外する（`db_row_count` 列と `summary.md` の実数は維持） |
 | `--stats-only` | `False` | (`--zip` / `--zip-dir` 時) HTML フルパースを行わず、ZIP メタデータと CSV 行数のみで軽量に規模感（`zip_stats.md` / `zip_databases.csv` / `zip_folders.csv`）を算出 |
+| `--fast-tree` | `False` | (`--zip` / `--zip-dir` 時) HTML 本文パースをスキップし、ZIP パス階層・`<title>`・CSV 行数のみから高速に `pages.csv` / `summary.md` を生成 |
+| `--exclude-ids <UUID ...>` | `[]` | 分析・ツリー出力から除外するページ/DB の Notion UUID（配下サブツリーも除外） |
+| `--exclude-file <PATH>` | なし | 除外対象の Notion UUID を 1 行 1 件で記載したファイルパス（`#` コメント可） |
 | `-v`, `--verbose` | `False` | デバッグ用の詳細ログを出力する |
 
 ---

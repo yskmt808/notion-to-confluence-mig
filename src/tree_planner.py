@@ -1,6 +1,7 @@
 """移行計画作成用のページツリー調査・CSV/Markdownサマリー出力モジュール。"""
 
 import csv
+import html as _html
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 
 from src.extractor import PageNode, normalize_notion_id
-from src.html_extractor import HtmlZipExtractor, MultiZipExtractor
+from src.html_extractor import HtmlZipExtractor, MultiZipExtractor, extract_uuids
 
 logger = logging.getLogger(__name__)
 
@@ -486,12 +487,16 @@ class ApiTreeScanner:
         self,
         root_page_id: str,
         progress_cb: Optional[Callable[[int, int, int], None]] = None,
+        exclude_ids: Optional[Set[str]] = None,
     ) -> List[PlanTreeNode]:
         """--root-page-id を起点に blocks/{id}/children のみでサブツリーを直接探索する（DB行には入らない高速モード）。"""
         if not root_page_id:
             raise ValueError("scan_subtree requires root_page_id.")
+        ex_ids = {normalize_notion_id(x) for x in (exclude_ids or set()) if normalize_notion_id(x)}
         formatted_root = _format_uuid(root_page_id)
         root_norm = normalize_notion_id(root_page_id)
+        if root_norm in ex_ids:
+            return []
 
         res = self._request_with_retry("GET", f"https://api.notion.com/v1/pages/{formatted_root}")
         if res.ok:
@@ -559,6 +564,8 @@ class ApiTreeScanner:
                         continue
 
                     if b_type == "child_page":
+                        if b_norm in ex_ids:
+                            continue
                         title = str((blk.get("child_page") or {}).get("title") or "").strip() or "Untitled"
                         child_node = PlanTreeNode(
                             node_id=_format_uuid(b_id),
@@ -573,6 +580,8 @@ class ApiTreeScanner:
                         page_count += 1
                         queue.append((child_node, b_norm))
                     elif b_type == "child_database":
+                        if b_norm in ex_ids:
+                            continue
                         title = str((blk.get("child_database") or {}).get("title") or "").strip() or "Untitled Database"
                         db_node = PlanTreeNode(
                             node_id=_format_uuid(b_id),
@@ -925,8 +934,10 @@ def _count_csv_data_rows_fast(raw_bytes: bytes) -> int:
 def analyze_zips_lightweight(
     zip_paths: List[str],
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    exclude_ids: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """HTMLパースを行わず、ZIPメタデータとCSV行数カウントのみでエクスポート規模を高速算出する。"""
+    ex_ids = {normalize_notion_id(x) for x in (exclude_ids or set()) if normalize_notion_id(x)}
     total_html = 0
     total_csv = 0
     total_other = 0
@@ -945,10 +956,31 @@ def analyze_zips_lightweight(
             progress_cb(z_idx, len(zip_paths), z_name)
         with zipfile.ZipFile(zp, "r") as zf:
             infos = [info for info in zf.infolist() if not info.is_dir()]
+            excluded_prefixes: List[str] = []
+            if ex_ids:
+                for info in infos:
+                    fn = info.filename
+                    low = fn.lower()
+                    if low.endswith((".html", ".csv")):
+                        base_no_ext = os.path.splitext(fn)[0]
+                        uids = extract_uuids(os.path.basename(base_no_ext))
+                        if uids and normalize_notion_id(uids[-1]) in ex_ids:
+                            uid_l = normalize_notion_id(uids[-1])
+                            clean_base = _ZIP_UUID_SUFFIX_RE.sub("", base_no_ext).rstrip("/")
+                            excluded_prefixes.append(clean_base + "/")
+                            excluded_prefixes.append(f"{clean_base} {uid_l[:4]}-{uid_l[-4:]}/")
+                            excluded_prefixes.append(f"{clean_base} {uid_l}/")
+
             html_paths: List[str] = []
 
             for info in infos:
                 fname = info.filename
+                if ex_ids:
+                    if any(fname.startswith(pref) for pref in excluded_prefixes):
+                        continue
+                    fn_uids = extract_uuids(os.path.basename(os.path.splitext(fname)[0]))
+                    if fn_uids and normalize_notion_id(fn_uids[-1]) in ex_ids:
+                        continue
                 lower = fname.lower()
                 ext = os.path.splitext(lower)[1] or "(no_ext)"
                 ext_counts[ext] = ext_counts.get(ext, 0) + 1
@@ -1113,3 +1145,295 @@ def export_zip_stats_csvs(stats: Dict[str, Any], output_dir: str) -> Tuple[str, 
             writer.writerow(fst)
 
     return db_csv_path, folder_csv_path
+
+
+def load_exclude_ids(
+    exclude_ids: Optional[List[str]] = None,
+    exclude_file: Optional[str] = None,
+) -> Set[str]:
+    """コマンドライン引数および除外リストファイルから正規化済みNotion ID集合を読み込む。"""
+    result: Set[str] = set()
+    for raw in exclude_ids or []:
+        uids = extract_uuids(str(raw))
+        if uids:
+            for u in uids:
+                result.add(normalize_notion_id(u))
+        else:
+            norm = normalize_notion_id(str(raw))
+            if norm:
+                result.add(norm)
+    if exclude_file:
+        if not os.path.exists(exclude_file):
+            raise FileNotFoundError(f"Exclude file not found: {exclude_file}")
+        with open(exclude_file, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                stripped = line.split("#", 1)[0].strip()
+                if not stripped:
+                    continue
+                uids = extract_uuids(stripped)
+                if uids:
+                    result.add(normalize_notion_id(uids[0]))
+                else:
+                    norm = normalize_notion_id(stripped)
+                    if norm and len(norm) >= 32:
+                        result.add(norm)
+    return {x for x in result if x}
+
+
+def prune_excluded_subtrees(
+    roots: List[PlanTreeNode],
+    exclude_ids: Optional[Set[str]],
+) -> List[PlanTreeNode]:
+    """指定された除外IDに一致するノードとその配下サブツリーをツリーから除去する。"""
+    ex_ids = {normalize_notion_id(x) for x in (exclude_ids or set()) if normalize_notion_id(x)}
+    if not ex_ids:
+        return roots
+
+    def _filter_node(node: PlanTreeNode) -> Optional[PlanTreeNode]:
+        if normalize_notion_id(node.node_id) in ex_ids:
+            return None
+        had_row_children = any(c.node_type == "database_row" for c in node.children)
+        kept_children: List[PlanTreeNode] = []
+        for c in node.children:
+            fc = _filter_node(c)
+            if fc is not None:
+                kept_children.append(fc)
+        node.children = kept_children
+        if node.node_type == "database" and had_row_children:
+            node.db_row_count = sum(1 for c in node.children if c.node_type == "database_row")
+        return node
+
+    pruned: List[PlanTreeNode] = []
+    for r in roots:
+        fr = _filter_node(r)
+        if fr is not None:
+            pruned.append(fr)
+    return pruned
+
+
+_HTML_TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_title_fast_from_zip(zf: zipfile.ZipFile, entry_path: str, fallback_stem: str) -> str:
+    """HTMLの先頭数KBのみから<title>を正規表現で高速抽出し、失敗時はファイル名から補完する。"""
+    try:
+        with zf.open(entry_path, "r") as fh:
+            head_bytes = fh.read(4096)
+        head_text = head_bytes.decode("utf-8", errors="ignore")
+        m = _HTML_TITLE_TAG_RE.search(head_text)
+        if m:
+            t = _html.unescape(m.group(1)).strip()
+            if t:
+                return t
+    except Exception:
+        pass
+    clean = _ZIP_UUID_SUFFIX_RE.sub("", fallback_stem)
+    clean = re.sub(r"\s+[0-9a-fA-F]{4}-[0-9a-fA-F]{4}$", "", clean)
+    return urllib.parse.unquote(clean).strip() or "Untitled"
+
+
+def _scan_single_zip_fast_tree(
+    zip_path: str,
+    include_db_rows: bool,
+    ex_ids: Set[str],
+) -> Tuple[List[PlanTreeNode], Dict[str, PlanTreeNode]]:
+    nodes_by_norm: Dict[str, PlanTreeNode] = {}
+    dir_to_parent: Dict[str, PlanTreeNode] = {}
+    roots: List[PlanTreeNode] = []
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        all_files = [
+            info.filename for info in zf.infolist()
+            if not info.is_dir() and info.filename.lower().endswith((".html", ".csv"))
+        ]
+        # 階層が浅い順（ディレクトリ深さ昇順）かつCSV/HTMLを安定順で走査
+        all_files.sort(key=lambda p: (p.count("/"), 0 if p.lower().endswith(".csv") else 1, p))
+
+        # 先に全DB CSVのディレクトリプレフィックスと情報を登録（HTMLより先にDB判定を確定させる）
+        db_dir_prefixes: Dict[str, PlanTreeNode] = {}
+        excluded_dir_prefixes: List[str] = []
+
+        # 除外対象ノードのディレクトリプレフィックスを先に収集
+        if ex_ids:
+            for fname in all_files:
+                base_no_ext = os.path.splitext(fname)[0]
+                uids = extract_uuids(os.path.basename(base_no_ext))
+                if uids and normalize_notion_id(uids[-1]) in ex_ids:
+                    uid_l = normalize_notion_id(uids[-1])
+                    clean_base = _ZIP_UUID_SUFFIX_RE.sub("", base_no_ext).rstrip("/")
+                    excluded_dir_prefixes.append(clean_base + "/")
+                    excluded_dir_prefixes.append(f"{clean_base} {uid_l[:4]}-{uid_l[-4:]}/")
+                    excluded_dir_prefixes.append(f"{clean_base} {uid_l}/")
+
+        def _is_excluded(fname: str) -> bool:
+            if not ex_ids:
+                return False
+            if any(fname.startswith(pref) for pref in excluded_dir_prefixes):
+                return True
+            uids = extract_uuids(os.path.basename(os.path.splitext(fname)[0]))
+            return bool(uids and normalize_notion_id(uids[-1]) in ex_ids)
+
+        def _find_parent_for_path(fname: str) -> Optional[PlanTreeNode]:
+            parent_dir = os.path.dirname(fname).rstrip("/")
+            while parent_dir:
+                if parent_dir in dir_to_parent:
+                    return dir_to_parent[parent_dir]
+                parent_dir = os.path.dirname(parent_dir).rstrip("/")
+            return None
+
+        def _register_dir_aliases(base_no_ext: str, norm_uid: str, node: PlanTreeNode) -> None:
+            clean_base = _ZIP_UUID_SUFFIX_RE.sub("", base_no_ext).rstrip("/")
+            clean_base = re.sub(r"\s+[0-9a-fA-F]{4}-[0-9a-fA-F]{4}$", "", clean_base).rstrip("/")
+            for cand in (
+                base_no_ext.rstrip("/"),
+                clean_base,
+                f"{clean_base} {norm_uid[:4]}-{norm_uid[-4:]}" if len(norm_uid) == 32 else "",
+                f"{clean_base} {norm_uid}" if len(norm_uid) == 32 else "",
+            ):
+                if cand and cand not in dir_to_parent:
+                    dir_to_parent[cand] = node
+
+        # Pass 1: DB CSV を解析し、DBノードと行ディレクトリプレフィックスを準備（親紐付けはPass 3で行う）
+        pending_dbs: List[Tuple[str, str, str, PlanTreeNode]] = []
+        for fname in all_files:
+            if not fname.lower().endswith(".csv") or _is_excluded(fname):
+                continue
+            if fname.lower().endswith("_all.csv") and (fname[:-8] + ".csv") in all_files:
+                continue
+            base_no_ext = os.path.splitext(fname)[0]
+            if base_no_ext.endswith("_all"):
+                base_no_ext = base_no_ext[:-4]
+            base_name = os.path.basename(base_no_ext)
+            uids = extract_uuids(base_name)
+            norm_uid = normalize_notion_id(uids[-1]) if uids else normalize_notion_id(fname)
+            if norm_uid in nodes_by_norm:
+                continue
+            db_title = urllib.parse.unquote(_ZIP_UUID_SUFFIX_RE.sub("", base_name)).strip() or "Untitled Database"
+            row_cnt = _count_csv_data_rows_fast(zf.read(fname))
+            db_node = PlanTreeNode(
+                node_id=_format_uuid(norm_uid),
+                parent_id="",
+                node_type="database",
+                title=db_title,
+                notion_url=f"https://www.notion.so/{norm_uid}" if len(norm_uid) == 32 else "",
+                db_row_count=row_cnt,
+            )
+            nodes_by_norm[norm_uid] = db_node
+            pending_dbs.append((fname, base_no_ext, norm_uid, db_node))
+
+            clean_base = _ZIP_UUID_SUFFIX_RE.sub("", base_no_ext).rstrip("/")
+            for d_pref in (
+                clean_base + "/",
+                f"{clean_base} {norm_uid[:4]}-{norm_uid[-4:]}/" if len(norm_uid) == 32 else "",
+                f"{clean_base} {norm_uid}/" if len(norm_uid) == 32 else "",
+            ):
+                if d_pref:
+                    db_dir_prefixes[d_pref] = db_node
+
+        # Pass 2: 通常ページHTMLを浅い階層順に処理してツリーとdir_to_parentを構築
+        pending_row_htmls: List[Tuple[str, str, str, str, PlanTreeNode]] = []
+        for fname in all_files:
+            if not fname.lower().endswith(".html") or _is_excluded(fname):
+                continue
+            base_no_ext = os.path.splitext(fname)[0]
+            base_name = os.path.basename(base_no_ext)
+            uids = extract_uuids(base_name)
+            norm_uid = normalize_notion_id(uids[-1]) if uids else normalize_notion_id(fname)
+
+            if norm_uid in nodes_by_norm:
+                continue
+
+            parent_dir_slash = (os.path.dirname(fname).rstrip("/") + "/") if os.path.dirname(fname) else ""
+            owner_db = db_dir_prefixes.get(parent_dir_slash)
+            if owner_db is not None:
+                if include_db_rows:
+                    pending_row_htmls.append((fname, base_no_ext, base_name, norm_uid, owner_db))
+                continue
+
+            parent_node = _find_parent_for_path(fname)
+            page_title = _extract_title_fast_from_zip(zf, fname, base_name)
+            page_node = PlanTreeNode(
+                node_id=_format_uuid(norm_uid),
+                parent_id=parent_node.node_id if parent_node else "",
+                node_type="page",
+                title=page_title,
+                notion_url=f"https://www.notion.so/{norm_uid}" if len(norm_uid) == 32 else "",
+            )
+            nodes_by_norm[norm_uid] = page_node
+            if parent_node:
+                parent_node.children.append(page_node)
+            else:
+                roots.append(page_node)
+            _register_dir_aliases(base_no_ext, norm_uid, page_node)
+
+        # Pass 3: DBノードを親ページへ紐付け
+        for fname, base_no_ext, norm_uid, db_node in pending_dbs:
+            parent_node = _find_parent_for_path(fname)
+            if parent_node:
+                db_node.parent_id = parent_node.node_id
+                parent_node.children.append(db_node)
+            else:
+                roots.append(db_node)
+            _register_dir_aliases(base_no_ext, norm_uid, db_node)
+
+        # Pass 4: DB行HTMLを登録 (include_db_rows=True時のみ)
+        for fname, base_no_ext, base_name, norm_uid, owner_db in pending_row_htmls:
+            row_title = _extract_title_fast_from_zip(zf, fname, base_name)
+            row_node = PlanTreeNode(
+                node_id=_format_uuid(norm_uid),
+                parent_id=owner_db.node_id,
+                node_type="database_row",
+                title=row_title,
+                notion_url=f"https://www.notion.so/{norm_uid}" if len(norm_uid) == 32 else "",
+            )
+            nodes_by_norm[norm_uid] = row_node
+            owner_db.children.append(row_node)
+            _register_dir_aliases(base_no_ext, norm_uid, row_node)
+
+    return roots, nodes_by_norm
+
+
+def scan_zips_fast_tree(
+    zip_paths: List[str],
+    root_page_id: Optional[str] = None,
+    include_db_rows: bool = True,
+    exclude_ids: Optional[Set[str]] = None,
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+) -> List[PlanTreeNode]:
+    """HTML本文パースをスキップし、ZIPパス階層・<title>・CSV行数のみから高速にツリーを構築する。"""
+    if not zip_paths:
+        raise ValueError("No ZIP files provided.")
+    ex_ids = {normalize_notion_id(x) for x in (exclude_ids or set()) if normalize_notion_id(x)}
+
+    merged_nodes: Dict[str, PlanTreeNode] = {}
+    merged_roots: List[PlanTreeNode] = []
+
+    for idx, zp in enumerate(zip_paths, start=1):
+        if progress_cb:
+            progress_cb(idx, len(zip_paths), os.path.basename(zp))
+        z_roots, z_nodes = _scan_single_zip_fast_tree(zp, include_db_rows=include_db_rows, ex_ids=ex_ids)
+        for nid, node in z_nodes.items():
+            if nid not in merged_nodes:
+                merged_nodes[nid] = node
+            else:
+                existing = merged_nodes[nid]
+                existing_child_ids = {normalize_notion_id(c.node_id) for c in existing.children}
+                for c in node.children:
+                    cn = normalize_notion_id(c.node_id)
+                    if cn not in existing_child_ids:
+                        existing.children.append(c)
+                        existing_child_ids.add(cn)
+                if node.db_row_count is not None and (existing.db_row_count or 0) < node.db_row_count:
+                    existing.db_row_count = node.db_row_count
+        for zr in z_roots:
+            zn = normalize_notion_id(zr.node_id)
+            if not any(normalize_notion_id(r.node_id) == zn for r in merged_roots):
+                merged_roots.append(zr)
+
+    if root_page_id:
+        target = _find_plan_node_by_id(merged_roots, root_page_id)
+        if not target:
+            raise ValueError(f"Root page/database ID '{root_page_id}' not found in ZIP export.")
+        target.parent_id = ""
+        return [target]
+    return merged_roots

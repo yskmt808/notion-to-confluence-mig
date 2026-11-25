@@ -27,6 +27,9 @@ from src.tree_planner import (
     export_summary_markdown,
     export_zip_stats_csvs,
     flatten_plan_trees,
+    load_exclude_ids,
+    prune_excluded_subtrees,
+    scan_zips_fast_tree,
     scan_zips_to_plan_trees,
 )
 
@@ -104,6 +107,22 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
         help="(--zip / --zip-dir 時) HTMLフルパースを行わず、ZIPメタデータとCSV行数カウントのみで規模感(zip_stats.md / zip_databases.csv / zip_folders.csv)を高速算出する",
     )
     parser.add_argument(
+        "--fast-tree",
+        action="store_true",
+        help="(--zip / --zip-dir 時) HTML本文パースをスキップし、ZIPパス階層・<title>・CSV行数のみから高速にpages.csv / summary.mdを生成する",
+    )
+    parser.add_argument(
+        "--exclude-ids",
+        nargs="+",
+        default=[],
+        help="分析・ツリー出力から除外するページ/DBのNotion UUID（複数指定可、配下のサブツリーも除外）",
+    )
+    parser.add_argument(
+        "--exclude-file",
+        default="",
+        help="分析対象外のページ/DB UUIDを1行1件で記載したテキスト/CSVファイルパス（#コメント可）",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -124,6 +143,10 @@ def main(argv: List[str] = None) -> int:
 
     t0 = time.monotonic()
     api_calls = 0
+    include_db_rows = not args.exclude_db_rows
+    exclude_ids = load_exclude_ids(args.exclude_ids, args.exclude_file or None)
+    if exclude_ids:
+        print(f"🚫 除外リスト読み込み: {len(exclude_ids)} 件のページ/DB（および配下サブツリー）を分析対象外にします")
 
     if args.api:
         token = args.notion_token or os.environ.get("NOTION_TOKEN") or os.environ.get("NOTION_API_KEY") or ""
@@ -153,6 +176,7 @@ def main(argv: List[str] = None) -> int:
             roots = scanner.scan_subtree(
                 root_page_id=args.root_page_id,
                 progress_cb=_on_subtree_progress,
+                exclude_ids=exclude_ids,
             )
             source_label = f"Notion API (blocks/children subtree) [root={args.root_page_id}]"
         else:
@@ -207,6 +231,7 @@ def main(argv: List[str] = None) -> int:
             stats = analyze_zips_lightweight(
                 zip_files,
                 progress_cb=lambda idx, tot, name: print(f"  ... [{idx}/{tot}] {name}", flush=True),
+                exclude_ids=exclude_ids,
             )
             elapsed = time.monotonic() - t0
             os.makedirs(args.output_dir, exist_ok=True)
@@ -221,13 +246,26 @@ def main(argv: List[str] = None) -> int:
             print(f"   - DB一覧CSV          : {db_csv_path}")
             print(f"   - フォルダ一覧CSV    : {folder_csv_path}")
             return 0
-        print(f"📦 エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) からページツリーを解析中...")
-        roots = scan_zips_to_plan_trees(zip_files, root_page_id=args.root_page_id or None)
-        source_label = f"Export ZIP x {len(zip_files)} ({os.path.basename(zip_files[0])})"
+        if args.fast_tree:
+            print(f"⚡ エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) から超高速ツリー構築中 (--fast-tree)...")
+            roots = scan_zips_fast_tree(
+                zip_files,
+                root_page_id=args.root_page_id or None,
+                include_db_rows=include_db_rows,
+                exclude_ids=exclude_ids,
+                progress_cb=lambda idx, tot, name: print(f"  ... [{idx}/{tot}] {name}", flush=True),
+            )
+            source_label = f"Export ZIP fast-tree x {len(zip_files)} ({os.path.basename(zip_files[0])})"
+        else:
+            print(f"📦 エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) からページツリーを解析中...")
+            roots = scan_zips_to_plan_trees(zip_files, root_page_id=args.root_page_id or None)
+            source_label = f"Export ZIP x {len(zip_files)} ({os.path.basename(zip_files[0])})"
         if args.root_page_id:
             source_label += f" [root={args.root_page_id}]"
 
-    include_db_rows = not args.exclude_db_rows
+    if exclude_ids:
+        roots = prune_excluded_subtrees(roots, exclude_ids)
+
     rows = flatten_plan_trees(roots, include_db_rows=include_db_rows)
     elapsed = time.monotonic() - t0
 

@@ -397,6 +397,45 @@ class TestTreePlanner(unittest.TestCase):
             self.assertEqual(folder_rows[0]["csv_count"], "1")
             self.assertEqual(folder_rows[0]["csv_rows"], "3")
 
+    def test_fast_tree_and_exclude_file_skip_full_parse_and_prune_subtrees(self):
+        """--fast-tree がフルパースなしでツリーを構築し、--exclude-file 指定IDのサブツリーを除外すること"""
+        root_id = "aaaa1111111111111111111111111111"
+        keep_id = "bbbb2222222222222222222222222222"
+        db_id = "cccc3333333333333333333333333333"
+        row_id = "dddd4444444444444444444444444444"
+        excl_id = "eeee5555555555555555555555555555"
+        excl_child_id = "ffff6666666666666666666666666666"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "fast.zip")
+            excl_file = os.path.join(tmpdir, "exclude.txt")
+            out_dir = os.path.join(tmpdir, "fast_out")
+            with open(excl_file, "w", encoding="utf-8") as ef:
+                ef.write(f"# 不要なアーカイブ\nhttps://www.notion.so/{excl_id}\n")
+
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr(f"Root {root_id}.html", "<html><head><title>全体ルート</title></head><body></body></html>")
+                zf.writestr(f"Root/部署A {keep_id}.html", "<html><head><title>部署A</title></head><body></body></html>")
+                zf.writestr(f"Root/部署A/課題DB {db_id}.csv", "名前,メモ\nK1,a\nK2,b\n")
+                zf.writestr(f"Root/部署A/課題DB/K1 {row_id}.html", "<html><head><title>K1</title></head><body></body></html>")
+                zf.writestr(f"Root/アーカイブ {excl_id}.html", "<html><head><title>アーカイブ</title></head><body></body></html>")
+                zf.writestr(f"Root/アーカイブ/古いページ {excl_child_id}.html", "<html><head><title>古いページ</title></head><body></body></html>")
+
+            with patch("src.tree_planner.HtmlZipExtractor.extract_tree", side_effect=AssertionError("should not full-parse")):
+                exit_code = plan_tree.main([
+                    "--zip", zip_path,
+                    "--fast-tree",
+                    "--exclude-db-rows",
+                    "--exclude-file", excl_file,
+                    "--output-dir", out_dir,
+                ])
+
+            self.assertEqual(exit_code, 0)
+            with open(os.path.join(out_dir, "pages.csv"), "r", encoding="utf-8-sig") as f:
+                csv_rows = list(csv.DictReader(f))
+            self.assertEqual([r["title"] for r in csv_rows], ["全体ルート", "部署A", "課題DB"])
+            self.assertEqual(csv_rows[2]["db_row_count"], "2")
+
 
 if __name__ == "__main__":
     unittest.main()
