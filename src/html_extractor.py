@@ -763,6 +763,21 @@ class HtmlZipExtractor:
         logger.info(f"Built database PageNode from standalone CSV: [{db_node.title}] (ID: {db_id}, {len(db_node.children)} rows)")
         return db_node
 
+    @staticmethod
+    def _decode_csv_bytes(raw_bytes: bytes) -> str:
+        """CSVバイト列をBOM・エンコーディング自動判別でデコードする（UTF-8-SIG / UTF-16 / CP932対応）。"""
+        if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+            try:
+                return raw_bytes.decode("utf-16")
+            except UnicodeDecodeError:
+                pass
+        for enc in ("utf-8-sig", "utf-16", "cp932"):
+            try:
+                return raw_bytes.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw_bytes.decode("utf-8", errors="replace")
+
     def _attach_database_rows(
         self,
         zf: zipfile.ZipFile,
@@ -772,7 +787,7 @@ class HtmlZipExtractor:
         db_csv_map: Optional[Dict[str, str]] = None,
     ):
         """CSVおよび同名ディレクトリ内の行レコードHTMLファイルを解析し、db_node.childrenに格納する。"""
-        raw_csv = zf.read(csv_path).decode("utf-8-sig")
+        raw_csv = self._decode_csv_bytes(zf.read(csv_path))
         reader = csv.DictReader(io.StringIO(raw_csv))
         rows = list(reader)
 

@@ -1084,6 +1084,28 @@ class TestHtmlAttachmentsAndLineBgColor(unittest.TestCase):
         self.assertEqual(len(callout_dbs), 1)
         self.assertEqual(callout_dbs[0]["database_id"].replace("-", ""), db_id)
 
+    def test_utf16_bom_csv_is_decoded_without_unicode_error(self):
+        """0xFF 0xFE (UTF-16 BOM) を含むCSVでも UnicodeDecodeError にならず抽出できること"""
+        root_id = "aaaa1111111111111111111111111112"
+        db_id = "bbbb2222222222222222222222222223"
+        html_doc = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Root</title></head>
+<body><article id="{root_id}" class="page sans"><header><h1 class="page-title">Root</h1></header>
+<div class="page-body"></div></article></body></html>"""
+        csv_bytes = "名前,メモ\n行1,UTF16テスト\n".encode("utf-16")
+        self.assertTrue(csv_bytes.startswith(b"\xff\xfe"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zpath = os.path.join(tmpdir, "utf16_csv.zip")
+            with zipfile.ZipFile(zpath, "w") as zf:
+                zf.writestr(f"Root {root_id}.html", html_doc)
+                zf.writestr(f"Root/テストDB {db_id}.csv", csv_bytes)
+            tree = HtmlZipExtractor(zpath).extract_tree()
+
+        db_node = next(c for c in tree.children if c.node_type == "database")
+        self.assertEqual(len(db_node.children), 1)
+        self.assertEqual(db_node.children[0].title, "行1")
+
 
 if __name__ == "__main__":
     unittest.main()
