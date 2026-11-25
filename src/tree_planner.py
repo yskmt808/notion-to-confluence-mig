@@ -645,6 +645,24 @@ def count_zip_source_files(zip_paths: List[str]) -> Tuple[int, int]:
     return html_cnt, csv_cnt
 
 
+def count_unique_db_csvs(zip_paths: List[str]) -> int:
+    """ZIP内のユニークなNotion DB CSV数（_all.csvペア重複・添付CSV・複数ZIP重複を除外）を返す。"""
+    seen_db_ids: Set[str] = set()
+    for zp in zip_paths:
+        with zipfile.ZipFile(zp, "r") as zf:
+            for name in zf.namelist():
+                if not _is_notion_db_csv_filename(name):
+                    continue
+                base_no_ext = os.path.splitext(_norm_zip_path(name))[0]
+                if base_no_ext.lower().endswith("_all"):
+                    base_no_ext = base_no_ext[:-4]
+                uids = extract_uuids(os.path.basename(base_no_ext))
+                norm_uid = normalize_notion_id(uids[-1]) if uids else normalize_notion_id(base_no_ext)
+                if norm_uid:
+                    seen_db_ids.add(norm_uid)
+    return len(seen_db_ids)
+
+
 def _find_plan_node_by_id(roots: List[PlanTreeNode], target_id: str) -> Optional[PlanTreeNode]:
     target_norm = normalize_notion_id(target_id)
     if not target_norm:
@@ -918,14 +936,14 @@ def export_summary_markdown(summary_md: str, output_path: str) -> str:
 
 
 _ZIP_UUID_SUFFIX_RE = re.compile(r"\s+([0-9a-fA-F]{32})$")
-_NOTION_DB_CSV_SUFFIX_RE = re.compile(r"(?:^|\s)([0-9a-fA-F]{32})(?:_all)?$", re.IGNORECASE)
+_NOTION_DB_CSV_SUFFIX_RE = re.compile(r"(?:^|[\s_-])([0-9a-fA-F]{32})(?:_all)?$", re.IGNORECASE)
 
 
 def _is_notion_db_csv_filename(path: str) -> bool:
     """Notion DBのエクスポートCSV（末尾32桁UUID付き .csv / _all.csv）か判定し、添付CSVと区別する。"""
     if not path.lower().endswith(".csv"):
         return False
-    stem = os.path.basename(os.path.splitext(path)[0])
+    stem = urllib.parse.unquote(os.path.basename(os.path.splitext(path)[0]))
     return bool(_NOTION_DB_CSV_SUFFIX_RE.search(stem))
 
 

@@ -22,6 +22,7 @@ from src.tree_planner import (
     analyze_zips_lightweight,
     build_summary_markdown,
     build_zip_stats_markdown,
+    count_unique_db_csvs,
     count_zip_source_files,
     export_pages_csv,
     export_summary_markdown,
@@ -226,8 +227,10 @@ def main(argv: List[str] = None) -> int:
                 print(f"エラー: ディレクトリ '{args.zip_dir}' にZIPファイルが見つかりません。", file=sys.stderr)
                 return 1
         html_cnt, csv_cnt = count_zip_source_files(zip_files)
+        unique_db_cnt = count_unique_db_csvs(zip_files)
+        file_summary = f"{len(zip_files)}件, HTML:{html_cnt}件 / DB CSV:{unique_db_cnt}件 (全CSV:{csv_cnt}件)"
         if args.stats_only:
-            print(f"⚡ エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) の軽量規模算出を実行中...")
+            print(f"⚡ エクスポートZIP ({file_summary}) の軽量規模算出を実行中...")
             stats = analyze_zips_lightweight(
                 zip_files,
                 progress_cb=lambda idx, tot, name: print(f"  ... [{idx}/{tot}] {name}", flush=True),
@@ -247,7 +250,7 @@ def main(argv: List[str] = None) -> int:
             print(f"   - フォルダ一覧CSV    : {folder_csv_path}")
             return 0
         if args.fast_tree:
-            print(f"⚡ エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) から超高速ツリー構築中 (--fast-tree)...")
+            print(f"⚡ エクスポートZIP ({file_summary}) から超高速ツリー構築中 (--fast-tree)...")
             roots = scan_zips_fast_tree(
                 zip_files,
                 root_page_id=args.root_page_id or None,
@@ -257,7 +260,7 @@ def main(argv: List[str] = None) -> int:
             )
             source_label = f"Export ZIP fast-tree x {len(zip_files)} ({os.path.basename(zip_files[0])})"
         else:
-            print(f"📦 エクスポートZIP ({len(zip_files)}件, HTML:{html_cnt}件 / CSV:{csv_cnt}件) からページツリーを解析中...")
+            print(f"📦 エクスポートZIP ({file_summary}) からページツリーを解析中...")
             roots = scan_zips_to_plan_trees(zip_files, root_page_id=args.root_page_id or None)
             source_label = f"Export ZIP x {len(zip_files)} ({os.path.basename(zip_files[0])})"
         if args.root_page_id:

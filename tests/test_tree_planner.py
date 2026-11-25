@@ -496,6 +496,30 @@ class TestTreePlanner(unittest.TestCase):
                 db_rows = list(csv.DictReader(f))
             self.assertEqual(db_rows, [])
 
+    def test_count_unique_db_csvs_matches_fast_tree_db_count_with_all_pair_and_url_encoded_name(self):
+        """_all.csvペアや%20エンコードされたDB CSV名、添付CSV混在時でもユニークDB CSV数とfast-treeのDB数が一致すること"""
+        from src.tree_planner import count_unique_db_csvs, scan_zips_fast_tree
+
+        root_id = "11111111111111111111111111111111"
+        db1_id = "22222222222222222222222222222222"
+        db2_id = "33333333333333333333333333333333"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "mixed.zip")
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr(f"Root {root_id}.html", "<html><head><title>Root</title></head></html>")
+                zf.writestr(f"Root/DB1 {db1_id}.csv", "名前\nA\n")
+                zf.writestr(f"Root/DB1 {db1_id}_all.csv", "名前\nA\nB\n")
+                zf.writestr(f"Root/DB2%20{db2_id}_all.csv", "名前\nC\n")
+                zf.writestr("Root/attached.csv", "x,y\n1,2\n")
+
+            unique_cnt = count_unique_db_csvs([zip_path])
+            self.assertEqual(unique_cnt, 2)
+            roots = scan_zips_fast_tree([zip_path], include_db_rows=False)
+            rows = flatten_plan_trees(roots, include_db_rows=False)
+            db_count = sum(1 for r in rows if r["node_type"] == "database")
+            self.assertEqual(db_count, unique_cnt)
+
 
 if __name__ == "__main__":
     unittest.main()
