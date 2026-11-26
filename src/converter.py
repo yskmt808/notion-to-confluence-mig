@@ -2710,10 +2710,10 @@ class NotionToConfluenceConverter:
                 if k not in keys:
                     keys.append(k)
 
-        table_html = ['<table class="wrapped"><thead><tr>']
+        table_html = ['<table class="wrapped"><tbody><tr>']
         for k in keys:
             table_html.append(f'<th>{html.escape(k)}</th>')
-        table_html.append('</tr></thead><tbody>')
+        table_html.append('</tr>')
 
         mig_map = getattr(self, "migration_map", None) or {}
         for row in db_node.children:

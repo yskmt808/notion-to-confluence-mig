@@ -353,6 +353,22 @@ class TestDbTriage(unittest.TestCase):
         self.assertIn("individual推奨", triage_rows["参照先DB"]["recommendation"])
         self.assertEqual(triage_rows["独立標準DB"]["recommendation"], "✅ 標準 (aggregated推奨)")
 
+    def test_static_table_uses_tbody_header_row_without_thead(self):
+        """static_tableのテーブルが<thead>を使わず<tbody>内の先頭<tr><th>...</th></tr>で出力されること"""
+        from src.converter import NotionToConfluenceConverter
+
+        db = PageNode(
+            id="db-st-header",
+            title="静的テーブル",
+            node_type="database",
+            properties={"schema": {"名前": {"type": "title"}, "メモ": {"type": "rich_text"}}},
+            children=[_row("r1", "Row1", has_body=False)],
+        )
+        conv = NotionToConfluenceConverter()
+        html_out = conv.generate_page_content(db)
+        self.assertNotIn("<thead>", html_out)
+        self.assertIn('<table class="wrapped"><tbody><tr><th>名前</th><th>メモ</th></tr><tr>', html_out)
+
 
 if __name__ == "__main__":
     unittest.main()
