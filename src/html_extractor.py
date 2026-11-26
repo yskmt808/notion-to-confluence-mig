@@ -613,6 +613,30 @@ class HtmlZipExtractor:
         page_body = soup.find(class_="page-body")
         if page_body and not is_database:
             blocks = self._parse_elements_to_blocks(page_body, zf, os.path.dirname(html_file), db_csv_map=db_csv_map)
+            dom_collections = [
+                cc for cc in page_body.find_all("div", class_="collection-content")
+                if not cc.find_parent("div", class_="collection-content")
+            ]
+            if dom_collections:
+                def _count_child_dbs(blks: List[Dict[str, Any]]) -> int:
+                    cnt = 0
+                    for blk in blks or []:
+                        if isinstance(blk, dict):
+                            if blk.get("type") == "child_database":
+                                cnt += 1
+                            if blk.get("children_blocks"):
+                                cnt += _count_child_dbs(blk["children_blocks"])
+                    return cnt
+                ext_cnt = _count_child_dbs(blocks)
+                if ext_cnt < len(dom_collections):
+                    parents_info = [
+                        f"{cc.parent.name if cc.parent else None}(class={cc.parent.get('class') if cc.parent else None}, id={cc.get('id')})"
+                        for cc in dom_collections
+                    ]
+                    logger.info(
+                        f"[HTML-EXTRACT] Unextracted div.collection-content in [{title}] ({html_file}): "
+                        f"dom={len(dom_collections)}, extracted_child_db={ext_cnt}, parents={parents_info}"
+                    )
 
         comments = self._extract_page_comments(soup)
 
@@ -2115,6 +2139,12 @@ class HtmlZipExtractor:
                 }
                 if via_synced_wrapper:
                     db_block["_via_synced_block"] = True
+                if len(el.find_all("tr")) <= 1:
+                    logger.info(
+                        f"[HTML-EXTRACT] 0-row collection-content extracted: "
+                        f"id={db_el_id!r}, db_title={db_title!r}, target_db_id={target_db_id!r}, "
+                        f"view_name={view_info.get('name')!r}, html_dir={current_dir!r}"
+                    )
                 blocks.append(db_block)
 
             # 14. 画像 / 子ページリンク / 外部ファイル・動画・音声・埋め込み
