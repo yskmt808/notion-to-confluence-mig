@@ -27,6 +27,21 @@ UUID_PATTERN = re.compile(
 )
 
 
+def make_aggregated_row_anchor_id(row_id: Optional[str], title: Optional[str] = None) -> str:
+    """集約詳細ページ内のDB行に対する一意かつURL安全なアンカーIDを生成する。"""
+    raw_id = (row_id or "").strip()
+    if raw_id:
+        if re.fullmatch(r"[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}", raw_id):
+            return f"row-{raw_id.replace('-', '').lower()}"
+        safe_id = re.sub(r"[^A-Za-z0-9_-]+", "-", raw_id).strip("-")
+        if safe_id:
+            return f"row-{safe_id}"
+    raw_title = (title or "").strip()
+    if raw_title:
+        return urllib.parse.quote(raw_title, safe="-_().,~")
+    return "row-untitled"
+
+
 def extract_uuids(text: str) -> List[str]:
     """URLエンコードされた文字列等から安全に32桁UUIDを抽出する。"""
     if not text:
@@ -194,6 +209,27 @@ class NotionToConfluenceConverter:
         if db_url:
             return f'<a href="{html.escape(db_url)}">{escaped_disp}</a>'
         return f'<span>{escaped_disp}</span>'
+
+    def _resolve_notion_url_target(
+        self, url: Optional[str]
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+        """URL文字列に含まれるNotion UUIDから (target_uuid, target_info, target_title) を解決する。"""
+        if not url or not isinstance(url, str):
+            return None, None, None
+        for u in extract_uuids(url):
+            u_norm = u.replace("-", "").lower()
+            target_info = None
+            target_title = None
+            for key in (u_norm, f"{u_norm[:8]}-{u_norm[8:12]}-{u_norm[12:16]}-{u_norm[16:20]}-{u_norm[20:]}"):
+                if self.id_to_title_map and key in self.id_to_title_map:
+                    target_title = self.id_to_title_map[key]
+                if self.migration_map and key in self.migration_map:
+                    target_info = self.migration_map[key]
+                if target_title or target_info:
+                    return u_norm, target_info, target_title
+            if self._lookup_skipped_db_row(u_norm):
+                return u_norm, None, None
+        return None, None, None
 
     @staticmethod
     def _is_aggregated_row_entry(target_info: Optional[Dict[str, Any]]) -> bool:
@@ -421,10 +457,28 @@ class NotionToConfluenceConverter:
             return "☑️ 完了" if val else "⬜ 未完了"
 
         elif p_type == "url":
-            url = prop.get("value")
+            url = prop.get("value") or prop.get("url")
             if not url:
                 return "-"
-            return f'<a href="{html.escape(url)}">{html.escape(url)}</a>'
+            s_url = str(url)
+            target_uuid, target_info, target_title = self._resolve_notion_url_target(s_url)
+            if target_info and target_info.get("node_type") == "database":
+                db_url = target_info.get("web_url") or target_info.get("url") or f"{self.confluence_base_url}/database/{target_info.get('confluence_id')}"
+                return f'<a href="{html.escape(db_url)}" data-card-appearance="inline">{html.escape(db_url)}</a>'
+            if not target_info and target_uuid and (skipped_info := self._lookup_skipped_db_row(target_uuid)):
+                return self._render_skipped_db_row_link(skipped_info, label=target_title or skipped_info.get("title"))
+            if self._is_aggregated_row_entry(target_info):
+                return self._render_aggregated_row_link(target_info, label=target_info.get("title") or target_title)
+            if target_info or target_title:
+                disp_title = (target_info.get("title") if target_info else None) or target_title or s_url
+                escaped_title = html.escape(disp_title)
+                return (
+                    f'<ac:link ac:card-appearance="inline">'
+                    f'<ri:page ri:content-title="{escaped_title}" />'
+                    f'<ac:link-body>{escaped_title}</ac:link-body>'
+                    f'</ac:link>'
+                )
+            return f'<a href="{html.escape(s_url)}">{html.escape(s_url)}</a>'
 
         elif p_type in ("people", "created_by", "last_edited_by"):
             users = prop.get("users") or ([prop[p_type]] if isinstance(prop.get(p_type), dict) and prop[p_type] else [])
@@ -502,6 +556,10 @@ class NotionToConfluenceConverter:
                 return html.escape(str(val)) if val is not None else "-"
 
         elif p_type in ("title", "rich_text", "text", "number", "email", "phone_number", "formula"):
+            if p_type in ("rich_text", "text") and isinstance(prop.get("rich_text"), list) and prop.get("rich_text"):
+                rendered_rt = self.convert_rich_text(prop["rich_text"])
+                if rendered_rt:
+                    return rendered_rt.replace("\r\n", "<br/>").replace("\n", "<br/>").replace("\r", "<br/>")
             val = prop.get("value")
             if val is None:
                 return "-"
@@ -1492,7 +1550,7 @@ class NotionToConfluenceConverter:
                     escaped_title = html.escape(db_title)
                     db_url = None
                     if hasattr(self, "migration_map") and self.migration_map:
-                        # Notion ID またはタイトル一致でマッピングされた Confluence Database / static_table ページの URL を検索
+                        # Notion ID またはタイトル一致でマッピングされた Confluence Database の URL を検索
                         m_entry = self.migration_map.get(b.get("id"))
                         if m_entry and m_entry.get("node_type") in ("database", "page"):
                             db_url = m_entry.get("url")
@@ -2233,7 +2291,15 @@ class NotionToConfluenceConverter:
             return "true" if val else "false"
         elif p_type == "url":
             val = prop.get("value") or prop.get("url")
-            return str(val) if val else ""
+            if not val:
+                return ""
+            s_val = str(val)
+            _, target_info, _ = self._resolve_notion_url_target(s_val)
+            if isinstance(target_info, dict):
+                resolved_url = target_info.get("web_url") or target_info.get("url")
+                if resolved_url:
+                    return str(resolved_url)
+            return s_val
         elif p_type == "number":
             val = prop.get("value") if prop.get("value") is not None else prop.get("number")
             if val is None or val == "":
@@ -2628,9 +2694,7 @@ class NotionToConfluenceConverter:
 
         metadata_header = self._render_metadata_header(node)
 
-        if node.node_type == "database":
-            main_body = cover_html + metadata_header + self._generate_database_overview_content(node)
-        elif node.node_type == "database_row":
+        if node.node_type == "database_row":
             main_body = cover_html + metadata_header + self._generate_database_row_content(node, db_url=db_url, entry_id=entry_id)
         else:
             main_body = cover_html + metadata_header + self.blocks_to_storage_format(node.blocks)
@@ -2662,82 +2726,6 @@ class NotionToConfluenceConverter:
             )
 
         return main_body + backlinks_html
-
-    def _generate_database_overview_content(self, db_node: PageNode) -> str:
-        """static_table モード等でデータベースをConfluence通常ページの標準テーブルとして出力する。"""
-        has_detail_page = bool(getattr(db_node, "_aggregated_detail_page_url", None))
-        if not has_detail_page and hasattr(self, "migration_map") and self.migration_map:
-            db_entry = self.migration_map.get(db_node.id)
-            if isinstance(db_entry, dict) and db_entry.get("aggregated_detail_page_url"):
-                has_detail_page = True
-
-        info_text = f'<p>Notionデータベース <strong>{html.escape(db_node.title)}</strong> から移行された静的テーブルです。'
-        if has_detail_page:
-            info_text += '本文を持つ行の詳細は集約詳細ページへリンクされています。'
-        info_text += '</p>'
-
-        content_parts = [
-            '<ac:structured-macro ac:name="info">'
-            '<ac:rich-text-body>'
-            f'{info_text}'
-            '</ac:rich-text-body>'
-            '</ac:structured-macro>'
-        ]
-
-        if not db_node.children:
-            content_parts.append("<p>レコードが存在しません。</p>")
-            return "\n".join(content_parts)
-
-        # スキーマ順または全レコードのプロパティキーからカラム一覧を収集
-        schema = (db_node.properties or {}).get("schema") or {}
-        title_col = (db_node.properties or {}).get("title_column")
-        if not title_col and schema:
-            for p_name, p_info in schema.items():
-                if isinstance(p_info, dict) and p_info.get("type") == "title":
-                    title_col = p_name
-                    break
-        first_row_props = db_node.children[0].properties or {}
-        if not title_col:
-            title_col = "タスク名" if "タスク名" in first_row_props else (next(iter(first_row_props.keys()), "名前") if first_row_props else "名前")
-
-        keys = [title_col]
-        if schema:
-            for k in schema.keys():
-                if k not in keys:
-                    keys.append(k)
-        for row in db_node.children:
-            for k in (row.properties or {}).keys():
-                if k not in keys:
-                    keys.append(k)
-
-        table_html = ['<table class="wrapped"><tbody><tr>']
-        for k in keys:
-            table_html.append(f'<th>{html.escape(k)}</th>')
-        table_html.append('</tr>')
-
-        mig_map = getattr(self, "migration_map", None) or {}
-        for row in db_node.children:
-            table_html.append('<tr>')
-            row_entry = mig_map.get(row.id)
-            row_detail_url = row_entry.get("url") if isinstance(row_entry, dict) else None
-            for k in keys:
-                prop = (row.properties or {}).get(k)
-                if k == title_col or k == keys[0]:
-                    record_title = row.title or (prop.get("value") if isinstance(prop, dict) else str(prop or ""))
-                    escaped_title = html.escape(record_title)
-                    if row_detail_url:
-                        escaped_url = html.escape(row_detail_url)
-                        table_html.append(f'<td><a href="{escaped_url}">📄 {escaped_title}</a></td>')
-                    else:
-                        table_html.append(f'<td>{escaped_title}</td>')
-                else:
-                    formatted_val = self.format_property_for_confluence(prop)
-                    table_html.append(f'<td>{formatted_val}</td>')
-            table_html.append('</tr>')
-
-        table_html.append('</tbody></table>')
-        content_parts.append("".join(table_html))
-        return "\n".join(content_parts)
 
     def _render_metadata_header(self, node: PageNode) -> str:
         """Notionの作成者・作成日時・最終更新日時を記録したヘッダHTMLを生成する。
@@ -2901,8 +2889,14 @@ class NotionToConfluenceConverter:
         for row_node, entry_id in row_entries:
             self.current_node_id = getattr(row_node, "id", None)
             self.current_page_title = getattr(row_node, "title", None)
+            anchor_id = make_aggregated_row_anchor_id(self.current_node_id, self.current_page_title)
+            anchor_macro = (
+                f'<ac:structured-macro ac:name="anchor">'
+                f'<ac:parameter ac:name="">{html.escape(anchor_id)}</ac:parameter>'
+                f'</ac:structured-macro>'
+            )
             heading = html.escape(row_node.title or "(無題)")
-            parts.append(f"<h2>{heading}</h2>")
+            parts.append(f"<h2>{anchor_macro}{heading}</h2>")
             if entry_id:
                 pin_url = html.escape(f"{db_web_url}?entryId={entry_id}")
                 parts.append(

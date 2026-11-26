@@ -71,6 +71,7 @@ class TestDbTriage(unittest.TestCase):
         self.assertEqual(rows[1]["total_body_blocks"], 20)
         self.assertEqual(rows[1]["embedded_view_count"], 0)
         self.assertIn("大規模DB注意", rows[1]["recommendation"])
+        self.assertNotIn("static_table", rows[1]["recommendation"])
 
         table_str = format_db_triage_table(rows)
         self.assertIn("議事録DB", table_str)
@@ -90,30 +91,38 @@ class TestDbTriage(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_db_triage_overrides(bad_csv)
 
-    def test_count_and_importer_mode_overrides_skip_and_static_table(self):
+            deprecated_csv = os.path.join(tmpdir, "deprecated_static.csv")
+            with open(deprecated_csv, "w", encoding="utf-8") as f:
+                f.write("db_id,migration_mode\naaaa0000000000000000000000000001,static_table\n")
+            with self.assertRaises(ValueError):
+                load_db_triage_overrides(deprecated_csv)
+
+    def test_count_and_importer_mode_overrides_skip_and_aggregated(self):
         db_skip = PageNode(
             id="db-skip-id",
             title="除外DB",
             node_type="database",
             children=[_row("rs1", "Row S1", has_body=True)],
         )
-        db_static = PageNode(
-            id="db-static-id",
-            title="静的テーブルDB",
+        db_agg = PageNode(
+            id="db-agg-id",
+            title="集約DB",
             node_type="database",
             properties={"schema": {"名前": {"type": "title"}}},
-            children=[_row("rst1", "Row ST1", has_body=True)],
+            children=[_row("ra1", "Row A1", has_body=True)],
         )
-        root = PageNode(id="root-1", title="Root", node_type="page", children=[db_skip, db_static])
+        root = PageNode(id="root-1", title="Root", node_type="page", children=[db_skip, db_agg])
 
-        overrides = {"db-skip-id": "skip", "db-static-id": "static_table"}
-        # Root(1) + 除外DB(0) + 静的テーブルDB本体(1) + 集約ページ(1) = 3
+        overrides = {"db-skip-id": "skip", "db-agg-id": "aggregated"}
+        # Root(1) + 除外DB(0) + 集約DB本体(1) + 集約ページ(1) = 3
         self.assertEqual(count_migratable_nodes(root, db_mode_overrides=overrides), 3)
 
         mock_client = MagicMock()
         mock_client.base_url = "https://example.atlassian.net/wiki"
         mock_client.get_page_by_title.return_value = None
         mock_client.get_database_by_title.return_value = None
+        mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = []
         created_pages = []
 
         def fake_create_page(space_key, title, body, parent_id=None):
@@ -122,6 +131,7 @@ class TestDbTriage(unittest.TestCase):
             return {"id": pid, "_links": {"webui": f"/spaces/{space_key}/pages/{pid}"}}
 
         mock_client.create_page.side_effect = fake_create_page
+        mock_client.create_database.return_value = {"id": "db_1", "_links": {"webui": "/spaces/D/database/db_1"}}
         mock_client.get_page_by_id.return_value = {"id": "p_1", "version": {"number": 1}}
 
         mock_dashboard = MagicMock()
@@ -138,11 +148,11 @@ class TestDbTriage(unittest.TestCase):
         mapping = importer.import_tree(root, parent_id="parent-0", overwrite=False)
 
         mock_dashboard.start.assert_called_once_with(3)
-        mock_client.create_database.assert_not_called()
+        mock_client.create_database.assert_called_once()
         created_titles = [p["title"] for p in created_pages]
-        self.assertEqual(created_titles, ["Root", "静的テーブルDB", "静的テーブルDB - 詳細ページ一覧"])
+        self.assertEqual(created_titles, ["Root", "集約DB - 詳細ページ一覧"])
         self.assertNotIn("db-skip-id", mapping)
-        self.assertIn("db-static-id", mapping)
+        self.assertIn("db-agg-id", mapping)
 
     def test_cli_dry_run_db_triage_option_b_and_import_db_triage(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -200,8 +210,8 @@ class TestDbTriage(unittest.TestCase):
             finally:
                 os.chdir(orig_cwd)
 
-    def test_static_table_embed_prefers_uuid_over_same_name_database(self):
-        """static_table (node_type=page) として移行されたDBの埋め込みが同名別DBに奪われないこと"""
+    def test_page_embed_prefers_uuid_over_same_name_database(self):
+        """page (node_type=page) として移行された埋め込みが同名別DBに奪われないこと"""
         from src.converter import NotionToConfluenceConverter
         from src.extractor import PageNode
 
@@ -237,47 +247,6 @@ class TestDbTriage(unittest.TestCase):
         html_out = conv.generate_page_content(page)
         self.assertIn("https://example.atlassian.net/wiki/spaces/S/pages/7045206", html_out)
         self.assertNotIn("7110696", html_out)
-
-    def test_static_table_overview_has_no_detailssummary_and_links_only_existing_details(self):
-        """static_tableページにdetailssummaryや壊れた子ページリンクが出ず、詳細がある行のみリンク化されること"""
-        from src.converter import NotionToConfluenceConverter
-        from src.extractor import PageNode
-
-        conv = NotionToConfluenceConverter()
-        conv.migration_map = {
-            "row-with-body": {
-                "confluence_id": "999",
-                "title": "raw1",
-                "url": "https://example.atlassian.net/wiki/spaces/S/pages/999#raw1",
-                "node_type": "database_row",
-            }
-        }
-        db_node = PageNode(
-            id="db-static",
-            title="同じ名前 (2)",
-            node_type="database",
-            properties={"title_column": "名前", "schema": {"名前": {"type": "title"}, "テキスト": {"type": "rich_text"}}},
-            children=[
-                PageNode(
-                    id="row-with-body",
-                    title="raw1",
-                    node_type="database_row",
-                    properties={"名前": {"type": "title", "value": "raw1"}, "テキスト": {"type": "rich_text", "value": "aaa"}},
-                ),
-                PageNode(
-                    id="row-no-body",
-                    title="raw2",
-                    node_type="database_row",
-                    properties={"名前": {"type": "title", "value": "raw2"}, "テキスト": {"type": "rich_text", "value": "bbb"}},
-                ),
-            ],
-        )
-        html_out = conv._generate_database_overview_content(db_node)
-        self.assertNotIn("detailssummary", html_out)
-        self.assertNotIn("動的連動テーブル", html_out)
-        self.assertNotIn("ri:content-title", html_out)
-        self.assertIn('href="https://example.atlassian.net/wiki/spaces/S/pages/999#raw1"', html_out)
-        self.assertIn("<td>raw2</td>", html_out)
 
     def test_html_extractor_resolves_short_uuid_db_row_directory(self):
         """同名DB衝突時にNotionが生成する `<DB名> <先頭4桁>-<末尾4桁>/` 配下の行HTMLを正しく読み込むこと"""
@@ -352,22 +321,6 @@ class TestDbTriage(unittest.TestCase):
         triage_rows = {r["db_title"]: r for r in collect_db_triage_rows(root)}
         self.assertIn("individual推奨", triage_rows["参照先DB"]["recommendation"])
         self.assertEqual(triage_rows["独立標準DB"]["recommendation"], "✅ 標準 (aggregated推奨)")
-
-    def test_static_table_uses_tbody_header_row_without_thead(self):
-        """static_tableのテーブルが<thead>を使わず<tbody>内の先頭<tr><th>...</th></tr>で出力されること"""
-        from src.converter import NotionToConfluenceConverter
-
-        db = PageNode(
-            id="db-st-header",
-            title="静的テーブル",
-            node_type="database",
-            properties={"schema": {"名前": {"type": "title"}, "メモ": {"type": "rich_text"}}},
-            children=[_row("r1", "Row1", has_body=False)],
-        )
-        conv = NotionToConfluenceConverter()
-        html_out = conv.generate_page_content(db)
-        self.assertNotIn("<thead>", html_out)
-        self.assertIn('<table class="wrapped"><tbody><tr><th>名前</th><th>メモ</th></tr><tr>', html_out)
 
 
 if __name__ == "__main__":

@@ -803,7 +803,7 @@ class MigrationVerifier:
                 or analyze_database_child_page_stats(node)["skip_child_pages"]
             )
         if conf_id:
-            if node.node_type == "database" and db_override_mode != "static_table":
+            if node.node_type == "database":
                 res = self.verify_database_node(node, conf_id, expected_parent_id)
             else:
                 res = self.verify_page_node(node, conf_id, expected_parent_id)

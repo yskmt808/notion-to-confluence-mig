@@ -37,7 +37,7 @@ from src.extractor import (
     is_unsupported_page_element_block,
     normalize_db_title,
 )
-from src.converter import NotionToConfluenceConverter
+from src.converter import NotionToConfluenceConverter, make_aggregated_row_anchor_id
 from src.checkpoint import CheckpointWriteError
 from src.db_triage import resolve_db_migration_mode
 
@@ -1819,6 +1819,36 @@ class ConfluenceImporter:
             if self.dashboard:
                 self.dashboard.record_warning(msg)
 
+        def _apply_sorts_to_existing_view(view_name: str, view_sorts: List[Dict[str, Any]]) -> None:
+            url_get = f"{self.client.base_url}/api/v2/databases/{confluence_page_id}"
+            r_get = requests.get(url_get, auth=self.client.auth, timeout=15)
+            if not r_get.ok:
+                logger.warning(
+                    f"Failed to fetch database [{confluence_page_id}] before applying sorts to [{view_name}]: "
+                    f"HTTP {r_get.status_code}"
+                )
+                return
+            cur_v = r_get.json().get("version", {}).get("number", 1)
+            metadata_lines = ["<metadata>"]
+            for s in view_sorts:
+                field = s["field"]
+                direction = s.get("direction", "asc")
+                metadata_lines.append(f'add_sort,{view_name},{field},"[\'{field}\' {direction}]"')
+            metadata_lines.append("</metadata>")
+            csv_body = "\n".join(metadata_lines + ["<data>", "operation_type,entry_index", "</data>"])
+            r_put = requests.put(
+                url_get,
+                json={"id": str(confluence_page_id), "version": {"number": cur_v + 1}, "body": {"representation": "csv", "value": csv_body}},
+                auth=self.client.auth,
+                timeout=30,
+            )
+            if r_put.ok:
+                logger.info(f"Applied sorts {view_sorts} to existing view [{view_name}] on DB [{node.title}]")
+            else:
+                logger.warning(
+                    f"Failed to apply sorts to view [{view_name}] on DB [{node.title}]: HTTP {r_put.status_code}"
+                )
+
         logger.info(f"Applying {len(views_config)} API view configs for [{node.title}]")
         for vc in views_config:
             v_name = (vc.get("name") or "").strip() or "Untitled"
@@ -1852,7 +1882,9 @@ class ConfluenceImporter:
                         if h_name and h_name not in hidden_fields:
                             hidden_fields.append(h_name)
 
-            if v_name in ("Untitled", "Default view") and v_type == "table" and not filters and not sorts:
+            if v_name in ("Untitled", "Default view") and v_type == "table" and not filters:
+                if sorts and "すべてのデータ" in existing_names:
+                    _apply_sorts_to_existing_view("すべてのデータ", sorts)
                 continue
             if v_name in existing_names:
                 continue
@@ -2209,11 +2241,7 @@ class ConfluenceImporter:
                 node.properties = {}
             return
 
-        is_static_table_db = (
-            node.node_type == "database"
-            and self._get_db_migration_mode(node) == "static_table"
-        )
-        if (node.node_type in ("page", "database_row") and (node.blocks or node.properties)) or is_static_table_db:
+        if node.node_type in ("page", "database_row") and (node.blocks or node.properties):
             with self._lock:
                 page_info = self.migration_map.get(node.id)
             if page_info:
@@ -2286,7 +2314,7 @@ class ConfluenceImporter:
             node.properties = {}
 
     def _get_db_migration_mode(self, db_node: PageNode) -> str:
-        """DBノードの移行方式 ('aggregated' / 'individual' / 'static_table' / 'skip') を返す。"""
+        """DBノードの移行方式 ('aggregated' / 'individual' / 'skip') を返す。"""
         return resolve_db_migration_mode(
             db_node,
             individual_db_child_threshold=self.individual_db_child_threshold,
@@ -2294,10 +2322,10 @@ class ConfluenceImporter:
         )
 
     def _is_aggregated_db(self, db_node: PageNode) -> bool:
-        """DBが1ページ集約方式（本文あり行あり、かつ aggregated または static_table）かを判定する。"""
+        """DBが1ページ集約方式（本文あり行あり、かつ aggregated）かを判定する。"""
         if analyze_database_child_page_stats(db_node)["skip_child_pages"]:
             return False
-        return self._get_db_migration_mode(db_node) in ("aggregated", "static_table")
+        return self._get_db_migration_mode(db_node) == "aggregated"
 
     def _update_aggregated_detail_page_pass2(self, db_node: PageNode):
         """Pass 2: 集約方式のDB詳細まとめページ（分割対応・並行実行）に解決済みリンクと?entryId=戻りリンクを反映する。"""
@@ -2964,8 +2992,8 @@ class ConfluenceImporter:
                     "node_type": "page",
                 }
                 for child in chunk_rows:
-                    anchor = urllib.parse.quote((child.title or "").strip(), safe="-_().,~")
-                    row_anchor_url = f"{pm['url']}#{anchor}" if anchor else pm["url"]
+                    anchor_id = make_aggregated_row_anchor_id(child.id, child.title)
+                    row_anchor_url = f"{pm['url']}#{anchor_id}" if anchor_id else pm["url"]
                     if child_link_map is not None:
                         child_link_map[child.id] = row_anchor_url
                     self.migration_map[child.id] = {
@@ -2974,7 +3002,7 @@ class ConfluenceImporter:
                         "url": row_anchor_url,
                         "node_type": child.node_type,
                         "aggregated_page_title": pm["title"],
-                        "aggregated_anchor": (child.title or "").strip(),
+                        "aggregated_anchor": anchor_id,
                     }
 
         db_node._aggregated_detail_pages = public_pages_meta
@@ -3437,92 +3465,6 @@ class ConfluenceImporter:
             if db_mode == "skip":
                 logger.info(f"[DB Triage] Skipping database [{node.title}] (ID: {node.id}) as requested (mode=skip).")
                 return None
-
-            if db_mode == "static_table":
-                target_title, existing_page = self._resolve_unique_page_title(
-                    base_title=node.title,
-                    notion_node_id=node.id,
-                    allow_existing_overwrite=overwrite,
-                )
-                node.title = target_title
-                overview_body = self.converter.generate_page_content(node)
-                if existing_page and overwrite:
-                    confluence_page_id = str(existing_page["id"])
-                    self._apply_root_private_restriction(node, confluence_page_id)
-                    latest = self.client.get_page_by_id(confluence_page_id, expand="version")
-                    ver = latest.get("version", {}).get("number", 1) if latest else 1
-                    self.client.update_page(
-                        page_id=confluence_page_id,
-                        space_key=self.space_key,
-                        title=node.title,
-                        body=overview_body,
-                        current_version=ver,
-                    )
-                    webui = existing_page.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{confluence_page_id}")
-                else:
-                    with self._get_parent_lock(parent_id):
-                        res = self.client.create_page(
-                            space_key=self.space_key,
-                            title=node.title,
-                            body=overview_body,
-                            parent_id=parent_id,
-                        )
-                    confluence_page_id = str(res["id"])
-                    webui = res.get("_links", {}).get("webui", f"/spaces/{self.space_key}/pages/{confluence_page_id}")
-                    self._apply_root_private_restriction(node, confluence_page_id)
-                confluence_url = f"{self.client.base_url}{webui}"
-                if node.icon:
-                    self.client.set_page_emoji(confluence_page_id, node.icon)
-
-                db_map_entry = {
-                    "confluence_id": confluence_page_id,
-                    "title": node.title,
-                    "url": confluence_url,
-                    "node_type": "page",
-                }
-                body_children = [
-                    c for c in (node.children or [])
-                    if not self.is_empty_database_row(c) and database_row_has_substantive_body(c)
-                ]
-                if body_children:
-                    node._aggregated_mode = True
-                    agg_pages_meta = self._provision_aggregated_detail_pages(
-                        db_node=node,
-                        body_children=body_children,
-                        parent_id=confluence_page_id,
-                        overwrite=overwrite,
-                    )
-                    if agg_pages_meta:
-                        first_agg = agg_pages_meta[0]
-                        db_map_entry["aggregated_detail_page_id"] = first_agg["confluence_id"]
-                        db_map_entry["aggregated_detail_page_title"] = first_agg["title"]
-                        db_map_entry["aggregated_detail_page_url"] = first_agg["url"]
-                        db_map_entry["aggregated_detail_pages"] = agg_pages_meta
-                        nested_children = [
-                            sub for c in (node.children or []) for sub in (getattr(c, "children", None) or [])
-                        ]
-                        if nested_children:
-                            self._import_children_concurrently(
-                                parent_node=node,
-                                children=nested_children,
-                                parent_id=first_agg["confluence_id"],
-                                overwrite=overwrite,
-                                allow_sub_parallel=allow_sub_parallel,
-                            )
-                self._register_skipped_db_rows(node, confluence_url, skip_only_bodyless=True)
-                with self._lock:
-                    self.migration_map[node.id] = db_map_entry
-                if self.checkpoint:
-                    self.checkpoint.record_pass1(
-                        node_id=node.id,
-                        confluence_id=confluence_page_id,
-                        title=node.title,
-                        url=confluence_url,
-                        node_type="page",
-                    )
-                if self.dashboard:
-                    self.dashboard.record_pass1_done(node.title, node_type="page")
-                return confluence_page_id
 
             # 重複タイトル解決（同名DBが存在する場合に安全にユニークタイトルを採番）
             target_title, existing_db = self._resolve_unique_page_title(

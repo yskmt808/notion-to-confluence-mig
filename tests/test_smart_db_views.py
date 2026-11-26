@@ -928,6 +928,73 @@ class TestSmartDbViews(unittest.TestCase):
             ],
         )
 
+    @patch("src.importer.requests.put")
+    @patch("src.importer.requests.get")
+    def test_sort_only_untitled_view_does_not_create_extra_untitled_view(self, mock_get, mock_put):
+        """ソート条件だけが設定されたデフォルト(Untitled)テーブルビューで余分なUntitledビューが作成されず、すべてのデータへソートが適用されること"""
+        importer = ConfluenceImporter("https://example.atlassian.net", "u", "t", "TEST")
+        importer.client = MagicMock()
+        importer.client.base_url = "https://example.atlassian.net/wiki"
+        importer.client.auth = ("u", "t")
+        importer.client.get_database_views.return_value = [
+            {"id": "v-all", "name": "すべてのデータ", "type": "table"}
+        ]
+        mock_get.return_value = MagicMock(ok=True, json=lambda: {"version": {"number": 1}})
+        mock_put.return_value = MagicMock(ok=True, status_code=200)
+
+        db_node = PageNode(
+            id="db-sort-only",
+            title="ソートのみDB",
+            node_type="database",
+            properties={"schema": {"名前": {"type": "title"}, "期日": {"type": "date", "id": "p_due"}}},
+        )
+        views_config = [
+            {
+                "id": "v1",
+                "name": "Untitled",
+                "type": "table",
+                "sorts": [{"property": "p_due", "direction": "descending"}],
+                "configuration": {},
+            }
+        ]
+        existing_views = [{"id": "v-all", "name": "すべてのデータ", "type": "table"}]
+        importer._apply_api_views_config("db-conf-sort", db_node, views_config, existing_views, [], [])
+
+        importer.client.create_database_view.assert_not_called()
+        mock_put.assert_called_once()
+        put_csv = mock_put.call_args.kwargs["json"]["body"]["value"]
+        self.assertIn('add_sort,すべてのデータ,期日,"[\'期日\' desc]"', put_csv)
+
+    @patch("src.api_enricher.requests.get")
+    def test_fetch_views_falls_back_to_direct_view_id_lookup(self, mock_get):
+        """database_id クエリが空/非200でも /v1/views/{id} 直接取得へフォールバックすること"""
+        from src.api_enricher import NotionApiEnricher
+
+        vid = "11111111-2222-3333-4444-555555555566"
+        res_list = MagicMock(status_code=404, ok=False)
+        res_direct = MagicMock(
+            status_code=200,
+            ok=True,
+            json=lambda: {
+                "id": vid,
+                "name": "0件ビュー",
+                "type": "table",
+                "data_source_id": "ds-1",
+                "filter": {"property": "status", "status": {"equals": "保留"}},
+                "quick_filters": None,
+                "sorts": None,
+                "configuration": {},
+            },
+        )
+        mock_get.side_effect = [res_list, res_direct]
+
+        enricher = NotionApiEnricher(token="dummy")
+        views = enricher._fetch_views_for_database_id(vid.replace("-", ""), label="test")
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0]["id"], vid)
+        self.assertEqual(views[0]["name"], "0件ビュー")
+        self.assertIn(f"/v1/views/{vid}", mock_get.call_args_list[1].args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

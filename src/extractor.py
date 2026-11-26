@@ -1464,7 +1464,7 @@ def count_migratable_nodes(
                 )
             ):
                 return 1 + sum(_count(c) for c in (getattr(n, "children", None) or []))
-            # aggregated または static_table: 本体1枚 + 集約詳細ページ(上限30件で分割) + レコード配下のネスト子ページ/DB
+            # aggregated: 本体1枚 + 集約詳細ページ(上限30件で分割) + レコード配下のネスト子ページ/DB
             detail_page_count = max(1, math.ceil(db_stats["body_rows"] / AGGREGATED_DETAIL_MAX_ROWS_PER_PAGE))
             nested_count = sum(
                 _count(sub)

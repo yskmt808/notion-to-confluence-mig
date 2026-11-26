@@ -1544,7 +1544,12 @@ class HtmlZipExtractor:
                 else:
                     if col_types_out is not None:
                         col_types_out.setdefault(p_name, "text")
-                    result[p_name] = {"type": "text", "value": p_val}
+                    prop_text: Dict[str, Any] = {"type": "text", "value": p_val}
+                    if td.find("a") or td.find(class_="user"):
+                        rt_items = self._parse_inline_rich_text(td)
+                        if rt_items:
+                            prop_text["rich_text"] = rt_items
+                    result[p_name] = prop_text
 
         return result
 

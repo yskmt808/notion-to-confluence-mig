@@ -14,7 +14,7 @@ from src.extractor import (
     normalize_notion_id,
 )
 
-VALID_DB_MODES = ("aggregated", "individual", "static_table", "skip")
+VALID_DB_MODES = ("aggregated", "individual", "skip")
 
 LARGE_DB_ROW_THRESHOLD = 300
 LARGE_DB_BODY_BLOCKS_THRESHOLD = 1000
@@ -26,7 +26,7 @@ def resolve_db_migration_mode(
     individual_db_child_threshold: int = 0,
     mode_overrides: Optional[Dict[str, str]] = None,
 ) -> str:
-    """DBノードに適用される移行方式 ('aggregated' / 'individual' / 'static_table' / 'skip') を解決する。"""
+    """DBノードに適用される移行方式 ('aggregated' / 'individual' / 'skip') を解決する。"""
     if mode_overrides:
         norm_id = normalize_notion_id(getattr(db_node, "id", "") or "")
         if norm_id in mode_overrides:
@@ -107,7 +107,7 @@ def _recommend_db_triage(
             return "⚠️ 大規模DB・カラム値参照あり (individual推奨)"
         return "💡 カラム値参照あり (individual推奨)"
     if is_large:
-        return "⚠️ 大規模DB注意 (static_table / skip検討)"
+        return "⚠️ 大規模DB注意 (aggregated / skip検討)"
     if 1 <= body_rows <= SMALL_DB_BODY_ROW_THRESHOLD:
         return "💡 小規模DB (individual候補)"
     return "✅ 標準 (aggregated推奨)"

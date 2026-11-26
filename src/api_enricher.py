@@ -286,32 +286,66 @@ class NotionApiEnricher:
         return raw_id
 
     def _fetch_views_for_database_id(self, raw_id: str, label: str = "") -> List[Dict[str, Any]]:
-        """指定した database_id / Linked View block_id に対して Notion Views API を呼び出す。"""
+        """指定した database_id / Linked View block_id / view_id に対して Notion Views API を呼び出す。"""
         formatted_id = self._format_uuid(raw_id)
         views_info: List[Dict[str, Any]] = []
+
+        def _to_view_dict(vd: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "id": vd.get("id"),
+                "name": vd.get("name"),
+                "type": vd.get("type"),
+                "data_source_id": vd.get("data_source_id"),
+                "filter": vd.get("filter"),
+                "quick_filters": vd.get("quick_filters"),
+                "sorts": vd.get("sorts"),
+                "configuration": vd.get("configuration", {}),
+            }
+
         try:
             url_views = f"https://api.notion.com/v1/views?database_id={formatted_id}"
             res_v = requests.get(url_views, headers=self.headers_v2, timeout=15)
             if res_v.status_code == 200:
                 raw_views = res_v.json().get("results", [])
+                if not raw_views:
+                    logger.info(
+                        f"[API-ENRICH] Views API returned 0 results for {label or formatted_id} "
+                        f"(query database_id={formatted_id})"
+                    )
                 for v in raw_views:
                     vid = v.get("id")
                     if vid:
                         v_detail = requests.get(f"https://api.notion.com/v1/views/{vid}", headers=self.headers_v2, timeout=15)
                         if v_detail.ok:
-                            vd = v_detail.json()
-                            views_info.append({
-                                "id": vd.get("id"),
-                                "name": vd.get("name"),
-                                "type": vd.get("type"),
-                                "data_source_id": vd.get("data_source_id"),
-                                "filter": vd.get("filter"),
-                                "quick_filters": vd.get("quick_filters"),
-                                "sorts": vd.get("sorts"),
-                                "configuration": vd.get("configuration", {}),
-                            })
+                            views_info.append(_to_view_dict(v_detail.json()))
+                        else:
+                            logger.warning(
+                                f"[API-ENRICH] Failed to fetch view detail {vid} for {label or formatted_id}: "
+                                f"HTTP {v_detail.status_code}"
+                            )
+            else:
+                logger.info(
+                    f"[API-ENRICH] Views API query by database_id={formatted_id} returned HTTP {res_v.status_code} "
+                    f"for {label or formatted_id}"
+                )
+
+            if not views_info and re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", formatted_id):
+                res_single = requests.get(f"https://api.notion.com/v1/views/{formatted_id}", headers=self.headers_v2, timeout=15)
+                if res_single.ok:
+                    vd = res_single.json()
+                    if isinstance(vd, dict) and vd.get("id"):
+                        views_info.append(_to_view_dict(vd))
+                        logger.info(
+                            f"[API-ENRICH] Resolved view directly via /v1/views/{formatted_id} "
+                            f"for {label or formatted_id}: name={vd.get('name')!r}, type={vd.get('type')!r}"
+                        )
+                else:
+                    logger.info(
+                        f"[API-ENRICH] Direct /v1/views/{formatted_id} returned HTTP {res_single.status_code} "
+                        f"for {label or formatted_id}"
+                    )
         except Exception as ve:
-            logger.debug(f"[API-ENRICH] Views API skipped or not available for {label or formatted_id}: {ve}")
+            logger.warning(f"[API-ENRICH] Views API exception for {label or formatted_id}: {ve}")
         return views_info
 
     @staticmethod
@@ -349,21 +383,38 @@ class NotionApiEnricher:
             for b in blocks or []:
                 if not isinstance(b, dict):
                     continue
-                if b.get("type") == "child_database" and not b.get("_is_unresolved_external_db"):
+                if b.get("type") == "child_database":
                     block_id = str(b.get("id") or "").strip()
                     target_id = str(
                         b.get("database_id")
                         or ((b.get("data_sources") or [{}])[0].get("id") if b.get("data_sources") else "")
                         or ""
                     ).strip()
+                    if b.get("_is_unresolved_external_db"):
+                        logger.info(
+                            f"[API-ENRICH] Skipping unresolved external child_database on [{page_title}] "
+                            f"(block={block_id}, target={target_id}, views={b.get('views')})"
+                        )
+                        continue
                     norm_bid = block_id.replace("-", "").lower()
                     norm_tid = target_id.replace("-", "").lower()
-                    if norm_bid and norm_tid and norm_bid != norm_tid:
+                    if not norm_bid or not norm_tid or norm_bid == norm_tid:
+                        logger.info(
+                            f"[API-ENRICH] Skipping child_database linked-view lookup on [{page_title}] "
+                            f"(block={block_id}, target={target_id}, is_linked={b.get('is_linked_database')}, "
+                            f"views={b.get('views')})"
+                        )
+                    else:
                         if norm_bid not in fetched_block_cache:
                             fetched_block_cache[norm_bid] = self._fetch_views_for_database_id(
                                 block_id, label=f"linked view on [{page_title}]"
                             )
                         linked_views = fetched_block_cache[norm_bid]
+                        if not linked_views:
+                            logger.info(
+                                f"[API-ENRICH] No linked views retrieved on [{page_title}] "
+                                f"(block={block_id}, target={target_id}, orig_views={b.get('views')})"
+                            )
                         if linked_views:
                             summary["views_enriched"] += len(linked_views)
                             orig_views = b.get("views") or []

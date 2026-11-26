@@ -402,7 +402,10 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         agg_updates = [u for u in updated_pages if u["id"] == "p_2"]
         self.assertEqual(len(agg_updates), 1)
         agg_body = agg_updates[0]["body"]
-        self.assertIn("<h2>本文あり行</h2>", agg_body)
+        self.assertIn(
+            '<h2><ac:structured-macro ac:name="anchor"><ac:parameter ac:name="">row-r_body</ac:parameter></ac:structured-macro>本文あり行</h2>',
+            agg_body,
+        )
         self.assertIn("db_agg_conf_1?entryId=entry-agg-1", agg_body)
         self.assertIn("DBの該当レコードを直接開く", agg_body)
         self.assertNotIn("データベースプロパティ", agg_body)
@@ -684,8 +687,8 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         # 1件目(Row0)は(1/3)、23件目(Row22)は(2/3)、45件目(Row44)は(3/3)へ紐付くこと
         self.assertNotEqual(mapping["r-sp-0"]["confluence_id"], mapping["r-sp-22"]["confluence_id"])
         self.assertNotEqual(mapping["r-sp-22"]["confluence_id"], mapping["r-sp-44"]["confluence_id"])
-        self.assertIn("#Row0", mapping["r-sp-0"]["url"])
-        self.assertIn("#Row44", mapping["r-sp-44"]["url"])
+        self.assertIn("#row-r-sp-0", mapping["r-sp-0"]["url"])
+        self.assertIn("#row-r-sp-44", mapping["r-sp-44"]["url"])
 
     def test_pass2_timeout_records_error_and_leaves_checkpoint_resumable(self):
         """Pass 2 の集約子ページ更新でタイムアウト等が起きた場合、エラー記録されチェックポイントが完了にならず再開可能であること。"""
@@ -877,11 +880,106 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         mapping = importer.import_tree(root, parent_id="parent-0", overwrite=False)
 
         row_url = mapping["r-enc-1"]["url"]
-        self.assertIn("#%5B20261126-1100%5D", row_url)
-        self.assertIn("(1)", row_url)
+        expected_anchor = "row-r-enc-1"
+        self.assertTrue(row_url.endswith(f"#{expected_anchor}"))
+        self.assertEqual(mapping["r-enc-1"]["aggregated_anchor"], expected_anchor)
         self.assertNotIn("%2D", row_url)
         self.assertNotIn("%28", row_url)
         self.assertNotIn("%29", row_url)
+
+        conv = NotionToConfluenceConverter()
+        details_html = conv.generate_aggregated_database_details_html(
+            db,
+            "https://example.atlassian.net/wiki/spaces/TEST/database/db-c1",
+            [(db.children[0], None)],
+        )
+        self.assertIn(
+            f'<h2><ac:structured-macro ac:name="anchor"><ac:parameter ac:name="">{expected_anchor}</ac:parameter></ac:structured-macro>[20261126-1100]タスク (1)</h2>',
+            details_html,
+        )
+
+    def test_db_column_rich_text_and_url_resolve_aggregated_row_links(self):
+        """DBの rich_text / text / url カラムに含まれる集約子ページ参照がアンカー付きリンクへ解決されること"""
+        row_id = "11111111-2222-3333-4444-555555555566"
+        row_nodash = "11111111222233334444555555555566"
+        agg_url = "https://example.atlassian.net/wiki/spaces/S/pages/900#集約行A"
+        migration_map = {
+            row_id: {
+                "title": "集約行A",
+                "node_type": "database_row",
+                "url": agg_url,
+                "aggregated_page_title": "DB詳細（1）",
+                "aggregated_anchor": "集約行A",
+            }
+        }
+        conv = NotionToConfluenceConverter(id_to_title_map={row_id: "集約行A"})
+        conv.migration_map = migration_map
+        expected_anchor_link = (
+            '<ac:link ac:anchor="集約行A">'
+            '<ri:page ri:content-title="DB詳細（1）" />'
+            '<ac:link-body>集約行A</ac:link-body>'
+            '</ac:link>'
+        )
+
+        # 1. プロパティ描画: rich_text / text カラム内のページメンション・リンク
+        rt_html = conv.format_property_for_confluence({
+            "type": "text",
+            "value": "参照: 集約行A",
+            "rich_text": [
+                {"type": "text", "text": {"content": "参照: "}, "plain_text": "参照: "},
+                {"type": "mention", "mention": {"type": "page", "page": {"id": row_id}}, "plain_text": "集約行A"},
+            ],
+        })
+        self.assertEqual(rt_html, f"参照: {expected_anchor_link}")
+
+        # 2. プロパティ描画: url カラム内の Notion ページ URL
+        url_html = conv.format_property_for_confluence({
+            "type": "url",
+            "value": f"https://www.notion.so/workspace/{row_nodash}",
+        })
+        self.assertEqual(url_html, expected_anchor_link)
+
+        # 外部URLはそのままリンクになること
+        ext_html = conv.format_property_for_confluence({
+            "type": "url",
+            "value": "https://example.com/docs",
+        })
+        self.assertEqual(ext_html, '<a href="https://example.com/docs">https://example.com/docs</a>')
+
+        # 3. Native DB CSV: url カラム内の Notion ページ URL が集約詳細ページ#アンカーURLに解決されること
+        csv_url = conv._format_prop_for_csv(
+            {"type": "url", "value": f"https://www.notion.so/workspace/{row_nodash}"},
+            "URL",
+            "",
+        )
+        self.assertEqual(csv_url, agg_url)
+
+    def test_html_extractor_preserves_rich_text_for_text_property_with_links(self):
+        """HTMLのpropertiesテーブルのtext列にリンクがある場合、valueに加えてrich_textも保持されること"""
+        from bs4 import BeautifulSoup
+        from src.html_extractor import HtmlZipExtractor
+
+        html_doc = """
+        <table class="properties">
+          <tbody>
+            <tr class="property-row-text">
+              <th>メモ</th>
+              <td>関連: <a href="SubRow%2011111111222233334444555555555566.html">集約行A</a></td>
+            </tr>
+          </tbody>
+        </table>
+        """
+        soup = BeautifulSoup(html_doc, "html.parser")
+        extractor = HtmlZipExtractor.__new__(HtmlZipExtractor)
+        props = extractor._extract_properties_from_table(soup.find("table"))
+        self.assertIn("メモ", props)
+        self.assertEqual(props["メモ"]["type"], "text")
+        self.assertIn("集約行A", props["メモ"]["value"])
+        self.assertIsInstance(props["メモ"].get("rich_text"), list)
+        self.assertTrue(any(
+            (((rt.get("text") or {}).get("link") or {}).get("url") or "").endswith("11111111222233334444555555555566.html")
+            for rt in props["メモ"]["rich_text"]
+        ))
 
 
 if __name__ == "__main__":
