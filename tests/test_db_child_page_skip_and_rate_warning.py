@@ -837,6 +837,52 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
         })
         self.assertEqual(rel_html, expected_anchor_link)
 
+    def test_aggregated_anchor_url_preserves_hyphen_and_parentheses(self):
+        """集約詳細ページの行アンカーURLでマイナス(-)やカッコ(())がエンコードされないこと"""
+        db = PageNode(
+            id="db-anchor-enc",
+            title="アンカーDB",
+            node_type="database",
+            properties={"schema": {"名前": {"type": "title"}}},
+            children=[
+                PageNode(
+                    id="r-enc-1",
+                    title="[20261126-1100]タスク (1)",
+                    node_type="database_row",
+                    blocks=[{"id": "b1", "type": "paragraph", "paragraph": {"rich_text": [{"plain_text": "本文"}]}}],
+                )
+            ],
+        )
+        root = PageNode(id="root-enc", title="Root", node_type="page", children=[db])
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.get_space_id.return_value = "space-1"
+        mock_client.get_page_by_title.return_value = None
+        mock_client.get_database_by_title.return_value = None
+        mock_client.get_database_views.return_value = [{"id": "v-1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = []
+        created_seq = [0]
+
+        def fake_create_page(space_key, title, body, parent_id=None):
+            created_seq[0] += 1
+            pid = f"p{created_seq[0]}"
+            return {"id": pid, "_links": {"webui": f"/spaces/TEST/pages/{pid}"}}
+
+        mock_client.create_page.side_effect = fake_create_page
+        mock_client.create_database.return_value = {"id": "db-c1", "_links": {"webui": "/spaces/TEST/database/db-c1"}}
+        mock_client.get_page_by_id.return_value = {"id": "p1", "version": {"number": 1}}
+
+        importer = ConfluenceImporter("https://example.atlassian.net", "u", "t", "TEST", page_workers=1)
+        importer.client = mock_client
+        mapping = importer.import_tree(root, parent_id="parent-0", overwrite=False)
+
+        row_url = mapping["r-enc-1"]["url"]
+        self.assertIn("#%5B20261126-1100%5D", row_url)
+        self.assertIn("(1)", row_url)
+        self.assertNotIn("%2D", row_url)
+        self.assertNotIn("%28", row_url)
+        self.assertNotIn("%29", row_url)
+
 
 if __name__ == "__main__":
     unittest.main()

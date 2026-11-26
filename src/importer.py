@@ -2964,7 +2964,7 @@ class ConfluenceImporter:
                     "node_type": "page",
                 }
                 for child in chunk_rows:
-                    anchor = urllib.parse.quote((child.title or "").strip(), safe="")
+                    anchor = urllib.parse.quote((child.title or "").strip(), safe="-_().,~")
                     row_anchor_url = f"{pm['url']}#{anchor}" if anchor else pm["url"]
                     if child_link_map is not None:
                         child_link_map[child.id] = row_anchor_url
