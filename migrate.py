@@ -1163,10 +1163,10 @@ def main():
     def _run_step3_verification(confluence_client, target_mapping):
         step3_start = datetime.now(resolved_tz)
         print(f"🔍 [Step 3/3] テキストベース移行整合性を自動検証中... (開始: {step3_start.strftime('%H:%M:%S')})")
-        verifier = (
-            MigrationVerifier(confluence_client, db_mode_overrides=db_mode_overrides)
-            if db_mode_overrides
-            else MigrationVerifier(confluence_client)
+        verifier = MigrationVerifier(
+            confluence_client,
+            db_mode_overrides=db_mode_overrides or None,
+            individual_db_child_threshold=getattr(args, "individual_db_child_threshold", None),
         )
         page_id_map = {nid: item["confluence_id"] for nid, item in target_mapping.items() if item.get("confluence_id")}
         results = verifier.verify_tree(tree, page_id_map, conf_parent_id)

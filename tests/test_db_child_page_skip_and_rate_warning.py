@@ -981,6 +981,77 @@ class TestDbChildPageSkipAndRateWarning(unittest.TestCase):
             for rt in props["メモ"]["rich_text"]
         ))
 
+    def test_verify_only_supports_aggregated_db_without_runtime_flags(self):
+        """--verify-only 相当（_aggregated_mode未付与の抽出直後ツリー + checkpoint経由page_id_map）でも集約DB子行がFAILにならずネスト子ページが詳細ページ配下として検証されること"""
+        from src.verifier import MigrationVerifier
+
+        nested_sub = PageNode(
+            id="sub-page-1",
+            title="ネスト子ページ",
+            node_type="page",
+            blocks=[{"id": "sb1", "type": "paragraph", "paragraph": {"rich_text": [{"plain_text": "sub body"}]}}],
+        )
+        rows = [
+            PageNode(
+                id=f"r-{i}",
+                title=f"Row {i}",
+                node_type="database_row",
+                properties={"名前": {"type": "title", "value": f"Row {i}"}},
+                blocks=[{"id": f"b-{i}", "type": "paragraph", "paragraph": {"rich_text": [{"plain_text": f"body {i}"}]}}],
+                children=[nested_sub] if i == 0 else [],
+            )
+            for i in range(15)
+        ]
+        db_node = PageNode(
+            id="db-verify-agg",
+            title="集約検証DB",
+            node_type="database",
+            properties={"schema": {"名前": {"type": "title"}}},
+            children=rows,
+        )
+        root = PageNode(id="root-v-agg", title="Root", node_type="page", children=[db_node])
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.auth = ("u", "t")
+        mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = [{"id": f"e-{i}"} for i in range(15)]
+        mock_client.get_database_fields.return_value = [{"name": "名前", "type": "pageLink"}]
+        mock_client.get_page_by_id.side_effect = lambda pid, expand=None: (
+            {
+                "id": "conf-root",
+                "title": "Root",
+                "ancestors": [{"id": "parent-0"}],
+                "body": {"storage": {"value": "<p>root</p>"}, "view": {"value": "<p>root</p>"}},
+            }
+            if pid == "conf-root"
+            else {
+                "id": "conf-sub-1",
+                "title": "ネスト子ページ",
+                "ancestors": [{"id": "conf-agg-detail"}],
+                "body": {"storage": {"value": "<p>sub body</p>"}, "view": {"value": "<p>sub body</p>"}},
+            }
+        )
+
+        mock_db_res = MagicMock(ok=True)
+        mock_db_res.json.return_value = {"id": "conf-db", "title": "集約検証DB", "parentId": "conf-root"}
+
+        # checkpoint.get_migration_map() 相当（行ID自体は個別ページを持たない）
+        page_id_map = {
+            "root-v-agg": "conf-root",
+            "db-verify-agg": "conf-db",
+            "db-verify-agg__details": "conf-agg-detail",
+            "sub-page-1": "conf-sub-1",
+        }
+        verifier = MigrationVerifier(mock_client, individual_db_child_threshold=10)
+        with patch("src.verifier.requests.get", return_value=mock_db_res):
+            results = verifier.verify_tree(root, page_id_map, expected_parent_id="parent-0")
+
+        titles = [r["title"] for r in results]
+        self.assertEqual(titles, ["Root", "集約検証DB", "ネスト子ページ"])
+        for r in results:
+            self.assertEqual(r["status"], "PASS", f"Unexpected non-PASS for {r['title']}: {r}")
+
 
 if __name__ == "__main__":
     unittest.main()

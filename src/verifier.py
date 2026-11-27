@@ -35,10 +35,18 @@ class MigrationVerifier:
         self,
         confluence_client: ConfluenceClient,
         db_mode_overrides: Optional[Dict[str, str]] = None,
+        individual_db_child_threshold: Optional[int] = None,
     ):
         self.client = confluence_client
         self.db_mode_overrides: Dict[str, str] = dict(db_mode_overrides) if db_mode_overrides else {}
+        self.individual_db_child_threshold: Optional[int] = individual_db_child_threshold
         self._db_view_requirements: Dict[str, Dict[str, Any]] = {}
+
+    def _resolve_db_mode(self, node: PageNode) -> str:
+        kwargs: Dict[str, Any] = {"mode_overrides": self.db_mode_overrides}
+        if self.individual_db_child_threshold is not None:
+            kwargs["individual_db_child_threshold"] = self.individual_db_child_threshold
+        return resolve_db_migration_mode(node, **kwargs)
 
     def verify_page_node(
         self,
@@ -704,7 +712,7 @@ class MigrationVerifier:
             checks_passed.append(
                 f"Database row child pages skipped intentionally (0/{db_stats['total_rows']} rows with substantive body; title column uses 'text')."
             )
-        elif getattr(node, "_aggregated_mode", False):
+        elif getattr(node, "_aggregated_mode", False) or self._resolve_db_mode(node) == "aggregated":
             checks_passed.append(
                 f"Database row details aggregated into 1 detail page ({db_stats['body_rows']}/{db_stats['total_rows']} rows with substantive body)."
             )
@@ -803,7 +811,7 @@ class MigrationVerifier:
         skip_db_children = False
         db_override_mode = None
         if node.node_type == "database":
-            db_override_mode = resolve_db_migration_mode(node, mode_overrides=self.db_mode_overrides) if self.db_mode_overrides else None
+            db_override_mode = self._resolve_db_mode(node)
             if db_override_mode == "skip":
                 return results
             skip_db_children = bool(
@@ -830,12 +838,20 @@ class MigrationVerifier:
 
         # 子ページの検証 (本文なしDBで子ページ作成をスキップした行、1ページ集約方式の行、および空行はスキップ)
         if not skip_db_children:
-            aggregated_mode = bool(getattr(node, "_aggregated_mode", False))
+            agg_detail_id = (
+                getattr(node, "_aggregated_detail_page_id", None)
+                or page_id_map.get(f"{node.id}__details")
+                or page_id_map.get(f"{node.id}__details__1")
+            )
+            aggregated_mode = bool(
+                getattr(node, "_aggregated_mode", False)
+                or (node.node_type == "database" and (db_override_mode == "aggregated" or agg_detail_id))
+            )
             for child in node.children:
                 if node.node_type == "database" and is_empty_database_row(child):
                     continue
                 if node.node_type == "database" and aggregated_mode:
-                    agg_parent_id = getattr(node, "_aggregated_detail_page_id", None) or this_parent_id
+                    agg_parent_id = agg_detail_id or this_parent_id
                     for sub in (getattr(child, "children", None) or []):
                         results.extend(self.verify_tree(sub, page_id_map, agg_parent_id, _analyze_root=False))
                     continue
