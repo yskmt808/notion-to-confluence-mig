@@ -164,7 +164,11 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         self.assertTrue(call_kwargs["overwrite"])
         self.assertEqual(call_kwargs["root_node"].id, "multi_block_root_page")
 
-        mock_ver_cls.assert_called_once_with(mock_importer.client)
+        mock_ver_cls.assert_called_once_with(
+            mock_importer.client,
+            db_mode_overrides=None,
+            individual_db_child_threshold=0,
+        )
         mock_verifier.verify_tree.assert_called_once()
 
         # migration_result.json と checkpoint の完了状態を確認
@@ -620,7 +624,11 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
 
             mock_importer_cls.assert_not_called()
             mock_client_cls.assert_called_once()
-            mock_verifier_cls.assert_called_once_with(mock_client_cls.return_value)
+            mock_verifier_cls.assert_called_once_with(
+                mock_client_cls.return_value,
+                db_mode_overrides=None,
+                individual_db_child_threshold=0,
+            )
             mock_verifier.verify_tree.assert_called_once()
             _, page_id_map, parent_id = mock_verifier.verify_tree.call_args.args
             self.assertEqual(page_id_map, {"11111111111111111111111111111111": "88888"})
