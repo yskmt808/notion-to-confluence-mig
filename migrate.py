@@ -627,8 +627,8 @@ def validate_api_credentials(
                 },
                 timeout=15,
             )
-            if res.status_code == 403:
-                # Personal Access Token 等でユーザー情報取得権限がない場合は /v1/search でトークン有効性を確認
+            if res.status_code in (401, 403):
+                # Personal Access Token / ユーザートークン等でユーザー情報取得が 401/403 の場合は /v1/search でトークン有効性を確認
                 res_search = requests.post(
                     "https://api.notion.com/v1/search",
                     headers={
