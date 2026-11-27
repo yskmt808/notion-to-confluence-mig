@@ -679,6 +679,14 @@ class MigrationVerifier:
                         actual_type = conf_field_types[f_name]
                         if actual_type in expected_set:
                             matched_fields.append(f"{f_name}:{actual_type}")
+                        elif (
+                            n_type == "url"
+                            and NotionToConfluenceConverter.column_requires_text_for_url(node, f_name)
+                            and actual_type == "text"
+                        ):
+                            warnings.append(
+                                f"Database field '{f_name}' fell back to 'text' (Notion 'url' contains non-HTTP(S) values)."
+                            )
                         else:
                             issues.append(
                                 f"Database field '{f_name}' type mismatch: expected {sorted(expected_set)} for Notion '{n_type}', got '{actual_type}'."

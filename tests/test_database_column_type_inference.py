@@ -533,6 +533,42 @@ class TestDatabaseColumnTypeInference(unittest.TestCase):
         self.assertIn(",false,2026-11-11 21:30,2026-12-09,BBB", csv_str)
         self.assertIn(',false,2026-11-11 21:30,2026-11-30,""', csv_str)
 
+    def test_verifier_warns_instead_of_failing_on_url_text_fallback(self):
+        """URL列が非HTTP(S)値を含むため text 型にフォールバックした場合、FAILではなくWARNになること"""
+        mock_client = MagicMock()
+        mock_client.base_url = "https://example.atlassian.net/wiki"
+        mock_client.auth = ("u", "t")
+        mock_client.get_database_views.return_value = [{"id": "v1", "name": "すべてのデータ", "type": "table"}]
+        mock_client.get_database_entries.return_value = [{"id": "e1"}]
+        mock_client.get_database_fields.return_value = [
+            {"name": "参照先", "type": "text"},
+        ]
+
+        db_node = PageNode(
+            id="db-url-fb",
+            title="URL Fallback DB",
+            node_type="database",
+            properties={"schema": {"参照先": {"type": "url"}}},
+            children=[
+                PageNode(
+                    id="r1",
+                    title="Row 1",
+                    node_type="database_row",
+                    properties={"参照先": {"type": "url", "value": r"\\server\share\doc.pdf"}},
+                )
+            ],
+        )
+
+        mock_db_res = MagicMock(ok=True)
+        mock_db_res.json.return_value = {"id": "conf-db-url", "title": "URL Fallback DB", "parentId": "p-1"}
+
+        verifier = MigrationVerifier(mock_client)
+        with patch("requests.get", return_value=mock_db_res):
+            res = verifier.verify_database_node(db_node, "conf-db-url", expected_parent_id="p-1")
+        self.assertEqual(res["status"], "WARN")
+        self.assertEqual(res["issues"], [])
+        self.assertTrue(any("fell back to 'text'" in w for w in res["warnings"]))
+
 
 if __name__ == "__main__":
     unittest.main()
