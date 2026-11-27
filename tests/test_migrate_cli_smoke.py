@@ -672,6 +672,21 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
             self.assertEqual(cm.exception.code, 1)
             mock_ext.assert_not_called()
 
+        # 1b. Personal Access Token (/v1/users/me が 403 でも /v1/search が 200 なら通過すること)
+        res_403 = MagicMock(ok=False, status_code=403, text="restricted")
+        res_search_ok = MagicMock(ok=True, status_code=200)
+        with patch("requests.get", return_value=res_403), \
+             patch("requests.post", return_value=res_search_ok), \
+             patch("migrate.MultiZipExtractor") as mock_ext, \
+             patch("migrate.NotionApiEnricher") as mock_enricher:
+            mock_ext.return_value.extract_tree.return_value = PageNode(id="r", title="Root", node_type="page")
+            mock_enricher.return_value.enrich_tree.return_value = {"databases_enriched": 0, "properties_mapped": 0}
+            self._run_main(
+                ["--zip", zpath, "--enrich-via-api", "--dry-run"],
+                env={"NOTION_TOKEN": "pat_valid_without_user_scope"},
+            )
+            mock_ext.assert_called_once()
+
         # 2. 無効な Confluence API キー (通常実行)
         with patch("src.importer.ConfluenceClient") as mock_client_cls, \
              patch("migrate.MultiZipExtractor") as mock_ext:

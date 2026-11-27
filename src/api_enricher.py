@@ -77,6 +77,12 @@ class NotionApiEnricher:
                     params=params,
                     timeout=15,
                 )
+                if res.status_code == 403:
+                    logger.info(
+                        "[API-ENRICH] Skipping workspace users list (/v1/users returned HTTP 403; "
+                        "token lacks user-list permission)."
+                    )
+                    break
                 if res.status_code != 200:
                     err_msg = f"Failed to fetch workspace users: HTTP {res.status_code} - {getattr(res, 'text', '')}"
                     logger.warning(err_msg)

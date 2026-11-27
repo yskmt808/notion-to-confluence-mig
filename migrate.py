@@ -627,7 +627,25 @@ def validate_api_credentials(
                 },
                 timeout=15,
             )
-            if not res.ok:
+            if res.status_code == 403:
+                # Personal Access Token 等でユーザー情報取得権限がない場合は /v1/search でトークン有効性を確認
+                res_search = requests.post(
+                    "https://api.notion.com/v1/search",
+                    headers={
+                        "Authorization": f"Bearer {notion_token}",
+                        "Notion-Version": "2022-06-28",
+                        "Content-Type": "application/json",
+                    },
+                    json={"page_size": 1},
+                    timeout=15,
+                )
+                if not res_search.ok:
+                    print(
+                        f"❌ エラー: NOTION_TOKEN が無効または権限不足です "
+                        f"(HTTP {res_search.status_code}: {res_search.text[:200]})。"
+                    )
+                    sys.exit(1)
+            elif not res.ok:
                 print(
                     f"❌ エラー: NOTION_TOKEN が無効または権限不足です "
                     f"(HTTP {res.status_code}: {res.text[:200]})。"
