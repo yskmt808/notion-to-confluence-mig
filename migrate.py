@@ -609,6 +609,54 @@ def build_checkpoint_source_info(
     }
 
 
+def validate_api_credentials(
+    notion_token: Optional[str] = None,
+    conf_url: Optional[str] = None,
+    conf_user: Optional[str] = None,
+    conf_token: Optional[str] = None,
+) -> None:
+    """移行開始前に Notion / Confluence API キーの有効性を検証し、無効時はエラー終了する。"""
+    if notion_token:
+        import requests
+        try:
+            res = requests.get(
+                "https://api.notion.com/v1/users/me",
+                headers={
+                    "Authorization": f"Bearer {notion_token}",
+                    "Notion-Version": "2022-06-28",
+                },
+                timeout=15,
+            )
+            if not res.ok:
+                print(
+                    f"❌ エラー: NOTION_TOKEN が無効または権限不足です "
+                    f"(HTTP {res.status_code}: {res.text[:200]})。"
+                )
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"❌ エラー: Notion API キーの有効性確認に失敗しました: {e}")
+            sys.exit(1)
+
+    if conf_url and conf_user and conf_token:
+        from src.importer import ConfluenceClient
+        try:
+            client = ConfluenceClient(conf_url, conf_user, conf_token)
+            user_info = client.get_current_user()
+            if not user_info:
+                print(
+                    "❌ エラー: Confluence API キー (CONFLUENCE_USERNAME / CONFLUENCE_API_TOKEN) "
+                    "が無効または接続できません。"
+                )
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"❌ エラー: Confluence API キーの有効性確認に失敗しました: {e}")
+            sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Notion to Confluence Migration Tool")
     parser.add_argument(
@@ -942,6 +990,15 @@ def main():
     if not args.dry_run and (not conf_url or not conf_user or not conf_token or not conf_space):
         print("エラー: Confluence の設定 (.env) が不足しています。")
         sys.exit(1)
+
+    need_notion_check = (not use_zip) or bool(args.enrich_via_api) or bool(args.repair_inpage_links and notion_token)
+    need_conf_check = not args.dry_run
+    validate_api_credentials(
+        notion_token=notion_token if need_notion_check else None,
+        conf_url=conf_url if need_conf_check else None,
+        conf_user=conf_user if need_conf_check else None,
+        conf_token=conf_token if need_conf_check else None,
+    )
 
     # タイトルプレフィックスの決定
     title_prefix = args.title_prefix

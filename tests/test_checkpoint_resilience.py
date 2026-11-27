@@ -222,6 +222,7 @@ class TestCheckpointResilience(unittest.TestCase):
         with patch.dict(os.environ, env_vars, clear=False), \
              patch("sys.argv", ["migrate.py", "--zip", zip_path, "--no-dashboard", "--no-verify", "--checkpoint", cp_path]), \
              patch("migrate.setup_logger"), \
+             patch("migrate.validate_api_credentials"), \
              patch("migrate.ConfluenceImporter.import_tree", fake_import_tree), \
              patch("migrate.MigrationCheckpoint.mark_interrupted") as mock_mark_int, \
              patch("migrate.MigrationCheckpoint.flush") as mock_flush, \

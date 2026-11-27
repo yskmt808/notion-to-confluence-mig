@@ -415,7 +415,8 @@ class TestExternalSyncedBlockCliIntegration(unittest.TestCase):
             child_ok_id: {"title": "[HTML] Internal Sync Child", "node_type": "page", "confluence_id": "5003", "url": "https://example.invalid/5003"},
         }
 
-        with patch("migrate.ConfluenceImporter", return_value=mock_importer):
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter", return_value=mock_importer):
             out, _ = self._run_main(
                 [
                     "--zip", zpath,

@@ -140,7 +140,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
             }
         ]
 
-        with patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
              patch("migrate.MigrationVerifier", return_value=mock_verifier) as mock_ver_cls:
             out, _ = self._run_main(
                 [
@@ -198,7 +199,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
             }
         }
 
-        with patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
              patch("migrate.MigrationVerifier") as mock_ver_cls:
             self._run_main(
                 [
@@ -271,7 +273,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         ws_out = os.path.join(self.tmpdir, "out_ws.csv")
         um_out = os.path.join(self.tmpdir, "out_users.csv")
 
-        with patch("migrate.WorksheetManager") as mock_ws_cls, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.WorksheetManager") as mock_ws_cls, \
              patch("migrate.ConfluenceImporter") as mock_imp_cls:
             self._run_main(
                 ["--zip", zpath, "--export-worksheet", ws_out],
@@ -280,7 +283,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         mock_ws_cls.return_value.export_worksheet.assert_called_once()
         mock_imp_cls.assert_not_called()
 
-        with patch("migrate.UserMappingManager.export_template", return_value=2) as mock_exp, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.UserMappingManager.export_template", return_value=2) as mock_exp, \
              patch("migrate.ConfluenceImporter") as mock_imp_cls:
             self._run_main(
                 ["--zip", zpath, "--export-user-mapping", um_out],
@@ -301,7 +305,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         fake_cm_err.is_error_halt = True
         fake_cm_err.halt_reason = "409 conflict"
 
-        with patch("migrate.ConfluenceImporter", return_value=mock_imp_err), \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter", return_value=mock_imp_err), \
              patch("migrate.CancellationManager", return_value=fake_cm_err):
             with self.assertRaises(SystemExit) as cm_err:
                 self._run_main(
@@ -320,7 +325,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         fake_cm_user = MagicMock()
         fake_cm_user.is_error_halt = False
 
-        with patch("migrate.ConfluenceImporter", return_value=mock_imp_err), \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter", return_value=mock_imp_err), \
              patch("migrate.CancellationManager", return_value=fake_cm_user):
             with self.assertRaises(SystemExit) as cm_user:
                 self._run_main(
@@ -363,7 +369,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         env = dict(self.CONFLUENCE_ENV, NOTION_TOKEN="ntn_dummy")
         cp_path = os.path.join(self.tmpdir, "cp_api.json")
 
-        with patch("migrate.NotionExtractor", return_value=mock_extractor) as mock_ext_cls, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.NotionExtractor", return_value=mock_extractor) as mock_ext_cls, \
              patch("migrate.NotionApiEnricher", return_value=mock_enricher), \
              patch("migrate.WorksheetManager", return_value=mock_ws_mgr), \
              patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
@@ -520,7 +527,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         cp_path = os.path.join(self.tmpdir, "cp_opts.json")
 
         # 1. 初回実行（途中で中断した想定でチェックポイントに cli_options を保存）
-        with patch("migrate.ConfluenceImporter") as mock_importer_cls:
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter") as mock_importer_cls:
             mock_importer = mock_importer_cls.return_value
             mock_importer.migration_map = {}
             mock_importer.import_tree.side_effect = MigrationCancelledException("interrupted")
@@ -560,7 +568,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         self.assertNotIn("ntn_secret_must_not_be_saved", json.dumps(cp_data))
 
         # 2. --resume 実行（オプション再指定なしで復元され、--page-workers のみ上書き可能）
-        with patch("migrate.ConfluenceImporter") as mock_importer_cls:
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter") as mock_importer_cls:
             mock_importer = mock_importer_cls.return_value
             mock_importer.migration_map = {
                 "11111111111111111111111111111111": {
@@ -609,7 +618,8 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         cp.mark_completed()
 
         # 2. --verify-only 実行: ConfluenceImporter は呼ばれず、MigrationVerifier.verify_tree が呼ばれること
-        with patch("migrate.ConfluenceImporter") as mock_importer_cls, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter") as mock_importer_cls, \
              patch("migrate.MigrationVerifier") as mock_verifier_cls, \
              patch("src.importer.ConfluenceClient") as mock_client_cls:
             mock_verifier = mock_verifier_cls.return_value
@@ -644,6 +654,35 @@ class TestMigrateCliSmoke(MigrateCliTestBase):
         with self.assertRaises(SystemExit) as cm:
             self._run_main(["--verify-only", "--checkpoint", os.path.join(self.tmpdir, "missing.json")], env=self.CONFLUENCE_ENV)
         self.assertEqual(cm.exception.code, 1)
+
+    def test_invalid_api_keys_fail_upfront_before_step1(self):
+        """NOTION_TOKEN または Confluence API キーが無効な場合、Step 1 開始前にエラー終了すること"""
+        zpath = os.path.join(self.tmpdir, "api_check.zip")
+        _create_minimal_zip(zpath, "Root", "11111111111111111111111111111111")
+
+        # 1. 無効な NOTION_TOKEN (--enrich-via-api --dry-run)
+        bad_notion_res = MagicMock(ok=False, status_code=401, text="unauthorized")
+        with patch("requests.get", return_value=bad_notion_res), \
+             patch("migrate.MultiZipExtractor") as mock_ext:
+            with self.assertRaises(SystemExit) as cm:
+                self._run_main(
+                    ["--zip", zpath, "--enrich-via-api", "--dry-run"],
+                    env={"NOTION_TOKEN": "bad_notion_tok"},
+                )
+            self.assertEqual(cm.exception.code, 1)
+            mock_ext.assert_not_called()
+
+        # 2. 無効な Confluence API キー (通常実行)
+        with patch("src.importer.ConfluenceClient") as mock_client_cls, \
+             patch("migrate.MultiZipExtractor") as mock_ext:
+            mock_client_cls.return_value.get_current_user.return_value = None
+            with self.assertRaises(SystemExit) as cm:
+                self._run_main(
+                    ["--zip", zpath, "--no-dashboard"],
+                    env=self.CONFLUENCE_ENV,
+                )
+            self.assertEqual(cm.exception.code, 1)
+            mock_ext.assert_not_called()
 
 
 if __name__ == "__main__":

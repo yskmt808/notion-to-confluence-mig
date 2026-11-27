@@ -382,7 +382,8 @@ class TestPrivateModeCliAndResume(unittest.TestCase):
             }
         }
 
-        with patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
              patch("migrate.MigrationVerifier"):
             self._run_main([
                 "--zip", zpath,
@@ -397,7 +398,8 @@ class TestPrivateModeCliAndResume(unittest.TestCase):
             cp_data = json.load(f)
         self.assertTrue(cp_data["source_info"]["private_mode"])
 
-        with patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
              patch("migrate.MigrationVerifier"):
             self._run_main([
                 "--zip", zpath,
@@ -437,7 +439,8 @@ class TestPrivateModeCliAndResume(unittest.TestCase):
         }
 
         # 1) --private / --visibility 指定なしの --resume で private_mode=True が復元される
-        with patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
              patch("migrate.MigrationVerifier"):
             self._run_main([
                 "--resume",
@@ -450,7 +453,8 @@ class TestPrivateModeCliAndResume(unittest.TestCase):
         # 2) --visibility space を明示指定した --resume では private_mode=False となる
         cp.source_info["private_mode"] = True
         cp.save(force=True)
-        with patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
+        with patch("migrate.validate_api_credentials"), \
+             patch("migrate.ConfluenceImporter", return_value=mock_importer) as mock_imp_cls, \
              patch("migrate.MigrationVerifier"):
             self._run_main([
                 "--resume",

@@ -341,6 +341,8 @@ class TestUserMapping(unittest.TestCase):
             db_res.json.return_value = {"properties": {"タスク名": {"type": "title"}, "担当者": {"type": "people"}}}
 
             def fake_get(url, **kwargs):
+                if url.endswith("/v1/users/me"):
+                    return MagicMock(status_code=200, ok=True)
                 if url.endswith("/v1/users"):
                     return users_res
                 if "/databases/" in url:
